@@ -8,6 +8,18 @@ function safeJsonParse(value) {
   }
 }
 
+function createBridgeError(status, message, type = "api_error", details = null) {
+  const error = new Error(message);
+  error.status = status;
+  error.type = type;
+
+  if (details) {
+    error.details = details;
+  }
+
+  return error;
+}
+
 function classifyErrorType(statusCode, error) {
   if (statusCode === 400 || statusCode === 413 || statusCode === 422) {
     return "invalid_request_error";
@@ -27,6 +39,10 @@ function classifyErrorType(statusCode, error) {
 
   if (statusCode === 429) {
     return "rate_limit_error";
+  }
+
+  if (statusCode === 501) {
+    return "unsupported_error";
   }
 
   if (statusCode === 502 || statusCode === 503 || statusCode === 504 || statusCode === 529) {
@@ -99,6 +115,27 @@ function shouldFallbackToLocalTransport(error) {
   );
 }
 
+function shouldFailoverAccount(error) {
+  if (!error) {
+    return false;
+  }
+
+  const status = Number(error.status || 0);
+  const type = String(error.type || "").toLowerCase();
+  const message = String(error.message || "").toLowerCase();
+
+  if (status === 401 || status === 403 || status === 429 || status === 503 || status === 529) {
+    return true;
+  }
+
+  return (
+    type === "authentication_error" ||
+    type === "rate_limit_error" ||
+    type === "overloaded_error" ||
+    /quota|unauthorized|provider unavailable|rate limit|overloaded/.test(message)
+  );
+}
+
 function resolveResultError(result) {
   const metadata = (result.finalMessage && result.finalMessage.metadata) || {};
   const rawMessage =
@@ -115,6 +152,8 @@ function resolveResultError(result) {
 
 module.exports = {
   classifyErrorType,
+  createBridgeError,
   resolveResultError,
+  shouldFailoverAccount,
   shouldFallbackToLocalTransport
 };

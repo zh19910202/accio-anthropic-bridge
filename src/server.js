@@ -2,94 +2,40 @@
 
 const crypto = require("node:crypto");
 const http = require("node:http");
-const path = require("node:path");
-const { URL } = require("node:url");
 
 const { AccioClient, HttpError } = require("./accio-client");
 const { AuthProvider } = require("./auth-provider");
-const { buildErrorResponse, flattenAnthropicRequest } = require("./anthropic");
+const { buildErrorResponse } = require("./anthropic");
 const { DirectLlmClient } = require("./direct-llm");
-const { discoverAccioAppPath, discoverAccioConfig } = require("./discovery");
 const { classifyErrorType } = require("./errors");
-const { GatewayManager, parseFlag } = require("./gateway-manager");
+const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
 const log = require("./logger");
+const { ModelsRegistry } = require("./models");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
 const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic");
-const { buildOpenAiModelsResponse, handleChatCompletionsRequest } = require("./routes/openai");
+const { handleChatCompletionsRequest, handleModelsRequest, handleResponsesRequest } = require("./routes/openai");
+const { createConfig } = require("./runtime-config");
 const { SessionStore } = require("./session-store");
 
 function generateId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
 
-function env(name, fallback) {
-  return Object.prototype.hasOwnProperty.call(process.env, name)
-    ? process.env[name]
-    : fallback;
-}
-
-function createConfig() {
-  const discovered = discoverAccioConfig({
-    accountId: env("ACCIO_ACCOUNT_ID", ""),
-    accioHome: env("ACCIO_HOME", ""),
-    agentId: env("ACCIO_AGENT_ID", ""),
-    language: env("ACCIO_LANGUAGE", ""),
-    sourceChannelId: env("ACCIO_SOURCE_CHANNEL_ID", ""),
-    sourceChatId: env("ACCIO_SOURCE_CHAT_ID", ""),
-    sourceChatType: env("ACCIO_SOURCE_CHAT_TYPE", ""),
-    sourceUserId: env("ACCIO_SOURCE_USER_ID", ""),
-    workspacePath: env("ACCIO_WORKSPACE_PATH", "")
-  });
-
-  return {
-    port: Number(env("PORT", "8082")),
-    baseUrl: env("ACCIO_BASE_URL", "http://127.0.0.1:4097"),
-    accioHome: discovered.accioHome,
-    accountId: discovered.accountId,
-    agentId: discovered.agentId,
-    workspacePath: discovered.workspacePath,
-    language: discovered.language,
-    sourceChannelId: discovered.sourceChannelId,
-    sourceChatId: discovered.sourceChatId,
-    sourceUserId: discovered.sourceUserId,
-    sourceChatType: discovered.sourceChatType,
-    sourcePlatform: env("ACCIO_SOURCE_PLATFORM", "pcApp"),
-    sourceType: env("ACCIO_SOURCE_TYPE", "im"),
-    requestTimeoutMs: Number(env("ACCIO_REQUEST_TIMEOUT_MS", "120000")),
-    transportMode: env("ACCIO_TRANSPORT", "auto"),
-    authMode: env("ACCIO_AUTH_MODE", "auto"),
-    authStrategy: env("ACCIO_AUTH_STRATEGY", "round_robin"),
-    accountsPath: env("ACCIO_ACCOUNTS_PATH", path.join(process.cwd(), "config", "accounts.json")),
-    accessToken: env("ACCIO_ACCESS_TOKEN", ""),
-    envAccountId: env("ACCIO_AUTH_ACCOUNT_ID", "env-default"),
-    accessTokenExpiresAt: env("ACCIO_ACCESS_TOKEN_EXPIRES_AT", ""),
-    gatewayAutostart: parseFlag(env("ACCIO_GATEWAY_AUTOSTART", "1"), true),
-    appPath: discoverAccioAppPath(env("ACCIO_APP_PATH", "")),
-    gatewayWaitMs: Number(env("ACCIO_GATEWAY_WAIT_MS", "20000")),
-    gatewayPollMs: Number(env("ACCIO_GATEWAY_POLL_MS", "500")),
-    directLlmBaseUrl: env(
-      "ACCIO_DIRECT_LLM_BASE_URL",
-      "https://phoenix-gw.alibaba.com/api/adk/llm"
-    ),
-    clientIdPrefix: env("ACCIO_CLIENT_ID_PREFIX", "anthropic-bridge"),
-    sessionStorePath: env(
-      "ACCIO_SESSION_STORE_PATH",
-      path.join(process.cwd(), ".data", "sessions.json")
-    ),
-    maxRetries: Number(env("ACCIO_MAX_RETRIES", "2")),
-    retryBaseMs: Number(env("ACCIO_RETRY_BASE_MS", "250")),
-    retryMaxDelayMs: Number(env("ACCIO_RETRY_MAX_DELAY_MS", "2500"))
-  };
-}
-
-function createServer(client, directClient, sessionStore) {
+function createServer(client, directClient, sessionStore, modelsRegistry) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const startTime = Date.now();
     const requestId = String(req.headers["x-request-id"] || generateId("req"));
 
     res.setHeader("x-request-id", requestId);
+    req.bridgeContext = {
+      bodyParser: {
+        maxBytes: client.config.maxBodyBytes,
+        timeoutMs: client.config.bodyReadTimeoutMs
+      },
+      requestId
+    };
 
     const requestMeta = {
       requestId,
@@ -125,7 +71,8 @@ function createServer(client, directClient, sessionStore) {
             "GET /v1/models",
             "POST /v1/messages",
             "POST /v1/messages/count_tokens",
-            "POST /v1/chat/completions"
+            "POST /v1/chat/completions",
+            "POST /v1/responses"
           ]
         });
         finishLog("info", "request completed", { status: 200 });
@@ -133,38 +80,48 @@ function createServer(client, directClient, sessionStore) {
       }
 
       if (req.method === "GET" && url.pathname === "/healthz") {
-        await handleHealth(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200 });
+        await handleHealth(req, res, client, directClient, sessionStore, modelsRegistry);
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/debug/accio-auth") {
         await handleAccioAuthProbe(req, res, client, directClient);
-        finishLog("info", "request completed", { status: 200 });
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
-        writeJson(res, 200, buildOpenAiModelsResponse());
-        finishLog("info", "request completed", { status: 200 });
+        await handleModelsRequest(req, res, modelsRegistry);
+        finishLog("info", "request completed", {
+          status: res.statusCode || 200,
+          protocol: "openai",
+          modelsSource: client.config.modelsSource
+        });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages") {
         await handleMessagesRequest(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200, protocol: "anthropic" });
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
-        await handleCountTokens(req, res, flattenAnthropicRequest);
-        finishLog("info", "request completed", { status: 200, protocol: "anthropic" });
+        await handleCountTokens(req, res);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         await handleChatCompletionsRequest(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200, protocol: "openai" });
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/responses") {
+        await handleResponsesRequest(req, res, client, directClient, sessionStore);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai-responses" });
         return;
       }
 
@@ -185,6 +142,7 @@ function createServer(client, directClient, sessionStore) {
         ...requestMeta,
         status: statusCode,
         error: message,
+        type: error && error.type ? error.type : classifyErrorType(statusCode, error),
         ms: Date.now() - startTime
       });
 
@@ -220,10 +178,12 @@ async function main() {
     gatewayManager,
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,
-    upstreamBaseUrl: config.directLlmBaseUrl
+    upstreamBaseUrl: config.directLlmBaseUrl,
+    authCacheTtlMs: config.authCacheTtlMs
   });
   const sessionStore = new SessionStore(config.sessionStorePath);
-  const server = createServer(client, directClient, sessionStore);
+  const modelsRegistry = new ModelsRegistry(config);
+  const server = createServer(client, directClient, sessionStore, modelsRegistry);
 
   let shuttingDown = false;
 

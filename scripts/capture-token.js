@@ -85,7 +85,7 @@ function writeAccountToFile(filePath, accountId, accessToken) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const accountsPath = path.resolve(env("ACCIO_ACCOUNTS_PATH", path.join(REPO_ROOT, "config", "accounts.json")));
+  const accountsPath = path.resolve(env("ACCIO_ACCOUNTS_CONFIG_PATH", env("ACCIO_ACCOUNTS_PATH", path.join(REPO_ROOT, "config", "accounts.json"))));
   const manager = new GatewayManager({
     baseUrl: env("ACCIO_BASE_URL", "http://127.0.0.1:4097"),
     appPath: discoverAccioAppPath(env("ACCIO_APP_PATH", "")),
@@ -121,7 +121,7 @@ async function main() {
   }
 
   if (!args.writeFile) {
-    process.stdout.write("Re-run with --write-file to persist it into ACCIO_ACCOUNTS_PATH.\n");
+    process.stdout.write("Re-run with --write-file to persist it into ACCIO_ACCOUNTS_CONFIG_PATH.\n");
   }
 }
 

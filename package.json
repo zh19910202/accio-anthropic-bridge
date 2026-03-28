@@ -8,9 +8,13 @@
     "init-env": "node scripts/init-env.js",
     "setup": "node scripts/init-env.js",
     "capture-token": "node scripts/capture-token.js",
+    "accounts:list": "node scripts/accounts.js list",
+    "accounts:probe": "node scripts/accounts.js probe",
+    "accounts:activate": "node scripts/accounts.js activate",
+    "accounts:validate": "node scripts/accounts.js validate",
     "start": "node src/start.js",
     "test": "node --test",
-    "check": "node --check src/server.js && node --check src/direct-llm.js && node --check src/gateway-manager.js && node --check src/routes/anthropic.js && node --check src/routes/openai.js && node --check src/routes/health.js && node --check src/stream/anthropic-sse.js && node --check src/stream/openai-sse.js && node --check scripts/capture-token.js && npm test"
+    "check": "node --check src/server.js && node --check src/runtime-config.js && node --check src/models.js && node --check src/tooling.js && node --check src/direct-llm.js && node --check src/gateway-manager.js && node --check src/routes/anthropic.js && node --check src/routes/openai.js && node --check src/routes/health.js && node --check src/stream/anthropic-sse.js && node --check src/stream/openai-sse.js && node --check scripts/capture-token.js && node --check scripts/accounts.js && npm test"
   },
   "engines": {
     "node": ">=22"

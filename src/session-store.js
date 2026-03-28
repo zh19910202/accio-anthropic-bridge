@@ -6,16 +6,14 @@ const path = require("node:path");
 
 const log = require("./logger");
 
-const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const SAVE_DEBOUNCE_MS = 500;
 
 class SessionStore {
   constructor(filePath, options = {}) {
     this.filePath = filePath;
     this.maxAgeMs = options.maxAgeMs || DEFAULT_MAX_AGE_MS;
-    this.state = {
-      sessions: {}
-    };
+    this.state = { sessions: {} };
     this._saveTimer = null;
     this._pendingWrite = Promise.resolve();
     this.load();
@@ -55,9 +53,7 @@ class SessionStore {
         continue;
       }
 
-      const age = now - Date.parse(entry.updatedAt);
-
-      if (age > this.maxAgeMs) {
+      if (now - Date.parse(entry.updatedAt) > this.maxAgeMs) {
         delete sessions[key];
         changed = true;
       }
@@ -116,6 +112,10 @@ class SessionStore {
     this._saveSync();
   }
 
+  _isExpired(entry) {
+    return entry && entry.updatedAt && Date.now() - Date.parse(entry.updatedAt) > this.maxAgeMs;
+  }
+
   get(sessionId) {
     if (!sessionId) {
       return null;
@@ -123,33 +123,71 @@ class SessionStore {
 
     const entry = this.state.sessions[sessionId];
 
-    if (!entry || !entry.conversationId) {
+    if (!entry) {
       return null;
     }
 
-    if (entry.updatedAt && Date.now() - Date.parse(entry.updatedAt) > this.maxAgeMs) {
+    if (this._isExpired(entry)) {
       delete this.state.sessions[sessionId];
       this.save();
+      return null;
+    }
+
+    if (!entry.conversationId && !entry.accountId && !entry.accountName) {
       return null;
     }
 
     return entry;
   }
 
-  set(sessionId, conversationId, extras = {}) {
-    if (!sessionId || !conversationId) {
+  merge(sessionId, extras = {}) {
+    if (!sessionId || !extras || typeof extras !== "object") {
       return null;
     }
 
+    const previous = this.state.sessions[sessionId] || {};
     const entry = {
-      conversationId,
-      updatedAt: new Date().toISOString(),
-      ...extras
+      ...previous,
+      ...extras,
+      updatedAt: new Date().toISOString()
     };
 
     this.state.sessions[sessionId] = entry;
     this.save();
     return entry;
+  }
+
+  set(sessionId, conversationId, extras = {}) {
+    if (!sessionId) {
+      return null;
+    }
+
+    return this.merge(sessionId, {
+      ...extras,
+      conversationId: conversationId || extras.conversationId || (this.state.sessions[sessionId] || {}).conversationId || null
+    });
+  }
+
+  bindAccount(sessionId, account = {}) {
+    if (!sessionId || !account || (!account.accountId && !account.accountName)) {
+      return null;
+    }
+
+    return this.merge(sessionId, {
+      accountId: account.accountId || null,
+      accountName: account.accountName || account.accountId || null
+    });
+  }
+
+  getSummary() {
+    const sessions = Object.values(this.state.sessions || {});
+    return {
+      count: sessions.length,
+      accountBoundCount: sessions.filter((entry) => entry && entry.accountId).length,
+      conversationBoundCount: sessions.filter((entry) => entry && entry.conversationId).length,
+      maxAgeMs: this.maxAgeMs,
+      path: this.filePath
+    };
   }
 }
 
@@ -185,6 +223,7 @@ function resolveSessionBinding(headers, body, protocol) {
 }
 
 module.exports = {
+  DEFAULT_MAX_AGE_MS,
   SessionStore,
   resolveSessionBinding
 };

@@ -7,6 +7,7 @@ const {
   buildChatCompletionChunk,
   buildChatCompletionResponse,
   buildOpenAiModelsResponse,
+  convertResponsesInputToOpenAiMessages,
   flattenOpenAiRequest
 } = require("../src/openai");
 
@@ -66,4 +67,24 @@ test("buildChatCompletionChunk and model listing stay OpenAI-compatible", () => 
   assert.equal(chunk.object, "chat.completion.chunk");
   assert.equal(models.object, "list");
   assert.equal(models.data[0].id, "accio-bridge");
+});
+
+
+test("convertResponsesInputToOpenAiMessages maps text and image inputs", () => {
+  const messages = convertResponsesInputToOpenAiMessages({
+    instructions: "be concise",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "describe this" },
+          { type: "input_image", image_url: "https://example.com/a.png" }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(messages[0].role, "system");
+  assert.equal(messages[1].content[0].type, "text");
+  assert.equal(messages[1].content[1].type, "image_url");
 });

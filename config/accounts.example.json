@@ -1,15 +1,21 @@
 {
   "strategy": "round_robin",
+  "activeAccount": "acct_primary",
   "accounts": [
     {
       "id": "acct_primary",
+      "name": "acct_primary",
       "accessToken": "replace-with-access-token",
-      "enabled": true
+      "enabled": true,
+      "priority": 1
     },
     {
       "id": "acct_backup",
-      "accessToken": "replace-with-access-token",
-      "enabled": false
+      "name": "acct_backup",
+      "tokenFile": "./secrets/backup.token",
+      "enabled": true,
+      "priority": 2,
+      "transportOverride": "direct-llm"
     }
   ]
 }

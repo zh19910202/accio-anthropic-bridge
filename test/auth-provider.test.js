@@ -73,3 +73,24 @@ test("AuthProvider invalidates accounts temporarily", () => {
   provider.clearInvalidation("acct_a");
   assert.equal(provider.resolveCredential().accountId, "acct_a");
 });
+
+
+test("AuthProvider prefers activeAccount over round robin", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));
+  const filePath = path.join(tempDir, "accounts.json");
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      strategy: "round_robin",
+      activeAccount: "acct_b",
+      accounts: [
+        { id: "acct_a", name: "acct_a", accessToken: "token_a", enabled: true, priority: 2 },
+        { id: "acct_b", name: "acct_b", accessToken: "token_b", enabled: true, priority: 1 }
+      ]
+    })
+  );
+
+  const provider = new AuthProvider({ authMode: "file", accountsPath: filePath });
+  assert.equal(provider.resolveCredential().accountId, "acct_b");
+});

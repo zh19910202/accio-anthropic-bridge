@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 
 const modelAliases = require("../config/model-aliases.json");
 
+const { shouldFailoverAccount } = require("./errors");
 const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 
@@ -24,6 +25,29 @@ function mapRequestedModel(model, protocol) {
   }
 
   return modelAliases[requested] || requested;
+}
+
+function supportsThinkingForModel(model) {
+  const resolved = mapRequestedModel(model);
+  return /claude-(opus|sonnet)/i.test(String(resolved || ""));
+}
+
+function extractThinkingConfigFromAnthropic(body) {
+  if (!body || !body.thinking || body.thinking === false) {
+    return null;
+  }
+
+  if (body.thinking === true) {
+    return { type: "enabled" };
+  }
+
+  if (typeof body.thinking === "object") {
+    const type = String(body.thinking.type || "enabled");
+    const budgetTokens = Number(body.thinking.budget_tokens || body.thinking.budgetTokens || 0) || null;
+    return budgetTokens ? { type, budget_tokens: budgetTokens } : { type };
+  }
+
+  return { type: "enabled" };
 }
 
 function inferProvider(model) {
@@ -196,6 +220,8 @@ function toAnthropicDirectParts(content, role, toolNameById) {
 function buildDirectRequestFromAnthropic(body) {
   const toolNameById = buildAnthropicToolNameMap(body.messages);
   const contents = [];
+  const thinking = extractThinkingConfigFromAnthropic(body);
+  const resolvedModel = mapRequestedModel(body.model, "anthropic");
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
     const role = message && message.role === "assistant" ? "model" : "user";
@@ -208,9 +234,10 @@ function buildDirectRequestFromAnthropic(body) {
 
   return {
     protocol: "anthropic",
-    model: mapRequestedModel(body.model, "anthropic"),
+    model: resolvedModel,
+    thinking,
     requestBody: {
-      model: mapRequestedModel(body.model, "anthropic"),
+      model: resolvedModel,
       request_id: `anthropic-${Date.now()}`,
       contents,
       system_instruction: typeof body.system === "string"
@@ -224,7 +251,8 @@ function buildDirectRequestFromAnthropic(body) {
       tools: toToolDeclarations(body.tools, (tool) => tool.input_schema),
       temperature: body.temperature,
       max_output_tokens: body.max_tokens,
-      stop_sequences: Array.isArray(body.stop_sequences) ? body.stop_sequences : []
+      stop_sequences: Array.isArray(body.stop_sequences) ? body.stop_sequences : [],
+      ...(thinking ? { thinking } : {})
     }
   };
 }
@@ -313,6 +341,7 @@ function toOpenAiDirectParts(message, toolNameById) {
 function buildDirectRequestFromOpenAi(body) {
   const toolNameById = buildOpenAiToolNameMap(body.messages);
   const contents = [];
+  const resolvedModel = mapRequestedModel(body.model, "openai");
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
     const role = message && message.role === "assistant" ? "model" : "user";
@@ -324,9 +353,9 @@ function buildDirectRequestFromOpenAi(body) {
 
   return {
     protocol: "openai",
-    model: mapRequestedModel(body.model, "openai"),
+    model: resolvedModel,
     requestBody: {
-      model: mapRequestedModel(body.model, "openai"),
+      model: resolvedModel,
       request_id: `openai-${Date.now()}`,
       contents,
       tools: toToolDeclarations(
@@ -600,7 +629,15 @@ function sanitizeErrorBody(value, token) {
 
   if (typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, sanitizeErrorBody(item, token)])
+      Object.entries(value).map(([key, item]) => {
+        const normalizedKey = String(key || "").toLowerCase();
+
+        if ((normalizedKey === "token" || normalizedKey === "accesstoken" || normalizedKey === "authorization") && typeof item === "string") {
+          return [key, maskToken(item)];
+        }
+
+        return [key, sanitizeErrorBody(item, token)];
+      })
     );
   }
 
@@ -757,7 +794,7 @@ class DirectLlmClient {
     this.gatewayManager = config.gatewayManager || null;
     this._cachedToken = null;
     this._cachedAt = 0;
-    this._cacheTtlMs = 2 * 60 * 1000; // 2 minutes
+    this._cacheTtlMs = Number(config.authCacheTtlMs || 2 * 60 * 1000);
   }
 
   async getGatewayToken(options = {}) {
@@ -795,6 +832,7 @@ class DirectLlmClient {
     if (this.authProvider && authMode !== "gateway") {
       const credential = this.authProvider.resolveCredential({
         accountId: options.accountId,
+        stickyAccountId: options.stickyAccountId,
         excludeIds: options.excludeIds
       });
 
@@ -809,6 +847,7 @@ class DirectLlmClient {
 
     return {
       accountId: null,
+      accountName: null,
       token: await this.getGatewayToken({ allowAutostart: options.allowAutostart !== false }),
       source: "gateway"
     };
@@ -830,6 +869,7 @@ class DirectLlmClient {
 
   async run(request, options = {}) {
     const explicitAccountId = options.accountId || request.accountId || null;
+    const stickyAccountId = options.stickyAccountId || null;
     const triedAccounts = new Set();
     let lastError = null;
 
@@ -837,12 +877,24 @@ class DirectLlmClient {
       const auth = await this.getAuthToken({
         allowAutostart: true,
         accountId: explicitAccountId,
+        stickyAccountId,
         excludeIds: [...triedAccounts]
       });
       const token = auth && auth.token;
 
       if (!token) {
         throw new Error("Accio access token is unavailable");
+      }
+
+      if (typeof options.onDecision === "function") {
+        options.onDecision({
+          type: "direct_attempt",
+          accountId: auth.accountId,
+          accountName: auth.accountName || null,
+          authSource: auth.source,
+          resolvedProviderModel: request.model,
+          thinking: request.thinking || null
+        });
       }
 
       const upstreamBody = {
@@ -870,31 +922,46 @@ class DirectLlmClient {
       }
 
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        const upstreamError = new UpstreamHttpError(res.status, res.statusText, text, token);
-        const message = upstreamError.message;
+        const rawText = await res.text().catch(() => "");
+        const upstreamError = new UpstreamHttpError(res.status, res.statusText, rawText, token);
 
-        if (res.status === 401 || res.status === 403) {
-          if (auth.source === "gateway") {
-            this.clearTokenCache();
+        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(auth.accountId, upstreamError);
+        }
+
+        if (
+          shouldFailoverAccount(upstreamError) &&
+          auth.accountId &&
+          this.authProvider &&
+          typeof this.authProvider.invalidateAccount === "function"
+        ) {
+          this.authProvider.invalidateAccount(auth.accountId, upstreamError.message);
+        }
+
+        if (shouldFailoverAccount(upstreamError) && !explicitAccountId && auth.accountId) {
+          triedAccounts.add(auth.accountId);
+          lastError = upstreamError;
+
+          if (typeof options.onDecision === "function") {
+            options.onDecision({
+              type: "account_failover",
+              accountId: auth.accountId,
+              accountName: auth.accountName || null,
+              reason: upstreamError.message,
+              status: upstreamError.status
+            });
           }
 
-          if (auth.accountId && this.authProvider) {
-            this.authProvider.invalidateAccount(auth.accountId);
+          const next = this.authProvider
+            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
+            : null;
+
+          if (next && !triedAccounts.has(next.accountId || "")) {
+            continue;
           }
 
-          if (!explicitAccountId && auth.accountId) {
-            triedAccounts.add(auth.accountId);
-            lastError = upstreamError;
-            const next = this.authProvider ? this.authProvider.resolveCredential({ excludeIds: [...triedAccounts] }) : null;
-
-            if (next) {
-              continue;
-            }
-
-            if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
-              continue;
-            }
+          if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
+            continue;
           }
         }
 
@@ -920,17 +987,62 @@ class DirectLlmClient {
       }
 
       if (state.error) {
-        if ((state.error.status === 401 || state.error.status === 403) && auth.accountId && this.authProvider) {
-          this.authProvider.invalidateAccount(auth.accountId);
+        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(auth.accountId, state.error);
+        }
+
+        if (
+          shouldFailoverAccount(state.error) &&
+          auth.accountId &&
+          this.authProvider &&
+          typeof this.authProvider.invalidateAccount === "function"
+        ) {
+          this.authProvider.invalidateAccount(auth.accountId, state.error.message);
+        }
+
+        if (shouldFailoverAccount(state.error) && !explicitAccountId && auth.accountId) {
+          triedAccounts.add(auth.accountId);
+          lastError = state.error;
+
+          if (typeof options.onDecision === "function") {
+            options.onDecision({
+              type: "account_failover",
+              accountId: auth.accountId,
+              accountName: auth.accountName || null,
+              reason: state.error.message,
+              status: state.error.status || null
+            });
+          }
+
+          const next = this.authProvider
+            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
+            : null;
+
+          if (next && !triedAccounts.has(next.accountId || "")) {
+            continue;
+          }
         }
 
         throw state.error;
       }
 
+      if (auth.accountId && this.authProvider) {
+        if (typeof this.authProvider.clearFailure === "function") {
+          this.authProvider.clearFailure(auth.accountId);
+        }
+
+        if (typeof this.authProvider.clearInvalidation === "function") {
+          this.authProvider.clearInvalidation(auth.accountId);
+        }
+      }
+
       return {
         ...state.toResult(),
         accountId: auth.accountId,
-        authSource: auth.source
+        accountName: auth.accountName || null,
+        authSource: auth.source,
+        resolvedProviderModel: request.model,
+        thinking: request.thinking || null
       };
     }
 
@@ -944,5 +1056,7 @@ module.exports = {
   UpstreamSseError,
   buildDirectRequestFromAnthropic,
   buildDirectRequestFromOpenAi,
-  mapRequestedModel
+  extractThinkingConfigFromAnthropic,
+  mapRequestedModel,
+  supportsThinkingForModel
 };

@@ -9,7 +9,9 @@ const {
   UpstreamSseError,
   buildDirectRequestFromAnthropic,
   buildDirectRequestFromOpenAi,
-  mapRequestedModel
+  extractThinkingConfigFromAnthropic,
+  mapRequestedModel,
+  supportsThinkingForModel
 } = require("../src/direct-llm");
 
 test("mapRequestedModel uses external alias config", () => {
@@ -158,4 +160,15 @@ test("DirectLlmClient converts SSE logical errors into structured upstream error
   );
 
   global.fetch = originalFetch;
+});
+
+
+test("extractThinkingConfigFromAnthropic preserves budget tokens", () => {
+  const thinking = extractThinkingConfigFromAnthropic({
+    thinking: { type: "enabled", budget_tokens: 2048 }
+  });
+
+  assert.deepEqual(thinking, { type: "enabled", budget_tokens: 2048 });
+  assert.equal(supportsThinkingForModel("claude-opus-4-6"), true);
+  assert.equal(supportsThinkingForModel("claude-haiku-4-5"), false);
 });

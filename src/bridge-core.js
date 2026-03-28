@@ -35,9 +35,7 @@ function usageCompletionTokens(usage) {
     return 0;
   }
 
-  return Number(
-    usage.candidatesTokenCount || usage.candidates_token_count || usage.output_tokens || 0
-  );
+  return Number(usage.candidatesTokenCount || usage.candidates_token_count || usage.output_tokens || 0);
 }
 
 async function executeBridgeQuery({ body, client, prompt, req, sessionStore, protocol, onEvent }) {
@@ -53,13 +51,21 @@ async function executeBridgeQuery({ body, client, prompt, req, sessionStore, pro
     workspacePath: client.config.workspacePath
   });
 
-  if (binding.sessionId && result.conversationId) {
-    sessionStore.set(binding.sessionId, result.conversationId, { protocol });
+  if (binding.sessionId) {
+    sessionStore.set(binding.sessionId, result.conversationId, {
+      protocol,
+      requestedModel: body.model || null,
+      lastTransport: "local-ws",
+      accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
+      accountName: storedSession && storedSession.accountName ? storedSession.accountName : null
+    });
   }
 
   return {
     ...result,
     sessionId: binding.sessionId,
+    sessionBindingHit: Boolean(storedSession && storedSession.conversationId),
+    storedSession,
     toolCalls:
       Array.isArray(result.toolCalls) && result.toolCalls.length > 0
         ? result.toolCalls

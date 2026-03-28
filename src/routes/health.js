@@ -5,10 +5,11 @@ const fs = require("node:fs");
 const { writeJson } = require("../http");
 const log = require("../logger");
 
-async function handleHealth(req, res, client, directClient, sessionStore) {
+async function handleHealth(req, res, client, directClient, sessionStore, modelsRegistry) {
   let auth = null;
   let authDebug = null;
   let directLlm = null;
+  let models = [];
 
   try {
     auth = await client.getAuthStatus();
@@ -43,6 +44,12 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
     };
   }
 
+  try {
+    models = await modelsRegistry.listModels();
+  } catch (error) {
+    models = [];
+  }
+
   const storeExists = fs.existsSync(client.config.sessionStorePath);
   const storeStats = storeExists ? fs.statSync(client.config.sessionStorePath) : null;
 
@@ -53,15 +60,23 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
     directLlm,
     authProvider: directClient.authProvider ? directClient.authProvider.getSummary() : null,
     gatewayManager: directClient.gatewayManager ? directClient.gatewayManager.getSummary() : null,
+    models: {
+      source: client.config.modelsSource,
+      count: models.length,
+      ids: models.slice(0, 20).map((model) => model.id)
+    },
     config: {
       baseUrl: client.config.baseUrl,
       directLlmBaseUrl: client.config.directLlmBaseUrl,
       agentId: client.config.agentId,
       authMode: client.config.authMode,
+      authCacheTtlMs: client.config.authCacheTtlMs,
       gatewayAutostart: client.config.gatewayAutostart,
       transportMode: client.config.transportMode,
       workspacePath: client.config.workspacePath,
-      port: client.config.port
+      port: client.config.port,
+      maxBodyBytes: client.config.maxBodyBytes,
+      bodyReadTimeoutMs: client.config.bodyReadTimeoutMs
     },
     discovery: {
       accioHome: client.config.accioHome,
@@ -70,9 +85,8 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
       sourceChatId: client.config.sourceChatId
     },
     sessions: {
-      count: Object.keys(sessionStore.state.sessions || {}).length,
+      ...sessionStore.getSummary(),
       exists: storeExists,
-      path: client.config.sessionStorePath,
       updatedAt: storeStats ? storeStats.mtime.toISOString() : null
     }
   });

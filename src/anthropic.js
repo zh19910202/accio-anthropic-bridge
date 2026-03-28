@@ -175,7 +175,9 @@ function buildMessageResponse(body, text, extras = {}) {
     accio: {
       conversation_id: extras.conversationId || null,
       session_id: extras.sessionId || null,
-      tool_results: extras.toolResults || []
+      tool_results: extras.toolResults || [],
+      account_id: extras.accountId || null,
+      account_name: extras.accountName || null
     }
   };
 }

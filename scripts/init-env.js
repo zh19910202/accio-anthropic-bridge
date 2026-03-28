@@ -96,7 +96,7 @@ function buildEnvFile(config) {
     `ACCIO_TRANSPORT=${quoteEnvValue(config.transportMode)}`,
     `ACCIO_AUTH_MODE=${quoteEnvValue(config.authMode)}`,
     `ACCIO_AUTH_STRATEGY=${quoteEnvValue(config.authStrategy)}`,
-    `ACCIO_ACCOUNTS_PATH=${quoteEnvValue(config.accountsPath)}`,
+    `ACCIO_ACCOUNTS_CONFIG_PATH=${quoteEnvValue(config.accountsPath)}`,
     `ACCIO_ACCESS_TOKEN=${quoteEnvValue(config.accessToken)}`,
     `ACCIO_AUTH_ACCOUNT_ID=${quoteEnvValue(config.envAccountId)}`,
     `ACCIO_ACCESS_TOKEN_EXPIRES_AT=${quoteEnvValue(config.accessTokenExpiresAt)}`,
@@ -109,7 +109,12 @@ function buildEnvFile(config) {
     `ACCIO_SESSION_STORE_PATH=${quoteEnvValue(config.sessionStorePath)}`,
     `ACCIO_MAX_RETRIES=${quoteEnvValue(config.maxRetries)}`,
     `ACCIO_RETRY_BASE_MS=${quoteEnvValue(config.retryBaseMs)}`,
-    `ACCIO_RETRY_MAX_DELAY_MS=${quoteEnvValue(config.retryMaxDelayMs)}`
+    `ACCIO_RETRY_MAX_DELAY_MS=${quoteEnvValue(config.retryMaxDelayMs)}`,
+    `ACCIO_MODELS_SOURCE=${quoteEnvValue(config.modelsSource)}`,
+    `ACCIO_MODELS_CACHE_TTL_MS=${quoteEnvValue(config.modelsCacheTtlMs)}`,
+    `ACCIO_MAX_BODY_BYTES=${quoteEnvValue(config.maxBodyBytes)}`,
+    `ACCIO_BODY_READ_TIMEOUT_MS=${quoteEnvValue(config.bodyReadTimeoutMs)}`,
+    `ACCIO_AUTH_CACHE_TTL_MS=${quoteEnvValue(config.authCacheTtlMs)}`
   ];
 
   return `${lines.join("\n")}\n`;
@@ -182,6 +187,7 @@ async function main() {
     authMode: process.env.ACCIO_AUTH_MODE || "auto",
     authStrategy: process.env.ACCIO_AUTH_STRATEGY || "round_robin",
     accountsPath:
+      process.env.ACCIO_ACCOUNTS_CONFIG_PATH ||
       process.env.ACCIO_ACCOUNTS_PATH ||
       path.join(REPO_ROOT, "config", "accounts.json"),
     accessToken: process.env.ACCIO_ACCESS_TOKEN || "",
@@ -200,7 +206,12 @@ async function main() {
       path.join(REPO_ROOT, ".data", "sessions.json"),
     maxRetries: process.env.ACCIO_MAX_RETRIES || "2",
     retryBaseMs: process.env.ACCIO_RETRY_BASE_MS || "250",
-    retryMaxDelayMs: process.env.ACCIO_RETRY_MAX_DELAY_MS || "2500"
+    retryMaxDelayMs: process.env.ACCIO_RETRY_MAX_DELAY_MS || "2500",
+    modelsSource: process.env.ACCIO_MODELS_SOURCE || "static",
+    modelsCacheTtlMs: process.env.ACCIO_MODELS_CACHE_TTL_MS || "30000",
+    maxBodyBytes: process.env.ACCIO_MAX_BODY_BYTES || String(10 * 1024 * 1024),
+    bodyReadTimeoutMs: process.env.ACCIO_BODY_READ_TIMEOUT_MS || "30000",
+    authCacheTtlMs: process.env.ACCIO_AUTH_CACHE_TTL_MS || String(2 * 60 * 1000)
   };
   const content = buildEnvFile(finalConfig);
 

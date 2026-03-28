@@ -95,23 +95,30 @@ Accio 桌面端本地暴露了两类入口：
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses` 最小可用子集
 - 非流式
 - SSE 流式
 - `tools`
 - `tool_calls`
+- `responses.input_text` / `responses.input_image` 到 OpenAI message 的最小映射
 - 响应顶层附加 `accio.*` 调试字段
 
 ### 额外能力
 
 - `ACCIO_TRANSPORT=auto|direct-llm|local-ws`
 - `ACCIO_AUTH_MODE=auto|file|env|gateway`
+- `ACCIO_MODELS_SOURCE=static|gateway|hybrid`
+- `ACCIO_MAX_BODY_BYTES` / `ACCIO_BODY_READ_TIMEOUT_MS` 请求体防护
+- `ACCIO_AUTH_CACHE_TTL_MS` 网关 token 短 TTL 缓存
 - `x-accio-session-id` / `x-session-id` 会话复用
 - `x-accio-conversation-id` 直接绑定已有 conversation
 - `x-accio-account-id` 指定外部账号凭证
+- 会话级账号粘性和可识别错误下的多账号 failover
 - 自动发现 Accio 本地账号、agent、workspace、source
 - 对本地网关超时/连接失败/429/5xx 做错误分类
 - 对可重试错误做指数退避重试
 - `GET /debug/accio-auth` 本地鉴权探测
+- `npm run accounts:list|probe|activate|validate` 账号池管理
 
 ## 仍然不是完整兼容
 
@@ -119,7 +126,9 @@ Accio 桌面端本地暴露了两类入口：
 
 - 只有 Claude 族模型在 Anthropic 流式下能做到接近原生的 SSE 透传
 - OpenAI 兼容接口当前是“OpenAI 协议适配 + Claude 上游执行”，不是直接调用 OpenAI 官方模型
-- 图片 block 还没有做完整上传桥接，当前仍偏向文本 / tool use 场景
+- `/v1/responses` 目前只支持最小可用非流式子集，尚未支持 streaming responses
+- 图片 block 目前只做 URL / base64 级别的最小映射，没有做完整上传桥接
+- thinking 目前只在 `direct-llm` 路径下按 Anthropic 语义透传，`local-ws` 会显式报不支持
 - `x-accio-session-id` 在 direct LLM 模式下只是桥接层会话标识，不对应 Accio cloud conversation
 
 ## 代理原理
@@ -145,7 +154,7 @@ Accio 桌面端本地暴露了两类入口：
 - `ACCIO_AUTH_MODE=auto`
   先尝试本地文件账号池，再尝试环境变量单账号，最后才回退到 Accio 本地网关
 - `ACCIO_AUTH_MODE=file`
-  只使用 `ACCIO_ACCOUNTS_PATH` 指向的账号池文件，不依赖 Accio 程序
+  只使用 `ACCIO_ACCOUNTS_CONFIG_PATH` 指向的账号池文件，不依赖 Accio 程序
 - `ACCIO_AUTH_MODE=env`
   只使用 `ACCIO_ACCESS_TOKEN` 指定的单账号 token，不依赖 Accio 程序
 - `ACCIO_AUTH_MODE=gateway`
@@ -286,7 +295,7 @@ npm run init-env -- --force
 ACCIO_TRANSPORT=auto
 ACCIO_AUTH_MODE=auto
 ACCIO_AUTH_STRATEGY=round_robin
-ACCIO_ACCOUNTS_PATH=config/accounts.json
+ACCIO_ACCOUNTS_CONFIG_PATH=config/accounts.json
 ACCIO_ACCESS_TOKEN=
 ACCIO_AUTH_ACCOUNT_ID=env-default
 ACCIO_GATEWAY_AUTOSTART=1
@@ -294,6 +303,11 @@ ACCIO_APP_PATH=/Applications/Accio.app
 ACCIO_GATEWAY_WAIT_MS=20000
 ACCIO_GATEWAY_POLL_MS=500
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
+ACCIO_MODELS_SOURCE=static
+ACCIO_MODELS_CACHE_TTL_MS=30000
+ACCIO_MAX_BODY_BYTES=10485760
+ACCIO_BODY_READ_TIMEOUT_MS=30000
+ACCIO_AUTH_CACHE_TTL_MS=120000
 ```
 
 如果你要调整模型别名映射，不需要改代码，直接编辑：
@@ -313,7 +327,7 @@ config/accounts.example.json
 ```bash
 ACCIO_TRANSPORT=direct-llm
 ACCIO_AUTH_MODE=file
-ACCIO_ACCOUNTS_PATH=config/accounts.json
+ACCIO_ACCOUNTS_CONFIG_PATH=config/accounts.json
 ```
 
 文件内容：
@@ -321,14 +335,33 @@ ACCIO_ACCOUNTS_PATH=config/accounts.json
 ```json
 {
   "strategy": "round_robin",
+  "activeAccount": "acct_primary",
   "accounts": [
     {
       "id": "acct_primary",
+      "name": "acct_primary",
       "accessToken": "replace-with-access-token",
-      "enabled": true
+      "enabled": true,
+      "priority": 1
+    },
+    {
+      "id": "acct_backup",
+      "name": "acct_backup",
+      "tokenFile": "./secrets/backup.token",
+      "enabled": true,
+      "priority": 2
     }
   ]
 }
+```
+
+账号池辅助命令：
+
+```bash
+npm run accounts:list
+npm run accounts:probe
+npm run accounts:activate -- acct_backup
+npm run accounts:validate
 ```
 
 如果你只想用一个 token，也可以不写账号池文件，直接用环境变量：
@@ -346,8 +379,7 @@ ACCIO_AUTH_ACCOUNT_ID=env-default
 npm run capture-token -- --write-file --account-id acct_primary
 ```
 
-这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_PATH`，默认也会在成功后自动关闭刚刚拉起的 Accio。
-这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_PATH`。bridge 不会自动关闭 Accio。
+这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_CONFIG_PATH`。当前 bridge 默认不会主动关闭 Accio。
 
 默认监听：
 
@@ -604,22 +636,25 @@ LOG_LEVEL=debug
 
 ## 已实测结果
 
-本机已经实测通过：
+本机已经实测通过或由自动化测试覆盖：
 
 - `GET /healthz`
 - `GET /v1/models`
 - `POST /v1/messages/count_tokens`
 - `POST /v1/messages`
 - `POST /v1/chat/completions`
+- `POST /v1/responses` 最小非流式子集
 - 相同 `session_id` 复用同一个 `conversation_id`
-- 响应中回带 `tool_use` 和 `accio.tool_results`
+- 会话级账号粘性与账号池选择
+- 响应中回带 `tool_use` / `tool_calls` / `accio.tool_results`
+- body size limit、body timeout、模型发现和工具校验的单元测试
 
 ## 后续还可以继续做
 
-1. 增加图片和多模态映射
-2. 把 `tool_result` 也映射成更接近官方协议的往返流程
-3. 增加 `/v1/responses` 或更多 OpenAI 兼容端点
+1. 补齐真正可互操作的 `tool_result` 往返协议，包括更完整的 multi-turn tool loop
+2. 扩展 `/v1/responses` 到 streaming 与更完整的 output item 子集
+3. 做更完整的图片/多模态上传桥接，而不是当前的 URL / base64 最小映射
 4. 在用户显式授权前提下，研究是否增加 Electron helper 去读取本地加密凭证
-5. 如果找到 Accio 本地可复用的上游 LLM 代发端点，再尝试做更深的直连适配
-6. 增加 conversation 清理和 session 过期策略
-7. 增加更细的日志与 debug tracing
+5. 如果找到更稳定的 Accio 上游 LLM 代发入口，再尝试做更深的直连适配
+6. 增加更细的 debug tracing、请求样本采样与问题复现工具
+7. 继续补充 live integration test，而不只依赖单元测试与本机手工验证

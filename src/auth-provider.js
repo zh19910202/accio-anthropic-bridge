@@ -29,23 +29,56 @@ class AuthProvider {
     this.strategy = normalizeStrategy(config.authStrategy);
     this._rrIndex = 0;
     this._invalidAccounts = new Map();
+    this._lastFailures = new Map();
   }
 
   _resolveAccountsPath() {
     return path.resolve(this.config.accountsPath || path.join(process.cwd(), "config", "accounts.json"));
   }
 
-  _normalizeAccount(account) {
-    if (!account || typeof account !== "object" || !account.accessToken) {
+  _resolveToken(account) {
+    if (account.accessToken) {
+      return String(account.accessToken);
+    }
+
+    if (account.tokenFile) {
+      try {
+        return String(fs.readFileSync(path.resolve(account.tokenFile), "utf8")).trim();
+      } catch (error) {
+        log.debug("auth provider token file load failed", {
+          tokenFile: account.tokenFile,
+          error: error && error.message ? error.message : String(error)
+        });
+      }
+    }
+
+    if (account.envKey && process.env[account.envKey]) {
+      return String(process.env[account.envKey]).trim();
+    }
+
+    return "";
+  }
+
+  _normalizeAccount(account, index = 0) {
+    if (!account || typeof account !== "object") {
       return null;
     }
 
+    const accessToken = this._resolveToken(account);
+    const id = String(account.id || account.accountId || account.name || `acct_${index + 1}`);
+
     return {
-      id: String(account.id || account.accountId || `acct_${Math.random().toString(36).slice(2, 10)}`),
-      accessToken: String(account.accessToken),
+      id,
+      name: String(account.name || id),
+      accessToken,
       enabled: account.enabled !== false,
       expiresAt: Number(account.expiresAt || 0) || null,
-      source: account.source || "file"
+      source: account.source || "file",
+      priority: Number(account.priority || index + 1) || index + 1,
+      authMode: account.authMode || null,
+      baseUrl: account.baseUrl || null,
+      transportOverride: account.transportOverride || null,
+      accountId: String(account.accountId || id)
     };
   }
 
@@ -54,12 +87,21 @@ class AuthProvider {
 
     try {
       const parsed = parseJsonFile(filePath);
-      const rawAccounts = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.accounts) ? parsed.accounts : [];
+      const rawAccounts = Array.isArray(parsed)
+        ? parsed
+        : parsed && Array.isArray(parsed.accounts)
+          ? parsed.accounts
+          : [];
       const strategy = Array.isArray(parsed) ? this.strategy : normalizeStrategy(parsed && parsed.strategy);
-      const accounts = rawAccounts.map((account) => this._normalizeAccount(account)).filter(Boolean);
+      const activeAccount = Array.isArray(parsed) ? null : parsed && parsed.activeAccount ? String(parsed.activeAccount) : null;
+      const accounts = rawAccounts
+        .map((account, index) => this._normalizeAccount(account, index))
+        .filter(Boolean)
+        .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
 
       return {
         strategy,
+        activeAccount,
         accounts,
         filePath,
         ok: true
@@ -74,6 +116,7 @@ class AuthProvider {
 
       return {
         strategy: this.strategy,
+        activeAccount: null,
         accounts: [],
         filePath,
         ok: false
@@ -91,12 +134,31 @@ class AuthProvider {
     return [
       {
         id: String(this.config.envAccountId || "env-default"),
+        name: String(this.config.envAccountId || "env-default"),
         accessToken,
         enabled: true,
         expiresAt: Number(this.config.accessTokenExpiresAt || 0) || null,
-        source: "env"
+        source: "env",
+        priority: 1,
+        authMode: "env",
+        baseUrl: null,
+        transportOverride: null,
+        accountId: String(this.config.envAccountId || "env-default")
       }
     ];
+  }
+
+  getInvalidUntil(accountId) {
+    return this._invalidAccounts.get(String(accountId)) || null;
+  }
+
+  getLastFailure(accountId) {
+    return this._lastFailures.get(String(accountId)) || null;
+  }
+
+  isAccountUsable(accountId) {
+    const account = this.getConfiguredAccounts().find((item) => item.id === String(accountId));
+    return this._isAccountUsable(account);
   }
 
   _isAccountUsable(account) {
@@ -112,9 +174,50 @@ class AuthProvider {
     return invalidUntil <= Date.now();
   }
 
-  _pickAccount(accounts, requestedAccountId) {
+  getConfiguredAccounts() {
+    const fileState = this._loadFileAccounts();
+    const envAccounts = this._loadEnvAccounts();
+
+    if (this.mode === "file") {
+      this._fileStrategy = fileState.strategy;
+      this._activeAccount = fileState.activeAccount;
+      return fileState.accounts;
+    }
+
+    if (this.mode === "env") {
+      this._fileStrategy = this.strategy;
+      this._activeAccount = null;
+      return envAccounts;
+    }
+
+    this._fileStrategy = fileState.strategy;
+    this._activeAccount = fileState.activeAccount;
+    return [...fileState.accounts, ...envAccounts];
+  }
+
+  _pickAccount(accounts, options = {}) {
+    const requestedAccountId = options.accountId ? String(options.accountId) : null;
+    const stickyAccountId = options.stickyAccountId ? String(options.stickyAccountId) : null;
+    const activeAccount = options.activeAccount ? String(options.activeAccount) : null;
+
     if (requestedAccountId) {
-      return accounts.find((account) => account.id === requestedAccountId) || null;
+      return accounts.find((account) => account.id === requestedAccountId || account.name === requestedAccountId) || null;
+    }
+
+    if (stickyAccountId) {
+      const sticky = accounts.find((account) => account.id === stickyAccountId || account.name === stickyAccountId);
+
+      if (sticky) {
+        return sticky;
+      }
+    }
+
+    if (activeAccount) {
+      const active = accounts.find((account) => account.id === activeAccount || account.name === activeAccount);
+
+      if (active) {
+        return active;
+      }
     }
 
     if (accounts.length === 0) {
@@ -136,45 +239,61 @@ class AuthProvider {
     return account;
   }
 
-  getExternalAccounts() {
-    if (this.mode === "file" || this.mode === "auto") {
-      const fileState = this._loadFileAccounts();
-      this._fileStrategy = fileState.strategy;
-      const fileAccounts = fileState.accounts.filter((account) => this._isAccountUsable(account));
-
-      if (fileAccounts.length > 0 || this.mode === "file") {
-        return fileAccounts;
-      }
-    }
-
-    if (this.mode === "env" || this.mode === "auto") {
-      return this._loadEnvAccounts().filter((account) => this._isAccountUsable(account));
-    }
-
-    return [];
-  }
-
   resolveCredential(options = {}) {
-    const requestedAccountId = options.accountId ? String(options.accountId) : null;
-    const excludeIds = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
-    const candidates = this.getExternalAccounts().filter((account) => !excludeIds.has(account.id));
-    const account = this._pickAccount(candidates, requestedAccountId);
+    const excludeIds = new Set(Array.isArray(options.excludeIds) ? options.excludeIds.map(String) : []);
+    const candidates = this.getConfiguredAccounts().filter(
+      (account) => this._isAccountUsable(account) && !excludeIds.has(account.id)
+    );
+    const account = this._pickAccount(candidates, {
+      accountId: options.accountId,
+      stickyAccountId: options.stickyAccountId,
+      activeAccount: this._activeAccount
+    });
 
     return account
       ? {
           accountId: account.id,
+          accountName: account.name,
           token: account.accessToken,
-          source: account.source
+          source: account.source,
+          transportOverride: account.transportOverride || null,
+          baseUrl: account.baseUrl || null
         }
       : null;
   }
 
-  invalidateAccount(accountId) {
+  invalidateAccount(accountId, reason = null) {
     if (!accountId) {
       return;
     }
 
     this._invalidAccounts.set(String(accountId), Date.now() + INVALIDATION_MS);
+
+    if (reason) {
+      this._lastFailures.set(String(accountId), {
+        at: new Date().toISOString(),
+        reason: String(reason)
+      });
+    }
+  }
+
+  recordFailure(accountId, error) {
+    if (!accountId) {
+      return;
+    }
+
+    this._lastFailures.set(String(accountId), {
+      at: new Date().toISOString(),
+      reason: error && error.message ? error.message : String(error)
+    });
+  }
+
+  clearFailure(accountId) {
+    if (!accountId) {
+      return;
+    }
+
+    this._lastFailures.delete(String(accountId));
   }
 
   clearInvalidation(accountId) {
@@ -193,9 +312,14 @@ class AuthProvider {
       mode: this.mode,
       strategy: normalizeStrategy(fileState.strategy || this.strategy),
       accountsPath: fileState.filePath,
+      activeAccount: fileState.activeAccount,
       fileAccounts: fileState.accounts.map((account) => account.id),
       envAccounts: envAccounts.map((account) => account.id),
-      activeExternalAccounts: this.getExternalAccounts().map((account) => account.id)
+      activeExternalAccounts: this.getConfiguredAccounts()
+        .filter((account) => this._isAccountUsable(account))
+        .map((account) => account.id),
+      lastFailures: Object.fromEntries(this._lastFailures),
+      invalidAccounts: Object.fromEntries(this._invalidAccounts)
     };
   }
 }
