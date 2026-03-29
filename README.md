@@ -20,6 +20,9 @@
 - 一键环境初始化与 `.env` 自动加载
 - 请求级结构化日志
 - Node.js 内置测试覆盖
+- 可视化管理台（`/admin`），含多账号 OAuth 登录、快照管理、网关状态实时展示
+- Electron 桌面壳，内嵌管理台并自动管理 bridge 子进程生命周期
+- 网关模型列表动态发现（`ACCIO_MODELS_SOURCE=gateway|hybrid`）
 
 ## 免责申明
 
@@ -123,6 +126,12 @@ Accio 桌面端本地暴露了两类入口：
 - `GET /debug/accio-auth` 本地鉴权探测
 - `GET /debug/traces` / `GET /debug/traces/:id` / `GET /debug/traces/:id/replay` 调试样本查看与复现导出
 - `npm run accounts:list|probe|activate|validate` 账号池管理
+- `GET /admin` 可视化管理台，含多账号登录、快照管理、网关状态
+- `POST /admin/api/accounts/login` 发起浏览器 OAuth 多账号登录流
+- `GET /admin/api/accounts/callback` OAuth 登录回调
+- `GET /admin/api/accounts/login-status` 登录流轮询
+- `POST /admin/api/snapshots/delete` 删除本机快照
+- 管理台网关模型列表发现（`ACCIO_MODELS_SOURCE=gateway|hybrid`）
 
 ## 仍然不是完整兼容
 
@@ -254,6 +263,8 @@ ACCIO_AUTH_MODE=file
 accio-anthropic-bridge/
   config/
     model-aliases.json
+    accounts.example.json
+    accounts.json
   .env.example
   .gitignore
   package.json
@@ -261,26 +272,56 @@ accio-anthropic-bridge/
     sessions.json
   src/
     accio-client.js
+    accounts-file.js
     anthropic.js
+    auth-provider.js
+    auth-state.js
+    bootstrap.js
     bridge-core.js
+    debug-traces.js
     direct-llm.js
     discovery.js
+    env-file.js
     errors.js
+    gateway-manager.js
     http.js
     jsonc.js
     logger.js
+    model.js
+    models.js
     middleware/
       body-parser.js
+    openai.js
+    redaction.js
+    request-defaults.js
+    response-cache.js
     routes/
+      admin.js
       anthropic.js
+      debug.js
       health.js
       openai.js
+    runtime-config.js
+    server.js
+    session-store.js
+    start.js
     stream/
       anthropic-sse.js
       openai-sse.js
-    openai.js
-    server.js
-    session-store.js
+      responses-sse.js
+    tooling.js
+  scripts/
+    accounts.js
+    auth-relogin.js
+    auth-state.js
+    capture-token.js
+    init-env.js
+    open-admin.js
+  desktop/
+    main.js
+    preload.js
+    start.js
+    package.json
   test/
     *.test.js
 ```
@@ -288,7 +329,6 @@ accio-anthropic-bridge/
 ## 启动
 
 ```bash
-cd /Users/snow/accio-anthropic-bridge
 npm start
 ```
 
@@ -461,11 +501,13 @@ npm run manager:open
 
 管理台当前支持：
 
-- 查看当前 Accio 登录状态和当前用户
+- 查看当前 Accio 网关状态和当前用户（脉冲指示灯实时反馈）
 - 查看本机登录态落盘位置
-- 保存和激活本机快照
-- 发起网页登录 / 执行登出
+- 保存、切换和删除本机账号快照
+- 通过浏览器完成多账号 OAuth 登录，登录完成后自动记录快照
+- 执行登出
 - 把当前 token 写回账号池文件
+- 按钮加载 spinner、消息通知自动消失、删除双击确认等交互
 
 桌面壳（Electron）：
 
@@ -474,17 +516,21 @@ npm run desktop:install
 npm run desktop:start
 ```
 
-桌面壳会做三件事：
+桌面壳会做四件事：
 
 - 先检查本地 bridge 是否已经在 `http://127.0.0.1:<PORT>` 监听；如果没起来，就从当前仓库目录自动执行 `node src/start.js`
 - 把已有的管理台 `/admin` 直接嵌进桌面窗口，不重复实现一套独立管理逻辑
-- 只在“桌面壳自己拉起了 bridge”时，退出桌面壳时一并结束那个子进程；如果 bridge 本来就是你手动启动的，它不会额外干预
+- 启动一个本地 desktop helper HTTP server（默认 `127.0.0.1:8090`），支持通过 HTTP 触发"拉起 Accio 桌面端"等命令
+- 只在"桌面壳自己拉起了 bridge"时，退出桌面壳时一并结束那个子进程；如果 bridge 本来就是你手动启动的，它不会额外干预
+
+桌面壳同时提供了 preload 脚本，在页面中暴露 `window.accioBridgeDesktop.launchAccio()` API，管理台可通过此接口或 `accio-bridge://launch-accio` 协议触发 Accio 桌面端启动。
 
 说明：
 
 - 当前是本地桌面壳，不是已打包的 `.app` / `.exe` 发布物
 - 第一次使用前需要先执行一次 `npm run desktop:install` 安装 Electron
 - bridge 的实际端口仍然以你的 `.env` 里的 `PORT` 为准，桌面壳会读取同一个 `.env`
+- helper server 端口可通过 `ACCIO_DESKTOP_HELPER_PORT` 环境变量或 runtime config 的 `desktopHelperUrl` 配置
 
 ## 本地鉴权探测
 
@@ -758,8 +804,18 @@ LOG_LEVEL=debug
   单账号/多账号外部凭证池模板
 - [src/auth-provider.js](/Users/snow/accio-anthropic-bridge/src/auth-provider.js)
   认证来源选择、账号池轮询、账号失效熔断
+- [src/accounts-file.js](/Users/snow/accio-anthropic-bridge/src/accounts-file.js)
+  本机账号注册表，记录 gatewayUser 元数据和凭证产物追踪
+- [src/auth-state.js](/Users/snow/accio-anthropic-bridge/src/auth-state.js)
+  本机登录态快照管理，包括快照、激活、删除和完整凭证捕获
 - [src/gateway-manager.js](/Users/snow/accio-anthropic-bridge/src/gateway-manager.js)
   本地网关探测、自动拉起 Accio、抓取 gateway token、可选自动退出
+- [src/runtime-config.js](/Users/snow/accio-anthropic-bridge/src/runtime-config.js)
+  运行时配置加载，合并 `.env` / 环境变量 / 命令行参数
+- [src/models.js](/Users/snow/accio-anthropic-bridge/src/models.js)
+  模型列表管理，支持静态/网关/混合模式发现
+- [src/routes/admin.js](/Users/snow/accio-anthropic-bridge/src/routes/admin.js)
+  管理台路由，含 OAuth 多账号登录流、快照 CRUD、网关状态 API、管理台页面渲染
 - [scripts/capture-token.js](/Users/snow/accio-anthropic-bridge/scripts/capture-token.js)
   显式抓取 Accio token 并写入账号池文件
 - [src/env-file.js](/Users/snow/accio-anthropic-bridge/src/env-file.js)
@@ -772,6 +828,12 @@ LOG_LEVEL=debug
   Anthropic 请求压平和响应映射
 - [src/openai.js](/Users/snow/accio-anthropic-bridge/src/openai.js)
   OpenAI 请求压平和响应映射
+- [desktop/main.js](/Users/snow/accio-anthropic-bridge/desktop/main.js)
+  Electron 主进程：窗口管理、bridge 子进程生命周期、desktop helper server、Accio 桌面端拉起
+- [desktop/preload.js](/Users/snow/accio-anthropic-bridge/desktop/preload.js)
+  Electron preload 脚本，通过 contextBridge 暴露 `accioBridgeDesktop` API
+- [desktop/start.js](/Users/snow/accio-anthropic-bridge/desktop/start.js)
+  桌面壳启动入口，从当前 Node 进程 spawn Electron
 
 ## 已实测结果
 
@@ -790,13 +852,20 @@ LOG_LEVEL=debug
 - 失败请求自动 trace 采样和脱敏 replay 导出
 - 响应中回带 `tool_use` / `tool_calls` / `accio.tool_results`
 - body size limit、body timeout、模型发现、工具校验和 trace store 的单元测试
+- `GET /admin` 管理台页面加载
+- `GET /admin/api/state` 网关状态 JSON 查询
+- `POST /admin/api/accounts/login` → 浏览器 OAuth → `GET /admin/api/accounts/callback` 完整登录流
+- `POST /admin/api/snapshots/delete` 快照删除
+- direct-llm 请求构造和网关模型列表提取的单元测试
 
 ## 后续还可以继续做
 
 1. 补齐真正可互操作的 `tool_result` 往返协议，包括更完整的 multi-turn tool loop
 2. 继续扩展 `/v1/responses` 的 reasoning item、tool_result item 和更细粒度事件覆盖
 3. 做更完整的图片/多模态上传桥接，而不是当前的 URL / base64 最小映射
-4. 在用户显式授权前提下，研究是否增加 Electron helper 去读取本地加密凭证
+4. ~~在用户显式授权前提下，研究是否增加 Electron helper 去读取本地加密凭证~~ — 已实现：desktop helper server 支持 `/debug/decrypt-credentials`
 5. 如果找到更稳定的 Accio 上游 LLM 代发入口，再尝试做更深的直连适配
 6. 在现有 trace store 基础上继续补 trace diff、导出 CLI 和自动复跑工具
 7. 继续补充 live integration test，而不只依赖单元测试与本机手工验证
+8. 将桌面壳打包为 `.app` / `.exe` / `.deb` 发布物，而不只是本地 `npm run desktop:start`
+9. 管理台增加账号分组、备注标签、批量操作等高级管理功能
