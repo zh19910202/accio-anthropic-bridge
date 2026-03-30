@@ -9,10 +9,8 @@ function parseEnvValue(raw) {
     return "";
   }
 
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
+  // Double-quoted: process escape sequences (shell-style)
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
     const inner = trimmed.slice(1, -1);
     return inner
       .replace(/\\n/g, "\n")
@@ -22,15 +20,28 @@ function parseEnvValue(raw) {
       .replace(/\\\\/g, "\\");
   }
 
+  // Single-quoted: literal value, no escape processing (POSIX shell semantics)
+  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
+    return trimmed.slice(1, -1);
+  }
+
   return trimmed;
 }
 
 function loadEnvFile(filePath) {
-  if (!fs.existsSync(filePath)) {
-    return;
+  let text;
+
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return;
+    }
+
+    throw error;
   }
 
-  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  const lines = text.split(/\r?\n/);
 
   for (const line of lines) {
     const trimmed = line.trim();

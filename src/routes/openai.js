@@ -10,7 +10,6 @@ const {
 } = require("../errors");
 const { shouldFallbackToExternalProvider } = require("../external-fallback");
 const { writeJson } = require("../http");
-const log = require("../logger");
 const { readJsonBody } = require("../middleware/body-parser");
 const {
   applyOpenAiDefaults,
@@ -38,30 +37,11 @@ const {
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
 const { generateId } = require("../id");
+const { cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
 const { resolveSessionBinding } = require("../session-store");
 
-function requestedAccountId(headers) {
-  return headers["x-accio-account-id"] || headers["x-account-id"] || null;
-}
-
 function logRequest(req, message, meta = {}) {
-  log.info(message, {
-    requestId: req.bridgeContext && req.bridgeContext.requestId ? req.bridgeContext.requestId : null,
-    protocol: "openai",
-    ...meta
-  });
-}
-
-function cacheHeaders(state) {
-  return {
-    "x-accio-cache": state
-  };
-}
-
-function fallbackTransportName(fallbackClient) {
-  return fallbackClient && fallbackClient.protocol === "anthropic"
-    ? "external-anthropic"
-    : "external-openai";
+  return logRequestShared(req, message, "openai", meta);
 }
 
 function fallbackCandidatesForOpenAi(fallbackPool, body) {

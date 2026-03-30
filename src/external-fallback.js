@@ -311,7 +311,10 @@ function shouldFallbackToExternalProvider(error) {
   const type = String(error.type || "").toLowerCase();
   const message = String(error.message || "").toLowerCase();
 
-  if (status === 401 || status === 403 || status === 408 || status === 429 || status >= 500) {
+  // 413: payload too large — another provider may have a higher limit
+  // 5xx except 501: transient server errors worth retrying externally
+  // 501 Not Implemented is excluded: no external provider will support it either
+  if (status === 401 || status === 403 || status === 408 || status === 413 || status === 429 || (status >= 500 && status !== 501)) {
     return true;
   }
 
