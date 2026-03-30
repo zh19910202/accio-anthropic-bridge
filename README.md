@@ -93,6 +93,30 @@ npm run desktop:start
 
 说明：当前是本地桌面壳，不是已打包的 `.app` / `.exe`。第一次使用前需要先 `npm run desktop:install`。
 
+### 打包桌面应用
+
+当前仓库已经补齐 Electron 打包配置，可以直接生成桌面产物：
+
+```bash
+npm run desktop:pack   # 生成未安装目录产物
+npm run desktop:dist   # 生成正式分发产物
+```
+
+目前已实测 `desktop:pack` 可在 macOS `arm64` 产出：
+
+- `desktop/dist/mac-arm64/Accio Bridge Desktop.app`
+
+打包后桌面壳会：
+
+- 从应用资源内启动内置 bridge，而不是依赖仓库源码目录
+- 默认把 `.env`、账号池、session、trace 等运行时文件写到 Electron `userData` 目录
+- 初次启动如果还没有 `.env`，会自动执行与源码模式相同的初始化流程
+
+补充说明：
+
+- 当前默认关闭自动证书发现，优先保证本地可稳定打包；需要正式签名时再单独配置 macOS 证书 / notarization
+- 当前没有单独的 `.icns` / `.ico`，打包会先使用 Electron 默认图标；运行时窗口图标仍使用仓库内 PNG 资源
+
 ## 当前支持
 
 ### Anthropic 兼容

@@ -33,9 +33,19 @@ function getRepoRoot() {
   return path.resolve(__dirname, "..");
 }
 
+function getDataRoot() {
+  const configured = String(env("ACCIO_DATA_DIR", "")).trim();
+
+  if (configured) {
+    return path.resolve(configured);
+  }
+
+  return path.join(getRepoRoot(), ".data");
+}
+
 function getSnapshotRoot() {
   return path.resolve(
-    env("ACCIO_AUTH_SNAPSHOT_DIR", path.join(getRepoRoot(), ".data", "auth-snapshots"))
+    env("ACCIO_AUTH_SNAPSHOT_DIR", path.join(getDataRoot(), "auth-snapshots"))
   );
 }
 

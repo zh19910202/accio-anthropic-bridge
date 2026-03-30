@@ -5,7 +5,9 @@ const path = require("node:path");
 
 const { main: initEnv } = require("../scripts/init-env");
 
-const envPath = path.resolve(__dirname, "..", ".env");
+const envPath = process.env.ACCIO_ENV_PATH
+  ? path.resolve(process.env.ACCIO_ENV_PATH)
+  : path.resolve(__dirname, "..", ".env");
 
 async function main() {
   if (!fs.existsSync(envPath)) {

@@ -9,7 +9,7 @@ const { loadEnvFile } = require("../src/env-file");
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = path.resolve(__dirname, "..");
-loadEnvFile(path.join(REPO_ROOT, ".env"));
+loadEnvFile(process.env.ACCIO_ENV_PATH ? path.resolve(process.env.ACCIO_ENV_PATH) : path.join(REPO_ROOT, ".env"));
 
 function env(name, fallback) {
   return Object.prototype.hasOwnProperty.call(process.env, name)

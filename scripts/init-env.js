@@ -15,7 +15,9 @@ const {
 } = require("../src/discovery");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
-const ENV_PATH = path.join(REPO_ROOT, ".env");
+const ENV_PATH = process.env.ACCIO_ENV_PATH
+  ? path.resolve(process.env.ACCIO_ENV_PATH)
+  : path.join(REPO_ROOT, ".env");
 
 function parseArgs(argv) {
   return {
@@ -226,6 +228,7 @@ async function main() {
     return;
   }
 
+  fs.mkdirSync(path.dirname(ENV_PATH), { recursive: true });
   fs.writeFileSync(ENV_PATH, content, "utf8");
   process.stdout.write(`Generated ${ENV_PATH}\n`);
 

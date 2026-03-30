@@ -20,7 +20,9 @@
     "manager:open": "node scripts/open-admin.js",
     "desktop:install": "npm --prefix desktop install",
     "desktop:start": "npm --prefix desktop start",
-    "desktop:check": "npm --prefix desktop run check"
+    "desktop:check": "npm --prefix desktop run check",
+    "desktop:pack": "npm --prefix desktop run pack",
+    "desktop:dist": "npm --prefix desktop run dist"
   },
   "engines": {
     "node": ">=22"

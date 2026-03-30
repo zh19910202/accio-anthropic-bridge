@@ -6,9 +6,58 @@
   "main": "main.js",
   "scripts": {
     "start": "node start.js",
-    "check": "node --check main.js && node --check start.js"
+    "check": "node --check main.js && node --check preload.js && node --check start.js",
+    "pack": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir",
+    "dist": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder"
   },
   "devDependencies": {
-    "electron": "41.1.0"
+    "electron": "41.1.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.zh19910202.accio-bridge-desktop",
+    "productName": "Accio Bridge Desktop",
+    "directories": {
+      "output": "dist"
+    },
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "start.js",
+      "assets/**/*",
+      {
+        "from": "../src",
+        "to": "src",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../scripts",
+        "to": "scripts",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../config",
+        "to": "config",
+        "filter": [
+          "**/*"
+        ]
+      },
+      "!../test{,/**/*}",
+      "!../.git{,/**/*}",
+      "!../desktop/dist{,/**/*}"
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns"
+    }
   }
 }

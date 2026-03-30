@@ -60,7 +60,7 @@ function createConfig() {
   const primaryFallback = fallbackTargets[0] || normalizeFallbackTarget({}, 0);
 
   return {
-    envPath: path.join(process.cwd(), ".env"),
+    envPath: env("ACCIO_ENV_PATH", path.join(process.cwd(), ".env")),
     port: Number(env("PORT", "8082")),
     baseUrl: env("ACCIO_BASE_URL", "http://127.0.0.1:4097"),
     accioHome: discovered.accioHome,

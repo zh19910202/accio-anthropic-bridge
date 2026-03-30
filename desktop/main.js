@@ -1,19 +1,41 @@
 "use strict";
 
+const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { app, BrowserWindow, Menu, dialog, shell, clipboard, ipcMain, safeStorage, nativeImage } = require("electron");
 
-const { loadEnvFile } = require("../src/env-file");
-const { createConfig } = require("../src/runtime-config");
-
 const execFileAsync = promisify(execFile);
-const REPO_ROOT = path.resolve(__dirname, "..");
+const IS_PACKAGED = app.isPackaged;
+const CODE_ROOT = IS_PACKAGED ? __dirname : path.resolve(__dirname, "..");
+const APP_ROOT = CODE_ROOT;
+const BRIDGE_ENTRY_PATH = path.join(CODE_ROOT, "src", "start.js");
+const BRIDGE_WORKDIR = IS_PACKAGED ? app.getPath("userData") : APP_ROOT;
+const RUNTIME_ROOT = IS_PACKAGED ? app.getPath("userData") : APP_ROOT;
+const ENV_PATH = path.join(RUNTIME_ROOT, ".env");
+const CONFIG_DIR = path.join(RUNTIME_ROOT, "config");
+const DATA_DIR = path.join(RUNTIME_ROOT, ".data");
+const ACCOUNTS_PATH = path.join(CONFIG_DIR, "accounts.json");
+const SESSION_STORE_PATH = path.join(DATA_DIR, "sessions.json");
+const AUTH_STATE_PATH = path.join(DATA_DIR, "auth-provider-state.json");
+const AUTH_SNAPSHOT_DIR = path.join(DATA_DIR, "auth-snapshots");
+const TRACE_DIR = path.join(DATA_DIR, "traces");
 const PRELOAD_PATH = path.join(__dirname, "preload.js");
-const ENV_PATH = path.join(REPO_ROOT, ".env");
 const DESKTOP_ICON_PATH = path.join(__dirname, "assets", "icon-512.png");
+const { loadEnvFile } = require(path.join(CODE_ROOT, "src", "env-file"));
+const { createConfig } = require(path.join(CODE_ROOT, "src", "runtime-config"));
+
+if (IS_PACKAGED) {
+  process.env.ACCIO_ENV_PATH = process.env.ACCIO_ENV_PATH || ENV_PATH;
+  process.env.ACCIO_ACCOUNTS_CONFIG_PATH = process.env.ACCIO_ACCOUNTS_CONFIG_PATH || ACCOUNTS_PATH;
+  process.env.ACCIO_DATA_DIR = process.env.ACCIO_DATA_DIR || DATA_DIR;
+  process.env.ACCIO_SESSION_STORE_PATH = process.env.ACCIO_SESSION_STORE_PATH || SESSION_STORE_PATH;
+  process.env.ACCIO_AUTH_STATE_PATH = process.env.ACCIO_AUTH_STATE_PATH || AUTH_STATE_PATH;
+  process.env.ACCIO_AUTH_SNAPSHOT_DIR = process.env.ACCIO_AUTH_SNAPSHOT_DIR || AUTH_SNAPSHOT_DIR;
+  process.env.ACCIO_TRACE_DIR = process.env.ACCIO_TRACE_DIR || TRACE_DIR;
+}
 
 loadEnvFile(ENV_PATH);
 
@@ -24,7 +46,9 @@ const ADMIN_URL = `${BRIDGE_BASE_URL}/admin`;
 const STATE_URL = `${BRIDGE_BASE_URL}/admin/api/state`;
 const HEALTH_URL = `${BRIDGE_BASE_URL}/healthz`;
 const START_TIMEOUT_MS = 30000;
-const BRIDGE_NODE_PATH = process.env.ACCIO_DESKTOP_NODE_PATH || process.env.NODE || "node";
+const BRIDGE_NODE_PATH = IS_PACKAGED
+  ? process.execPath
+  : (process.env.ACCIO_DESKTOP_NODE_PATH || process.env.NODE || "node");
 const START_POLL_MS = 500;
 const DESKTOP_HELPER_PORT = Number(process.env.ACCIO_DESKTOP_HELPER_PORT || bridgeConfig.desktopHelperUrl?.match(/:(\d+)(?:\/|$)/)?.[1] || 8090);
 
@@ -41,6 +65,13 @@ function loadDesktopIcon() {
   }
 
   return null;
+}
+
+function ensureRuntimeLayout() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(AUTH_SNAPSHOT_DIR, { recursive: true });
+  fs.mkdirSync(TRACE_DIR, { recursive: true });
 }
 
 let mainWindow = null;
@@ -377,9 +408,27 @@ function startBridgeProcess() {
     return bridgeProcess;
   }
 
-  bridgeProcess = spawn(BRIDGE_NODE_PATH, [path.join(REPO_ROOT, "src", "start.js")], {
-    cwd: REPO_ROOT,
-    env: process.env,
+  ensureRuntimeLayout();
+
+  const bridgeEnv = {
+    ...process.env,
+    ACCIO_ENV_PATH: ENV_PATH,
+    ACCIO_ACCOUNTS_CONFIG_PATH: ACCOUNTS_PATH,
+    ACCIO_DATA_DIR: DATA_DIR,
+    ACCIO_SESSION_STORE_PATH: SESSION_STORE_PATH,
+    ACCIO_AUTH_STATE_PATH: AUTH_STATE_PATH,
+    ACCIO_AUTH_SNAPSHOT_DIR: AUTH_SNAPSHOT_DIR,
+    ACCIO_TRACE_DIR: TRACE_DIR,
+    ACCIO_DESKTOP_NODE_PATH: BRIDGE_NODE_PATH
+  };
+
+  if (IS_PACKAGED) {
+    bridgeEnv.ELECTRON_RUN_AS_NODE = "1";
+  }
+
+  bridgeProcess = spawn(BRIDGE_NODE_PATH, [BRIDGE_ENTRY_PATH], {
+    cwd: BRIDGE_WORKDIR,
+    env: bridgeEnv,
     stdio: ["ignore", "pipe", "pipe"]
   });
   bridgeOwned = true;
