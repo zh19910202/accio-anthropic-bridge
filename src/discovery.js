@@ -463,14 +463,39 @@ function discoverAccioConfig(overrides = {}) {
   };
 }
 
+function readAccioUtdid(accioHome) {
+  const base = String(accioHome || "").trim();
+  if (!base) {
+    return "";
+  }
+
+  try {
+    return fs.readFileSync(path.join(base, "utdid"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function extractCnaFromCookie(rawCookie) {
+  if (!rawCookie) {
+    return "";
+  }
+
+  const text = String(rawCookie);
+  const match = text.match(/(?:^|%3B\s*|;\s*)cna(?:=|%3D)([^;%]+)/i);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
 module.exports = {
   discoverAccioConfig,
   discoverAccioAppPath,
   discoverSessionCandidates,
   discoverSessionSource,
   exists,
+  extractCnaFromCookie,
   listDirectories,
   parseSessionKey,
+  readAccioUtdid,
   readJsonIfExists,
   resolveAccioHome
 };

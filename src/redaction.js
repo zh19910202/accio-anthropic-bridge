@@ -98,9 +98,18 @@ function sanitizeHeaders(headers, options = {}) {
   );
 }
 
+function maskToken(token) {
+  if (!token || typeof token !== "string") {
+    return null;
+  }
+
+  return token.length > 8 ? `${token.slice(0, 8)}***` : "***";
+}
+
 module.exports = {
   DEFAULT_MAX_STRING_LENGTH,
   maskSecret,
+  maskToken,
   sanitizeHeaders,
   sanitizeValue,
   truncateString

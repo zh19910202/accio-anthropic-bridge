@@ -1,8 +1,6 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const fs = require("node:fs");
-const path = require("node:path");
 
 const modelAliases = require("../config/model-aliases.json");
 
@@ -11,31 +9,10 @@ const { extractGatewayModels } = require("./models");
 const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 const { safeJsonParse } = require("./jsonc");
+const { maskToken } = require("./redaction");
+const { readAccioUtdid, extractCnaFromCookie } = require("./discovery");
 
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
-
-function readAccioUtdid(accioHome) {
-  const base = String(accioHome || "").trim();
-  if (!base) {
-    return "";
-  }
-
-  try {
-    return fs.readFileSync(path.join(base, "utdid"), "utf8").trim();
-  } catch {
-    return "";
-  }
-}
-
-function extractCnaFromCookie(rawCookie) {
-  if (!rawCookie) {
-    return "";
-  }
-
-  const text = String(rawCookie);
-  const match = text.match(/(?:^|%3B\s*|;\s*)cna(?:=|%3D)([^;%]+)/i);
-  return match ? decodeURIComponent(match[1]) : "";
-}
 
 function mapRequestedModel(model, protocol) {
   const requested = normalizeRequestedModel(model);
@@ -629,14 +606,6 @@ async function* parseSseEvents(stream, maxBufferSize = 10 * 1024 * 1024) {
   } finally {
     reader.releaseLock();
   }
-}
-
-function maskToken(token) {
-  if (!token || typeof token !== "string") {
-    return "***";
-  }
-
-  return token.length > 8 ? `${token.slice(0, 8)}***` : "***";
 }
 
 function sanitizeErrorText(text, token) {

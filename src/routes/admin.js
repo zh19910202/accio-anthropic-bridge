@@ -8,6 +8,7 @@ const { promisify } = require("node:util");
 
 const { readJsonBody } = require("../middleware/body-parser");
 const { writeJson, writeSse, CORS_HEADERS } = require("../http");
+const { readAccioUtdid, extractCnaFromCookie } = require("../discovery");
 const { parseEnvValue } = require("../env-file");
 const {
   detectActiveStorage,
@@ -20,6 +21,7 @@ const {
   writeSnapshotAuthPayload
 } = require("../auth-state");
 const { writeAccountToFile, findStoredAccountAuthPayload } = require("../accounts-file");
+const { maskToken } = require("../redaction");
 const log = require("../logger");
 
 const execFileAsync = promisify(execFile);
@@ -121,15 +123,6 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-function maskToken(token) {
-  if (!token) {
-    return null;
-  }
-
-  const text = String(token);
-  return text.length > 8 ? `${text.slice(0, 8)}***` : "***";
 }
 
 function getSnapshotEntry(alias) {
@@ -362,37 +355,13 @@ function deriveUpstreamGatewayBaseUrl(config) {
   return "https://phoenix-gw.alibaba.com";
 }
 
-function readAccioUtdid(config) {
-  const accioHome = config && config.accioHome ? String(config.accioHome).trim() : "";
-  const utdidPath = accioHome ? path.join(accioHome, "utdid") : "";
-  if (!utdidPath) {
-    return "";
-  }
-
-  try {
-    return fs.readFileSync(utdidPath, "utf8").trim();
-  } catch {
-    return "";
-  }
-}
-
-function extractCnaFromCookie(rawCookie) {
-  if (!rawCookie) {
-    return "";
-  }
-
-  const text = String(rawCookie);
-  const match = text.match(/(?:^|%3B\s*|;\s*)cna(?:=|%3D)([^;%]+)/i);
-  return match ? decodeURIComponent(match[1]) : "";
-}
-
 async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) {
   if (!authPayload || !authPayload.accessToken || !authPayload.refreshToken) {
     throw new Error("Auth payload is missing accessToken or refreshToken");
   }
 
   const upstreamBaseUrl = deriveUpstreamGatewayBaseUrl(config);
-  const utdid = readAccioUtdid(config);
+  const utdid = readAccioUtdid(config.accioHome);
   const cna = extractCnaFromCookie(authPayload.cookie);
   const requestBody = {
     utdid,
@@ -485,7 +454,7 @@ async function requestQuotaViaUpstream(config, authPayload) {
   }
 
   const upstreamBaseUrl = deriveUpstreamGatewayBaseUrl(config);
-  const utdid = readAccioUtdid(config);
+  const utdid = readAccioUtdid(config.accioHome);
   const cna = extractCnaFromCookie(authPayload.cookie);
   const url = new URL("/api/entitlement/quota", upstreamBaseUrl);
   url.searchParams.set("accessToken", String(authPayload.accessToken));
