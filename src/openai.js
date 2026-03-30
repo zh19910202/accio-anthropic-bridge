@@ -1,13 +1,8 @@
 "use strict";
 
-const crypto = require("node:crypto");
-
 const { normalizeContent } = require("./anthropic");
 const { createBridgeError } = require("./errors");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
+const { generateId } = require("./id");
 
 function normalizeToolDefinitions(tools) {
   if (!Array.isArray(tools)) {

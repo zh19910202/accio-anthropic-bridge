@@ -1,10 +1,6 @@
 "use strict";
 
-const crypto = require("node:crypto");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
+const { generateId } = require("./id");
 
 function normalizeSystemPrompt(system) {
   if (typeof system === "string") {

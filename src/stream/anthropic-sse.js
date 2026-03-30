@@ -1,12 +1,7 @@
 "use strict";
 
-const crypto = require("node:crypto");
-
 const { CORS_HEADERS, writeSse } = require("../http");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
+const { generateId } = require("../id");
 
 class AnthropicStreamWriter {
   constructor({ estimateTokens, inputTokens, body, res, conversationId, sessionId, id }) {

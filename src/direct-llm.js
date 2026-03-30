@@ -952,8 +952,10 @@ class DirectLlmClient {
   async run(request, options = {}) {
     const explicitAccountId = options.accountId || request.accountId || null;
     const stickyAccountId = options.stickyAccountId || null;
+    const MAX_FAILOVER_ATTEMPTS = 10;
     const triedAccounts = new Set();
     let lastError = null;
+    let attempts = 0;
     const modelInfo = await this.resolveProviderModel(request.model);
 
     if (typeof options.onDecision === "function") {
@@ -966,7 +968,8 @@ class DirectLlmClient {
       });
     }
 
-    while (true) {
+    while (attempts < MAX_FAILOVER_ATTEMPTS) {
+      attempts++;
       const auth = await this.getAuthToken({
         allowAutostart: true,
         accountId: explicitAccountId,
@@ -1022,6 +1025,10 @@ class DirectLlmClient {
         const rawText = await res.text().catch(() => "");
         const upstreamError = new UpstreamHttpError(res.status, res.statusText, rawText, token);
 
+        if (auth.source === "gateway" && (res.status === 401 || res.status === 403)) {
+          this.clearTokenCache();
+        }
+
         if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
           this.authProvider.recordFailure(auth.accountId, upstreamError);
         }
@@ -1058,6 +1065,7 @@ class DirectLlmClient {
           }
 
           if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
+            triedAccounts.add(auth.accountId);
             continue;
           }
         }
@@ -1143,7 +1151,7 @@ class DirectLlmClient {
       };
     }
 
-    throw lastError;
+    throw lastError || new Error(`Failover exhausted after ${attempts} attempts`);
   }
 }
 

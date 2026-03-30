@@ -1,7 +1,5 @@
 "use strict";
 
-const crypto = require("node:crypto");
-
 const { buildErrorResponse, estimateTokens } = require("../anthropic");
 const { buildDirectRequestFromOpenAi } = require("../direct-llm");
 const {
@@ -38,11 +36,8 @@ const {
   usagePromptTokens
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
+const { generateId } = require("../id");
 const { resolveSessionBinding } = require("../session-store");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
 
 function requestedAccountId(headers) {
   return headers["x-accio-account-id"] || headers["x-account-id"] || null;

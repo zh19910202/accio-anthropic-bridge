@@ -1,13 +1,8 @@
 "use strict";
 
-const crypto = require("node:crypto");
-
 const { buildResponsesApiResponse } = require("../openai");
 const { CORS_HEADERS } = require("../http");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
+const { generateId } = require("../id");
 
 class ResponsesStreamWriter {
   constructor({ body, res, created, id, conversationId, sessionId, messageId }) {

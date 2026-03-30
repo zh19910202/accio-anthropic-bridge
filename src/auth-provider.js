@@ -30,6 +30,7 @@ class AuthProvider {
     this._rrIndex = 0;
     this._invalidAccounts = new Map();
     this._lastFailures = new Map();
+    this._fileCache = null;
   }
 
   _resolveAccountsPath() {
@@ -86,6 +87,18 @@ class AuthProvider {
     const filePath = this._resolveAccountsPath();
 
     try {
+      let mtimeMs = 0;
+
+      try {
+        mtimeMs = fs.statSync(filePath).mtimeMs;
+      } catch (_) {
+        // file may not exist yet
+      }
+
+      if (this._fileCache && this._fileCache.filePath === filePath && this._fileCache.mtimeMs === mtimeMs && mtimeMs > 0) {
+        return this._fileCache.result;
+      }
+
       const parsed = parseJsonFile(filePath);
       const rawAccounts = Array.isArray(parsed)
         ? parsed
@@ -99,14 +112,19 @@ class AuthProvider {
         .filter(Boolean)
         .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
 
-      return {
+      const result = {
         strategy,
         activeAccount,
         accounts,
         filePath,
         ok: true
       };
+
+      this._fileCache = { filePath, mtimeMs, result };
+      return result;
     } catch (error) {
+      this._fileCache = null;
+
       if (error && error.code !== "ENOENT") {
         log.debug("auth provider file load failed", {
           filePath,

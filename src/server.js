@@ -1,6 +1,5 @@
 "use strict";
 
-const crypto = require("node:crypto");
 const http = require("node:http");
 
 const { AccioClient, HttpError } = require("./accio-client");
@@ -11,6 +10,7 @@ const { DirectLlmClient } = require("./direct-llm");
 const { classifyErrorType } = require("./errors");
 const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
+const { generateId } = require("./id");
 const log = require("./logger");
 const { ModelsRegistry } = require("./models");
 const { ResponseCache } = require("./response-cache");
@@ -33,10 +33,6 @@ const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic
 const { handleChatCompletionsRequest, handleModelsRequest, handleResponsesRequest } = require("./routes/openai");
 const { createConfig } = require("./runtime-config");
 const { SessionStore } = require("./session-store");
-
-function generateId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
 
 function captureTrace(traceStore, req, res, requestMeta, startedAt) {
   if (!traceStore || !req.bridgeContext || req.bridgeContext.traceCaptured) {
@@ -389,6 +385,19 @@ async function main() {
       process.exit(1);
     }, 5000).unref();
   };
+
+  process.on("unhandledRejection", (reason) => {
+    log.error("unhandled promise rejection", {
+      error: reason instanceof Error ? reason.stack : String(reason)
+    });
+  });
+
+  process.on("uncaughtException", (error) => {
+    log.error("uncaught exception — initiating shutdown", {
+      error: error instanceof Error ? error.stack : String(error)
+    });
+    shutdown("uncaughtException");
+  });
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
