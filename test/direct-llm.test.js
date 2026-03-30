@@ -465,6 +465,48 @@ test("DirectLlmClient cools down a saturated account until refresh time instead 
   assert.ok((invalidUntilById.get('acct_full') || 0) > Date.now());
 });
 
+test("DirectLlmClient quota preflight sends the full cookie header for account-scoped quota", async () => {
+  const seenHeaders = [];
+  const client = new DirectLlmClient({
+    authMode: "file",
+    authProvider: {
+      resolveCredential() {
+        return null;
+      }
+    },
+    quotaPreflightEnabled: true,
+    requestTimeoutMs: 1000,
+    upstreamBaseUrl: "https://example.test/api/adk/llm",
+    fetchImpl: async (url, options = {}) => {
+      seenHeaders.push(options.headers || {});
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            success: true,
+            data: {
+              usagePercent: 12,
+              refreshCountdownSeconds: 180
+            }
+          };
+        }
+      };
+    }
+  });
+
+  const quota = await client.fetchQuotaStatus({
+    accountId: "acct_cookie",
+    token: "shared_token",
+    cookie: "cna%3Dcookie-cna%3B%20session%3Dacct-1"
+  });
+
+  assert.equal(quota.available, true);
+  assert.equal(seenHeaders.length, 1);
+  assert.equal(seenHeaders[0]["x-cna"], "cookie-cna");
+  assert.equal(seenHeaders[0].cookie, "cna=cookie-cna; session=acct-1");
+});
+
 test("DirectLlmClient cools down gateway auth after quota precheck and skips later direct attempts", async () => {
   let gatewayTokenRequests = 0;
   let quotaRequests = 0;

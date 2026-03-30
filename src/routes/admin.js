@@ -8,7 +8,7 @@ const { promisify } = require("node:util");
 
 const { readJsonBody } = require("../middleware/body-parser");
 const { writeJson, writeSse, CORS_HEADERS } = require("../http");
-const { readAccioUtdid, extractCnaFromCookie } = require("../discovery");
+const { readAccioUtdid, extractCnaFromCookie, normalizeCookieHeader } = require("../discovery");
 const { parseEnvValue } = require("../env-file");
 const {
   detectActiveStorage,
@@ -29,6 +29,53 @@ const execFileAsync = promisify(execFile);
 
 const QUOTA_CACHE_TTL_MS = 15 * 1000;
 const quotaCache = new Map();
+const SNAPSHOT_QUOTA_FILE = "quota-state.json";
+
+function isQuotaPendingFailure(reason) {
+  const text = String(reason || "").trim().toLowerCase();
+  return text === "quota refresh pending" || /quota exhausted|quota precheck skipped/.test(text);
+}
+
+function getSnapshotQuotaStatePath(snapshotDir) {
+  return path.join(String(snapshotDir || ""), SNAPSHOT_QUOTA_FILE);
+}
+
+function readSnapshotQuotaState(snapshotDir) {
+  if (!snapshotDir) {
+    return null;
+  }
+
+  try {
+    const text = fs.readFileSync(getSnapshotQuotaStatePath(snapshotDir), "utf8");
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    return {
+      available: parsed.available === true,
+      usagePercent: typeof parsed.usagePercent === "number" ? parsed.usagePercent : null,
+      refreshCountdownSeconds: typeof parsed.refreshCountdownSeconds === "number" ? parsed.refreshCountdownSeconds : null,
+      checkedAt: parsed.checkedAt ? String(parsed.checkedAt) : null,
+      source: parsed.source ? String(parsed.source) : null,
+      error: parsed.error ? String(parsed.error) : null,
+      stale: parsed.stale === true
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeSnapshotQuotaState(snapshotDir, quota) {
+  if (!snapshotDir || !quota || typeof quota !== "object") {
+    return;
+  }
+
+  const targetPath = getSnapshotQuotaStatePath(snapshotDir);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, JSON.stringify(quota, null, 2) + "\n", "utf8");
+}
+
 function quoteEnvValue(value) {
   const text = String(value == null ? "" : value);
   if (!text) {
@@ -462,6 +509,7 @@ async function requestQuotaViaUpstream(config, authPayload) {
       "x-app-version": "0.0.0",
       "x-os": process.platform,
       "x-cna": cna,
+      cookie: normalizeCookieHeader(authPayload.cookie),
       accept: "application/json, text/plain, */*"
     },
     signal: AbortSignal.timeout(8000)
@@ -571,6 +619,84 @@ async function resolveSnapshotQuota(config, snapshot, authPayload) {
     quotaCache.set(cacheKey, { at: Date.now(), value });
     return value;
   }
+}
+
+async function resolveSnapshotQuotaForAdmin(config, snapshot, authPayload, options = {}) {
+  const isCurrentGatewayAccount = options.isCurrentGatewayAccount === true;
+  const persistedQuota = readSnapshotQuotaState(snapshot && snapshot.dir ? snapshot.dir : null);
+
+  if (!isCurrentGatewayAccount) {
+    if (persistedQuota) {
+      return {
+        ...persistedQuota,
+        stale: true
+      };
+    }
+
+    return {
+      available: false,
+      usagePercent: null,
+      refreshCountdownSeconds: null,
+      checkedAt: null,
+      source: null,
+      error: "quota_unverified_for_inactive_account",
+      stale: true
+    };
+  }
+
+  const liveQuota = await resolveSnapshotQuota(config, snapshot, authPayload);
+  writeSnapshotQuotaState(snapshot && snapshot.dir ? snapshot.dir : null, {
+    ...liveQuota,
+    stale: false
+  });
+  return {
+    ...liveQuota,
+    stale: false
+  };
+}
+
+function syncSnapshotAccountState(authProvider, snapshot) {
+  const accountState = snapshot && snapshot.accountState ? snapshot.accountState : null;
+  const quota = snapshot && snapshot.quota ? snapshot.quota : null;
+
+  if (!accountState || !accountState.id) {
+    return snapshot;
+  }
+
+  if (
+    quota &&
+    quota.available &&
+    typeof quota.usagePercent === "number" &&
+    quota.usagePercent >= 100 &&
+    typeof quota.refreshCountdownSeconds === "number"
+  ) {
+    const checkedAtMs = Date.parse(quota.checkedAt || "") || Date.now();
+    const refreshUntilMs = checkedAtMs + Math.max(0, Number(quota.refreshCountdownSeconds)) * 1000;
+    const currentInvalidUntil = authProvider.getInvalidUntil(accountState.id) || 0;
+
+    if (refreshUntilMs > currentInvalidUntil) {
+      authProvider.invalidateAccountUntil(accountState.id, refreshUntilMs, "quota refresh pending");
+    }
+  } else if (
+    quota &&
+    quota.available &&
+    typeof quota.usagePercent === "number" &&
+    quota.usagePercent < 100
+  ) {
+    authProvider.clearInvalidation(accountState.id);
+    const lastFailure = authProvider.getLastFailure(accountState.id);
+    if (lastFailure && isQuotaPendingFailure(lastFailure.reason)) {
+      authProvider.clearFailure(accountState.id);
+    }
+  }
+
+  snapshot.accountState = {
+    ...accountState,
+    invalidUntil: authProvider.getInvalidUntil(accountState.id),
+    lastFailure: authProvider.getLastFailure(accountState.id) || null
+  };
+
+  return snapshot;
 }
 
 async function requestGatewayText(gatewayManager, pathname, options = {}) {
@@ -1028,6 +1154,7 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
   const gateway = await readGatewayState(config.baseUrl);
   const storage = detectActiveStorage();
   const configuredAccounts = authProvider.getConfiguredAccounts();
+  const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
   const snapshotEntries = listSnapshots().map((entry) => {
     const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
     const storedAuthPayload = resolvedAuth.payload;
@@ -1062,48 +1189,16 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
   });
   const snapshots = await Promise.all(snapshotEntries.map(async ({ snapshot, storedAuthPayload }) => ({
     ...snapshot,
-    quota: await resolveSnapshotQuota(config, snapshot, storedAuthPayload)
+    quota: await resolveSnapshotQuotaForAdmin(config, snapshot, storedAuthPayload, {
+      isCurrentGatewayAccount: Boolean(
+        currentGatewayUserId &&
+        snapshot &&
+        snapshot.gatewayUser &&
+        String(snapshot.gatewayUser.id || "") === currentGatewayUserId
+      )
+    })
   })));
-  const normalizedSnapshots = snapshots.map((snapshot) => {
-    const accountState = snapshot && snapshot.accountState ? snapshot.accountState : null;
-    const quota = snapshot && snapshot.quota ? snapshot.quota : null;
-
-    if (
-      accountState &&
-      accountState.id &&
-      quota &&
-      quota.available &&
-      typeof quota.usagePercent === "number" &&
-      quota.usagePercent >= 100 &&
-      typeof quota.refreshCountdownSeconds === "number"
-    ) {
-      const checkedAtMs = Date.parse(quota.checkedAt || "") || Date.now();
-      const refreshUntilMs = checkedAtMs + Math.max(0, Number(quota.refreshCountdownSeconds)) * 1000;
-      const currentInvalidUntil = authProvider.getInvalidUntil(accountState.id) || 0;
-
-      if (refreshUntilMs > currentInvalidUntil) {
-        authProvider.invalidateAccountUntil(accountState.id, refreshUntilMs, "quota refresh pending");
-      }
-
-      snapshot.accountState = {
-        ...accountState,
-        invalidUntil: authProvider.getInvalidUntil(accountState.id),
-        lastFailure: authProvider.getLastFailure(accountState.id) || accountState.lastFailure || null
-      };
-      return snapshot;
-    }
-
-    if (accountState && accountState.id) {
-      snapshot.accountState = {
-        ...accountState,
-        invalidUntil: authProvider.getInvalidUntil(accountState.id),
-        lastFailure: authProvider.getLastFailure(accountState.id) || accountState.lastFailure || null
-      };
-    }
-
-    return snapshot;
-  });
-  const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
+  const normalizedSnapshots = snapshots.map((snapshot) => syncSnapshotAccountState(authProvider, snapshot));
   const currentSnapshots = currentGatewayUserId
     ? normalizedSnapshots.filter((snapshot) => snapshot.gatewayUser && String(snapshot.gatewayUser.id || "") === currentGatewayUserId)
     : [];
@@ -2453,10 +2548,17 @@ function renderSnapshots(data) {
     const quota = item.quota || null;
     const quotaStatus = quota && quota.available && typeof quota.usagePercent === 'number'
       ? ('已用 ' + Math.round(quota.usagePercent) + '%')
-      : (quota && quota.error === 'missing_auth_payload' ? '未知（缺少完整凭证）' : '未知');
+      : (quota && quota.error === 'missing_auth_payload'
+        ? '未知（缺少完整凭证）'
+        : (quota && quota.error === 'quota_unverified_for_inactive_account'
+          ? '待验证'
+          : '未知'));
     const refreshStatus = quota && quota.available && typeof quota.refreshCountdownSeconds === 'number'
       ? formatCountdown(quota.refreshCountdownSeconds)
       : '未知';
+    const quotaMeta = quota && quota.checkedAt
+      ? ((quota.stale ? '上次确认：' : '实时更新：') + formatTime(quota.checkedAt))
+      : (quota && quota.stale ? '未切换到该账号，未做实时查询' : '');
     const accountState = item.accountState || null;
     const cooling = accountState && typeof accountState.invalidUntil === 'number' && accountState.invalidUntil > Date.now();
     const cooldownSeconds = cooling ? Math.max(0, Math.ceil((accountState.invalidUntil - Date.now()) / 1000)) : 0;
@@ -2478,6 +2580,7 @@ function renderSnapshots(data) {
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
       + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
       + '<div class="itemMeta">刷新时间：' + refreshStatus + '</div>'
+      + (quotaMeta ? '<div class="itemMeta hint">' + quotaMeta + '</div>' : '')
       + '<div class="itemMeta">请求候选：' + cooldownStatus + '</div>'
       + (cooling ? '<div class="itemMeta">恢复时间：' + formatTime(accountState.invalidUntil) + '</div>' : '')
       + (lastFailure ? '<div class="itemMeta hint">最近失败：' + lastFailure + '</div>' : '')
@@ -3589,5 +3692,13 @@ module.exports = {
   handleAdminCaptureAccount,
   handleAdminAccountLogin,
   handleAdminAccountCallback,
-  handleAdminAccountLoginStatus
+  handleAdminAccountLoginStatus,
+  __private__: {
+    isQuotaPendingFailure,
+    readSnapshotQuotaState,
+    requestQuotaViaUpstream,
+    resolveSnapshotQuotaForAdmin,
+    writeSnapshotQuotaState,
+    syncSnapshotAccountState
+  }
 };

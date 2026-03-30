@@ -10,7 +10,7 @@ const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 const { safeJsonParse } = require("./jsonc");
 const { maskToken } = require("./redaction");
-const { readAccioUtdid, extractCnaFromCookie } = require("./discovery");
+const { readAccioUtdid, extractCnaFromCookie, normalizeCookieHeader } = require("./discovery");
 
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
 
@@ -1038,6 +1038,7 @@ class DirectLlmClient {
         "x-app-version": "0.0.0",
         "x-os": process.platform,
         "x-cna": extractCnaFromCookie(auth.cookie),
+        cookie: normalizeCookieHeader(auth.cookie),
         accept: "application/json, text/plain, */*"
       },
       signal: AbortSignal.timeout(Math.min(4000, Number(this.config.requestTimeoutMs || 4000)))

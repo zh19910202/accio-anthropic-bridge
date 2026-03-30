@@ -486,6 +486,23 @@ function extractCnaFromCookie(rawCookie) {
   return match ? decodeURIComponent(match[1]) : "";
 }
 
+function normalizeCookieHeader(rawCookie) {
+  if (!rawCookie) {
+    return "";
+  }
+
+  const text = String(rawCookie).trim();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
 module.exports = {
   discoverAccioConfig,
   discoverAccioAppPath,
@@ -494,6 +511,7 @@ module.exports = {
   exists,
   extractCnaFromCookie,
   listDirectories,
+  normalizeCookieHeader,
   parseSessionKey,
   readAccioUtdid,
   readJsonIfExists,
