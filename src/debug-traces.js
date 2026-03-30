@@ -1,9 +1,11 @@
 "use strict";
 
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const { sanitizeHeaders, sanitizeValue } = require("./redaction");
+const log = require("./logger");
 
 const INDEX_FILE = "index.json";
 
@@ -142,6 +144,7 @@ class DebugTraceStore {
       ? Math.max(0, Math.min(1, Number(options.sampleRate)))
       : 0;
     this.entries = [];
+    this._recentTraces = new Map();
 
     if (this.enabled) {
       fs.mkdirSync(this.dirPath, { recursive: true });
@@ -168,6 +171,10 @@ class DebugTraceStore {
   get(traceId) {
     if (!traceId) {
       return null;
+    }
+
+    if (this._recentTraces.has(traceId)) {
+      return this._recentTraces.get(traceId);
     }
 
     const filePath = path.join(this.dirPath, `${traceId}.json`);
@@ -199,24 +206,39 @@ class DebugTraceStore {
     const summary = this._buildSummary(trace);
     const filePath = path.join(this.dirPath, `${trace.id}.json`);
 
-    fs.writeFileSync(filePath, JSON.stringify(trace, null, 2));
     this.entries = [summary, ...this.entries.filter((entry) => entry.id !== summary.id)];
+
+    const toRemove = [];
 
     while (this.entries.length > this.maxEntries) {
       const removed = this.entries.pop();
 
       if (removed) {
-        const removedPath = path.join(this.dirPath, `${removed.id}.json`);
-
-        try {
-          fs.unlinkSync(removedPath);
-        } catch (error) {
-          // Ignore stale index entries.
-        }
+        toRemove.push(path.join(this.dirPath, `${removed.id}.json`));
       }
     }
 
-    fs.writeFileSync(path.join(this.dirPath, INDEX_FILE), JSON.stringify(this.entries, null, 2));
+    const traceJson = JSON.stringify(trace, null, 2);
+    const indexJson = JSON.stringify(this.entries, null, 2);
+
+    this._recentTraces.set(trace.id, trace);
+    while (this._recentTraces.size > this.maxEntries) {
+      const firstKey = this._recentTraces.keys().next().value;
+      this._recentTraces.delete(firstKey);
+    }
+
+    fsp.writeFile(filePath, traceJson).catch((error) => {
+      log.warn("async trace write failed", { path: filePath, error: error.message || String(error) });
+    });
+
+    for (const removedPath of toRemove) {
+      fsp.unlink(removedPath).catch(() => {});
+    }
+
+    fsp.writeFile(path.join(this.dirPath, INDEX_FILE), indexJson).catch((error) => {
+      log.warn("async trace index write failed", { error: error.message || String(error) });
+    });
+
     return summary;
   }
 

@@ -64,8 +64,21 @@ class ResponseCache {
     });
 
     while (this.store.size > this.maxEntries) {
-      const oldestKey = this.store.keys().next().value;
-      this.store.delete(oldestKey);
+      let expiredKey = null;
+
+      for (const [k, entry] of this.store) {
+        if (Date.now() - entry.createdAt > this.ttlMs) {
+          expiredKey = k;
+          break;
+        }
+      }
+
+      if (expiredKey) {
+        this.store.delete(expiredKey);
+      } else {
+        const oldestKey = this.store.keys().next().value;
+        this.store.delete(oldestKey);
+      }
     }
   }
 

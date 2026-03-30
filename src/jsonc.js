@@ -81,8 +81,17 @@ function readJsonFile(filePath, options = {}) {
   return options.jsonc ? parseJsonc(text) : JSON.parse(text);
 }
 
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 module.exports = {
   parseJsonc,
   readJsonFile,
+  safeJsonParse,
   stripJsonComments
 };

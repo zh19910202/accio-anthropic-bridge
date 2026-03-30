@@ -1,12 +1,6 @@
 "use strict";
 
-function safeJsonParse(value) {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
+const { safeJsonParse } = require("./jsonc");
 
 function createBridgeError(status, message, type = "api_error", details = null) {
   const error = new Error(message);

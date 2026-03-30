@@ -10,14 +10,7 @@ const { shouldFailoverAccount } = require("./errors");
 const { extractGatewayModels } = require("./models");
 const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
-
-function safeJsonParse(value, fallback = null) {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-}
+const { safeJsonParse } = require("./jsonc");
 
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
 
@@ -588,7 +581,7 @@ class DirectResponseAccumulator {
   }
 }
 
-async function* parseSseEvents(stream) {
+async function* parseSseEvents(stream, maxBufferSize = 10 * 1024 * 1024) {
   const decoder = new TextDecoder();
   const reader = stream.getReader();
   let buffer = "";
@@ -602,6 +595,11 @@ async function* parseSseEvents(stream) {
       }
 
       buffer += decoder.decode(value, { stream: true });
+
+      if (buffer.length > maxBufferSize) {
+        throw new Error(`SSE buffer exceeded ${maxBufferSize} bytes — possible malformed stream`);
+      }
+
       const blocks = buffer.split("\n\n");
       buffer = blocks.pop() || "";
 
