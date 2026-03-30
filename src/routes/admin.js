@@ -1398,13 +1398,22 @@ button { font: inherit; cursor: pointer; }
 .dot.bad { background: var(--bad); }
 .kv {
   display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 8px 12px;
+  grid-template-columns: 94px minmax(0, 1fr);
+  gap: 14px 16px;
   margin-top: 12px;
   font-size: 13px;
 }
-.kv dt { color: var(--muted); font-weight: 500; }
-.kv dd { margin: 0; word-break: break-word; color: var(--ink-secondary); }
+.kv dt {
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.kv dd {
+  margin: 0;
+  word-break: break-word;
+  color: var(--ink-secondary);
+  line-height: 1.55;
+}
 
 /* ── Action Panel (topbar slot) ── */
 .actionPanel {
@@ -2202,6 +2211,73 @@ function recentActivityBadge(activity, gateway) {
 
   return ['good', summary];
 }
+function basenamePath(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '—';
+  }
+
+  const parts = text.split(/[\\\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : text;
+}
+function describeGatewayIdentity(gateway) {
+  if (!gateway || !gateway.reachable) {
+    return '网关不可达';
+  }
+
+  if (!gateway.authenticated) {
+    return '网关在线，但未登录';
+  }
+
+  const user = gateway.user || null;
+  if (!user) {
+    return '网关已登录';
+  }
+
+  const userId = user.id ? String(user.id) : '';
+  const userName = user.name ? String(user.name) : '';
+  if (userName && userId) {
+    return userName + ' · ' + userId;
+  }
+
+  return userName || userId || '网关已登录';
+}
+function describeSnapshotCompact(snapshot) {
+  if (!snapshot) {
+    return '无';
+  }
+
+  const details = [];
+  details.push(snapshot.alias || '未命名快照');
+  details.push(snapshot.hasFullAuthState ? '完整凭证' : '旧格式');
+  details.push(snapshot.hasAuthCallback ? '原生回调' : '仅文件');
+  return details.join(' · ');
+}
+function describeRuntimeCompact(data) {
+  const storageKind = data && data.storage && data.storage.kind ? String(data.storage.kind) : 'none';
+  const gatewayHost = data && data.gateway && data.gateway.baseUrl ? String(data.gateway.baseUrl).replace(/^https?:\\/\\//, '') : '';
+  const appName = data && data.bridge && data.bridge.appPath ? basenamePath(data.bridge.appPath) : '';
+  return [storageKind, gatewayHost, appName].filter(Boolean).join(' · ');
+}
+function describeAccountsCompact(data) {
+  const count = Array.isArray(data && data.snapshots) ? data.snapshots.length : 0;
+  const currentSnapshot = data && data.currentSnapshot ? data.currentSnapshot : null;
+  const currentLabel = currentSnapshot && currentSnapshot.gatewayUser
+    ? (currentSnapshot.gatewayUser.name || currentSnapshot.gatewayUser.id || currentSnapshot.alias)
+    : null;
+  return currentLabel
+    ? (String(count) + ' 个账号 · 当前 ' + currentLabel)
+    : (String(count) + ' 个账号');
+}
+function describeRecentActivityCompact(activity) {
+  if (!activity || !activity.transportSelected) {
+    return '暂无最近请求';
+  }
+
+  const route = describeRecentActivity(activity);
+  const time = activity.recordedAt ? formatTime(activity.recordedAt) : '';
+  return time ? (route + ' · ' + time) : route;
+}
 function renderKv(target, rows) {
   target.innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
 }
@@ -2353,15 +2429,11 @@ function renderState(data, options = {}) {
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary;
   renderKv(els.overviewKv, [
-    ['最近出口', describeRecentActivity(recentActivity)],
-    ['最近时间', recentActivity && recentActivity.recordedAt ? formatTime(recentActivity.recordedAt) : '—'],
-    ['本地网关', gatewaySummary + (data.gateway && data.gateway.user && data.gateway.user.id ? ' · ' + data.gateway.user.id : '')],
-    ['本地网关用户', data.gateway && data.gateway.user ? ((data.gateway.user.id || 'unknown') + (data.gateway.user.name ? ' (' + data.gateway.user.name + ')' : '')) : '未登录'],
-    ['已记录账号', String((data.snapshots || []).length)],
-    ['当前账号快照', data.currentSnapshot ? (data.currentSnapshot.alias + (data.currentSnapshot.hasFullAuthState ? ' · 完整' : ' · 旧格式') + (data.currentSnapshot.hasAuthCallback ? ' · 原生回调' : ' · 仅文件')) : '无'],
-    ['活动存储', data.storage && data.storage.kind ? data.storage.kind : 'none'],
-    ['网关地址', data.gateway && data.gateway.baseUrl ? data.gateway.baseUrl : '—'],
-    ['应用路径', data.bridge && data.bridge.appPath ? data.bridge.appPath : '—']
+    ['最近请求', describeRecentActivityCompact(recentActivity)],
+    ['当前网关', gatewaySummary + ' · ' + describeGatewayIdentity(data.gateway)],
+    ['账号池', describeAccountsCompact(data)],
+    ['当前快照', describeSnapshotCompact(data.currentSnapshot)],
+    ['运行环境', describeRuntimeCompact(data)]
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
@@ -2446,11 +2518,9 @@ async function pollAccountLogin(flowId) {
         ? (payload.gatewayState.userId + (payload.gatewayState.userName ? ' (' + payload.gatewayState.userName + ')' : ''))
         : (payload.gatewayState.authenticated ? '已登录但未返回用户ID' : '未登录');
       renderKv(els.overviewKv, [
-        ['当前用户', currentText],
-        ['已记录账号', els.snapshotList.children ? String(els.snapshotList.children.length) : '—'],
-        ['活动存储', '同步中'],
-        ['网关地址', payload.gatewayState.baseUrl || '—'],
-        ['应用路径', '—']
+        ['当前网关', currentText],
+        ['账号池', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个账号') : '—'],
+        ['运行环境', ['同步中', payload.gatewayState.baseUrl || '—'].filter(Boolean).join(' · ')]
       ]);
     }
 
