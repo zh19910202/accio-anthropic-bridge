@@ -45,14 +45,14 @@ test("openAiToFallbackMessages preserves plain text roles", () => {
   ]);
 });
 
-test("ExternalFallbackClient eligibility rejects tools thinking and images", () => {
+test("ExternalFallbackClient eligibility rejects tools and images while allowing thinking for openai-compatible anthropic fallback", () => {
   const client = new ExternalFallbackClient({
     baseUrl: "https://fallback.example/v1",
     apiKey: "key",
     model: "gpt-fallback"
   });
 
-  assert.equal(client.isEligibleAnthropic({ thinking: { type: "enabled" }, messages: [] }), false);
+  assert.equal(client.isEligibleAnthropic({ thinking: { type: "enabled" }, messages: [] }), true);
   assert.equal(client.isEligibleAnthropic({ tools: [{ name: "tool" }], messages: [] }), false);
   assert.equal(client.isEligibleAnthropic({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x" } }] }] }), false);
   assert.equal(client.isEligibleOpenAi({ tools: [{ type: "function", function: { name: "tool" } }], messages: [] }), false);
@@ -62,7 +62,7 @@ test("ExternalFallbackClient eligibility rejects tools thinking and images", () 
 
 test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   const targets = normalizeFallbackTargets([
-    { name: "Primary", protocol: "anthropic", baseUrl: "https://a.example/v1/", apiKey: "k1", model: "m1" },
+    { name: "Primary", protocol: "anthropic", baseUrl: "https://a.example/v1/", apiKey: "k1", model: "m1", reasoningEffort: "high" },
     { name: "Secondary", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2", enabled: false }
   ]);
 
@@ -70,14 +70,15 @@ test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   assert.equal(targets[0].name, "Primary");
   assert.equal(targets[0].protocol, "anthropic");
   assert.equal(targets[0].baseUrl, "https://a.example/v1");
+  assert.equal(targets[0].reasoningEffort, "high");
   assert.ok(targets[0].id);
 });
 
 test("ExternalFallbackPool returns eligible candidates in configured order", () => {
   const pool = new ExternalFallbackPool({
     targets: [
-      { id: "a", name: "A", protocol: "anthropic", baseUrl: "https://a.example/v1", apiKey: "k1", model: "m1" },
-      { id: "b", name: "B", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2" }
+      { id: "a", name: "A", protocol: "openai", baseUrl: "https://a.example/v1", apiKey: "k1", model: "m1" },
+      { id: "b", name: "B", protocol: "anthropic", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2" }
     ]
   });
 
@@ -89,7 +90,7 @@ test("ExternalFallbackPool returns eligible candidates in configured order", () 
     messages: [{ role: "user", content: "hi" }]
   });
 
-  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["a"]);
+  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["a", "b"]);
   assert.deepEqual(openAiCandidates.map((entry) => entry.target.id), ["a", "b"]);
 });
 
@@ -125,6 +126,76 @@ test("ExternalFallbackClient completes through OpenAI compatible endpoint", asyn
   assert.equal(result.usage.completion_tokens, 7);
   assert.equal(seen[0].url, "https://fallback.example/v1/chat/completions");
   assert.match(String(seen[0].options.headers.authorization), /Bearer key_123/);
+});
+
+test("ExternalFallbackClient maps anthropic thinking to openai reasoning fields", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { content: "fallback ok" } }],
+            usage: { prompt_tokens: 12, completion_tokens: 7 }
+          };
+        }
+      };
+    }
+  });
+
+  await client.completeAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    thinking: { type: "enabled", budget_tokens: 8192 },
+    max_tokens: 123,
+    temperature: 0.2
+  });
+
+  const payload = JSON.parse(seen[0].options.body);
+  assert.equal(payload.model, "gpt-5.4");
+  assert.equal(payload.reasoning_effort, "high");
+  assert.deepEqual(payload.reasoning, { effort: "high" });
+});
+
+test("ExternalFallbackClient uses configured default reasoning effort when anthropic thinking has no budget", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    reasoningEffort: "low",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { content: "fallback ok" } }],
+            usage: { prompt_tokens: 12, completion_tokens: 7 }
+          };
+        }
+      };
+    }
+  });
+
+  await client.completeAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    thinking: { type: "enabled" },
+    max_tokens: 123,
+    temperature: 0.2
+  });
+
+  const payload = JSON.parse(seen[0].options.body);
+  assert.equal(payload.reasoning_effort, "low");
+  assert.deepEqual(payload.reasoning, { effort: "low" });
 });
 
 test("ExternalFallbackClient completes through Anthropic endpoint", async () => {

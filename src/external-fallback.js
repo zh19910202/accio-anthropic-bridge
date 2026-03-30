@@ -12,6 +12,11 @@ function createFallbackId() {
   return "fb_" + Math.random().toString(36).slice(2, 10);
 }
 
+function normalizeReasoningEffort(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return ["low", "medium", "high"].includes(text) ? text : "";
+}
+
 function normalizeFallbackTarget(target = {}, index = 0) {
   return {
     id: String(target.id || createFallbackId()),
@@ -22,7 +27,8 @@ function normalizeFallbackTarget(target = {}, index = 0) {
     model: String(target.model || "").trim(),
     protocol: String(target.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai",
     anthropicVersion: String(target.anthropicVersion || DEFAULT_ANTHROPIC_VERSION).trim() || DEFAULT_ANTHROPIC_VERSION,
-    timeoutMs: Number(target.timeoutMs || 60000) || 60000
+    timeoutMs: Number(target.timeoutMs || 60000) || 60000,
+    reasoningEffort: normalizeReasoningEffort(target.reasoningEffort)
   };
 }
 
@@ -292,6 +298,53 @@ function extractTextFromCompletion(payload) {
   return "";
 }
 
+function normalizeAnthropicThinking(thinking) {
+  if (!thinking || thinking === false) {
+    return null;
+  }
+
+  if (thinking === true) {
+    return {
+      type: "enabled",
+      budgetTokens: null
+    };
+  }
+
+  if (typeof thinking !== "object") {
+    return null;
+  }
+
+  const type = String(thinking.type || "enabled").trim().toLowerCase() || "enabled";
+  const budgetTokens = Number(thinking.budget_tokens || thinking.budgetTokens || 0) || null;
+  return {
+    type,
+    budgetTokens
+  };
+}
+
+function mapAnthropicThinkingToOpenAiReasoning(thinking, fallbackReasoningEffort = "") {
+  const normalized = normalizeAnthropicThinking(thinking);
+  if (!normalized || normalized.type === "disabled") {
+    return null;
+  }
+
+  let effort = normalizeReasoningEffort(fallbackReasoningEffort) || "medium";
+  if (normalized.budgetTokens != null) {
+    if (normalized.budgetTokens <= 1024) {
+      effort = "low";
+    } else if (normalized.budgetTokens > 4096) {
+      effort = "high";
+    }
+  }
+
+  return {
+    reasoning_effort: effort,
+    reasoning: {
+      effort
+    }
+  };
+}
+
 function buildError(status, message, details = null) {
   const error = new Error(message);
   error.status = status;
@@ -344,6 +397,7 @@ class ExternalFallbackClient {
     this.timeoutMs = Number(config.timeoutMs || 60000);
     this.protocol = String(config.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai";
     this.anthropicVersion = String(config.anthropicVersion || DEFAULT_ANTHROPIC_VERSION || "2023-06-01");
+    this.reasoningEffort = normalizeReasoningEffort(config.reasoningEffort);
     this.preferredAnthropicMessagesPath = null;
   }
 
@@ -544,7 +598,7 @@ class ExternalFallbackClient {
       return Boolean(body && typeof body === "object");
     }
 
-    if (!body || body.thinking || (Array.isArray(body.tools) && body.tools.length > 0) || hasAnthropicImages(body.messages)) {
+    if (!body || (Array.isArray(body.tools) && body.tools.length > 0) || hasAnthropicImages(body.messages)) {
       return false;
     }
 
@@ -567,7 +621,7 @@ class ExternalFallbackClient {
     return true;
   }
 
-  async complete({ messages, system, maxTokens, temperature, metadata }) {
+  async complete({ messages, system, maxTokens, temperature, metadata, reasoning }) {
     if (!this.isConfigured()) {
       throw new Error("External fallback provider is not configured");
     }
@@ -593,7 +647,8 @@ class ExternalFallbackClient {
         max_tokens: maxTokens,
         temperature,
         stream: false,
-        metadata: metadata || undefined
+        metadata: metadata || undefined,
+        ...(reasoning || {})
       });
       response = await this.fetchWithRetry(this.baseUrl + "/chat/completions", {
         method: "POST",
@@ -647,7 +702,8 @@ class ExternalFallbackClient {
       messages: anthropicToFallbackMessages(body),
       maxTokens: Number(body && body.max_tokens) || undefined,
       temperature: typeof (body && body.temperature) === "number" ? body.temperature : undefined,
-      metadata: { source: "accio-bridge-anthropic-fallback" }
+      metadata: { source: "accio-bridge-anthropic-fallback" },
+      reasoning: mapAnthropicThinkingToOpenAiReasoning(body && body.thinking, this.reasoningEffort)
     });
   }
 

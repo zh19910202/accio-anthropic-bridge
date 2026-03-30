@@ -2642,6 +2642,7 @@ function createFallbackDraftTarget(index) {
     baseUrl: '',
     apiKey: '',
     model: '',
+    reasoningEffort: '',
     anthropicVersion: '2023-06-01',
     timeoutMs: 60000
   };
@@ -2655,6 +2656,9 @@ function normalizeFallbackDraftTarget(target, index) {
     baseUrl: String(target && target.baseUrl ? target.baseUrl : ''),
     apiKey: String(target && target.apiKey ? target.apiKey : ''),
     model: String(target && target.model ? target.model : ''),
+    reasoningEffort: ['low', 'medium', 'high'].includes(String(target && target.reasoningEffort ? target.reasoningEffort : '').toLowerCase())
+      ? String(target.reasoningEffort).toLowerCase()
+      : '',
     anthropicVersion: String(target && target.anthropicVersion ? target.anthropicVersion : '2023-06-01'),
     timeoutMs: Number(target && target.timeoutMs ? target.timeoutMs : 60000) || 60000
   };
@@ -2672,6 +2676,7 @@ function collectFallbackDraft() {
     baseUrl: item.querySelector('[data-field=\"baseUrl\"]') ? item.querySelector('[data-field=\"baseUrl\"]').value.trim() : '',
     apiKey: item.querySelector('[data-field=\"apiKey\"]') ? item.querySelector('[data-field=\"apiKey\"]').value.trim() : '',
     model: item.querySelector('[data-field=\"model\"]') ? item.querySelector('[data-field=\"model\"]').value.trim() : '',
+    reasoningEffort: item.querySelector('[data-field=\"reasoningEffort\"]') ? item.querySelector('[data-field=\"reasoningEffort\"]').value : '',
     anthropicVersion: item.querySelector('[data-field=\"anthropicVersion\"]') ? item.querySelector('[data-field=\"anthropicVersion\"]').value.trim() : '2023-06-01',
     timeoutMs: item.querySelector('[data-field=\"timeoutMs\"]') ? Number(item.querySelector('[data-field=\"timeoutMs\"]').value || 60000) : 60000
   }, index));
@@ -2721,6 +2726,7 @@ function renderFallbackTargets() {
       + '<div class="field wide"><label>Base URL</label><input data-field="baseUrl" type="text" value="' + escapeInline(target.baseUrl) + '" placeholder="https://your-upstream-host/v1" autocomplete="off" /></div>'
       + '<div class="field wide"><label>API Key</label><div class="inputWrap"><input data-field="apiKey" type="password" value="' + escapeInline(target.apiKey) + '" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" /><button class="inputToggle" type="button" data-toggle-secret="' + escapeInline(target.id) + '" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button></div></div>'
       + '<div class="field"><label>Model</label><input data-field="model" type="text" value="' + escapeInline(target.model) + '" placeholder="gpt-4.1-mini" autocomplete="off" /></div>'
+      + '<div class="field"><label>默认推理级别</label><select data-field="reasoningEffort"><option value=""' + (!target.reasoningEffort ? ' selected' : '') + '>自动</option><option value="low"' + (target.reasoningEffort === 'low' ? ' selected' : '') + '>low</option><option value="medium"' + (target.reasoningEffort === 'medium' ? ' selected' : '') + '>medium</option><option value="high"' + (target.reasoningEffort === 'high' ? ' selected' : '') + '>high</option></select></div>'
       + '<div class="field"><label>Anthropic Version</label><input data-field="anthropicVersion" type="text" value="' + escapeInline(target.anthropicVersion || '2023-06-01') + '" placeholder="2023-06-01" autocomplete="off" /></div>'
       + '<div class="field"><label>Timeout (ms)</label><input data-field="timeoutMs" type="number" min="1000" step="1000" value="' + escapeInline(String(target.timeoutMs || 60000)) + '" /></div>'
       + '</div>'
