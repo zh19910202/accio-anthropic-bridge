@@ -7,10 +7,7 @@ const path = require("node:path");
 
 const log = require("./logger");
 const { normalizeRequestedModel } = require("./model");
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const { delay } = require("./utils");
 
 class HttpError extends Error {
   constructor(status, message, body) {

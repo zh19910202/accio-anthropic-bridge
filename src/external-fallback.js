@@ -6,10 +6,7 @@ const { flattenOpenAiRequest } = require("./openai");
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 const { classifyErrorType } = require("./errors");
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const { delay } = require("./utils");
 
 function createTimeoutController(timeoutMs) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -542,31 +539,28 @@ class ExternalFallbackClient {
     }
 
     const isAnthropic = this.protocol === "anthropic";
-    const requestBody = JSON.stringify(
-      isAnthropic
-        ? {
-            model: this.model,
-            system: system || undefined,
-            messages,
-            max_tokens: maxTokens || 4096,
-            temperature,
-            metadata: metadata || undefined,
-            stream: false
-          }
-        : {
-            model: this.model,
-            messages,
-            max_tokens: maxTokens,
-            temperature,
-            stream: false,
-            metadata: metadata || undefined
-          }
-    );
 
     let response;
     if (isAnthropic) {
-      response = await this.fetchAnthropicMessageResponse(JSON.parse(requestBody));
+      const requestBody = {
+        model: this.model,
+        system: system || undefined,
+        messages,
+        max_tokens: maxTokens || 4096,
+        temperature,
+        metadata: metadata || undefined,
+        stream: false
+      };
+      response = await this.fetchAnthropicMessageResponse(requestBody);
     } else {
+      const requestBody = JSON.stringify({
+        model: this.model,
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        stream: false,
+        metadata: metadata || undefined
+      });
       response = await this.fetchWithRetry(this.baseUrl + "/chat/completions", {
         method: "POST",
         headers: {

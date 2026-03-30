@@ -242,7 +242,7 @@ async function waitForGatewayReachable(baseUrl, waitMs = 20000, pollMs = 500) {
       return gateway;
     }
 
-    await delayMs(pollMs);
+    await delay(pollMs);
   }
 
   return lastGateway;
@@ -692,7 +692,7 @@ async function waitForGatewayAuthenticatedUser(baseUrl, expectedUserId = "", wai
       return gateway;
     }
 
-    await delayMs(pollMs);
+    await delay(pollMs);
   }
 
   return lastGateway;
@@ -896,9 +896,7 @@ function normalizeAccioProcessName(appPath) {
   return base.endsWith(".app") ? base.slice(0, -4) : base;
 }
 
-async function delayMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const { delay } = require("../utils");
 
 function getGatewayPort(baseUrl) {
   try {
@@ -932,7 +930,7 @@ async function stopAccioForSnapshot(config, processName) {
 
   if (process.platform === 'darwin') {
     await execFileAsync('osascript', ['-e', 'tell application id "com.accio.desktop" to quit']).catch(() => {});
-    await delayMs(800);
+    await delay(800);
     await execFileAsync('pkill', ['-x', processName]).catch(() => {});
     if (appContentsPrefix) {
       await execFileAsync('pkill', ['-f', appContentsPrefix]).catch(() => {});
@@ -967,7 +965,7 @@ async function stopAccioForSnapshot(config, processName) {
       }
     }
 
-    await delayMs(400);
+    await delay(400);
   }
 
   log.warn('snapshot switch stop timed out', { baseUrl, processName, forced });
@@ -1007,7 +1005,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
     preStopped: Boolean(stopResult)
   });
 
-  await delayMs(800);
+  await delay(800);
 
   try {
     await startAccioForSnapshot(config, processName);
@@ -1051,7 +1049,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
       desktopHelperLaunch = await requestDesktopHelperLaunch(config);
     }
 
-    await delayMs(500);
+    await delay(500);
   }
 
   log.warn("snapshot switch restart timed out", {

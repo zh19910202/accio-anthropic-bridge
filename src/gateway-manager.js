@@ -6,12 +6,9 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 
 const log = require("./logger");
+const { delay } = require("./utils");
 
 const execFileAsync = promisify(execFile);
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function parseFlag(value, fallback = false) {
   if (value == null || value === "") {
