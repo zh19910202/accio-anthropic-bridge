@@ -11,6 +11,24 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createTimeoutController(timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { signal: undefined, clear() {} };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error("The operation was aborted due to timeout"));
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    clear() {
+      clearTimeout(timer);
+    }
+  };
+}
+
 function isRetryableFetchError(error) {
   const status = Number(error && error.status ? error.status : 0);
   const type = String(error && error.type ? error.type : "").toLowerCase();
@@ -317,8 +335,7 @@ class ExternalFallbackClient {
     const requestOptions = {
       method: "POST",
       headers: this.buildAnthropicHeaders(),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs)
+      body: JSON.stringify(body)
     };
 
     let lastResponse = null;
@@ -327,7 +344,12 @@ class ExternalFallbackClient {
         protocol: this.transportName(),
         url
       });
-      const response = await this.fetchWithRetry(url, requestOptions);
+      const response = body && body.stream === true
+        ? await this.fetchStreamWithRetry(url, requestOptions)
+        : await this.fetchWithRetry(url, {
+            ...requestOptions,
+            signal: AbortSignal.timeout(this.timeoutMs)
+          });
       lastResponse = response;
 
       if (response.status === 404) {
@@ -358,6 +380,51 @@ class ExternalFallbackClient {
     }
 
     return lastResponse;
+  }
+
+  async fetchStreamWithRetry(url, options) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const timeout = createTimeoutController(this.timeoutMs);
+      try {
+        if (attempt > 0) {
+          log.warn("external fallback retrying request", {
+            protocol: this.transportName(),
+            url,
+            attempt: attempt + 1
+          });
+        }
+
+        const response = await this.fetchImpl(url, {
+          ...options,
+          signal: timeout.signal
+        });
+        timeout.clear();
+        return response;
+      } catch (error) {
+        timeout.clear();
+        const normalized = normalizeFetchError(error);
+        lastError = normalized;
+
+        log.warn("external fallback request failed", {
+          protocol: this.transportName(),
+          url,
+          attempt: attempt + 1,
+          status: normalized.status || null,
+          type: normalized.type || null,
+          error: normalized.message || String(normalized)
+        });
+
+        if (attempt >= 1 || !isRetryableFetchError(normalized)) {
+          throw normalized;
+        }
+
+        await delay(250);
+      }
+    }
+
+    throw lastError || new Error("External fallback fetch failed");
   }
 
   async fetchWithRetry(url, options) {

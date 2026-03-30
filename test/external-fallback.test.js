@@ -185,6 +185,39 @@ test("ExternalFallbackClient requestAnthropicMessage preserves body and override
   assert.deepEqual(payload.thinking, { type: "enabled", budget_tokens: 2048 });
 });
 
+test("ExternalFallbackClient streaming anthropic request does not abort body read after header timeout is cleared", async () => {
+  let seenSignal = null;
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-1",
+    protocol: "anthropic",
+    timeoutMs: 10,
+    fetchImpl: async (url, options = {}) => {
+      seenSignal = options.signal;
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream; charset=utf-8" }),
+        async text() {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          assert.equal(seenSignal.aborted, false);
+          return "event: ping\\n\\ndata: ok\\n\\n";
+        }
+      };
+    }
+  });
+
+  const response = await client.requestAnthropicMessage({
+    model: "should-be-overridden",
+    stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "keep streaming" }] }]
+  });
+
+  const body = await response.text();
+  assert.match(body, /event: ping/);
+});
+
 test("ExternalFallbackClient anthropic mode accepts Anthropic payload passthrough", () => {
   const client = new ExternalFallbackClient({
     baseUrl: "https://fallback.example/v1",
