@@ -1,5 +1,6 @@
 "use strict";
 
+const log = require("./logger");
 const { flattenAnthropicRequest, normalizeContent, normalizeSystemPrompt } = require("./anthropic");
 const { flattenOpenAiRequest } = require("./openai");
 
@@ -322,10 +323,18 @@ class ExternalFallbackClient {
 
     let lastResponse = null;
     for (const url of this.buildAnthropicMessageUrls()) {
+      log.info("external fallback anthropic request begin", {
+        protocol: this.transportName(),
+        url
+      });
       const response = await this.fetchWithRetry(url, requestOptions);
       lastResponse = response;
 
       if (response.status === 404) {
+        log.warn("external fallback anthropic request got 404, trying next path", {
+          protocol: this.transportName(),
+          url
+        });
         continue;
       }
 
@@ -334,6 +343,10 @@ class ExternalFallbackClient {
         try {
           const probe = await response.clone().json();
           if (isAnthropicWrappedNotFoundPayload(probe)) {
+            log.warn("external fallback anthropic request got wrapped 404, trying next path", {
+              protocol: this.transportName(),
+              url
+            });
             continue;
           }
         } catch {
@@ -352,10 +365,26 @@ class ExternalFallbackClient {
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
+        if (attempt > 0) {
+          log.warn("external fallback retrying request", {
+            protocol: this.transportName(),
+            url,
+            attempt: attempt + 1
+          });
+        }
         return await this.fetchImpl(url, options);
       } catch (error) {
         const normalized = normalizeFetchError(error);
         lastError = normalized;
+
+        log.warn("external fallback request failed", {
+          protocol: this.transportName(),
+          url,
+          attempt: attempt + 1,
+          status: normalized.status || null,
+          type: normalized.type || null,
+          error: normalized.message || String(normalized)
+        });
 
         if (attempt >= 1 || !isRetryableFetchError(normalized)) {
           throw normalized;

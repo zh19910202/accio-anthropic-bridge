@@ -3,7 +3,7 @@
 把 Anthropic / OpenAI 风格请求桥接到 Accio 本地登录态和网关的本地代理。
 
 - Anthropic Messages API + OpenAI Chat Completions + Responses 最小子集
-- 优先直连 `phoenix-gw`，回退到 Accio 本地 WebSocket，必要时再落到外部 OpenAI 兼容上游
+- 优先直连 `phoenix-gw`，回退到 Accio 本地 WebSocket，必要时再落到外部 OpenAI / Anthropic 兼容上游
 - 多账号轮询 / failover / 本机快照管理
 - 可视化管理台 + Electron 桌面壳
 
@@ -67,10 +67,12 @@ npm run manager:open
 管理台支持：
 
 - 查看网关状态和当前用户（脉冲指示灯实时反馈）
+- 查看每个已记录账号的额度状态和刷新倒计时（短 TTL 缓存）
 - 通过浏览器完成多账号 OAuth 登录，登录完成后自动记录快照
 - 保存、切换和删除本机账号快照
-- 执行登出、把当前 token 写回账号池文件
-- 按钮 spinner、消息通知自动消失、删除双击确认等交互
+- 配置外部兜底上游，支持 `OpenAI compatible` 和 `Anthropic Messages` 两种协议
+- 在保存前直接测试外部上游连通性
+- API Key 明文/密文切换、桌面端粘贴兼容、删除双击确认、自动消息提示等交互
 
 ## 桌面壳（Electron）
 
@@ -95,7 +97,8 @@ npm run desktop:start
 - `POST /v1/messages` — 非流式 + SSE 流式
 - `POST /v1/messages/count_tokens`
 - 原生 `tool_use` / `tool_result`
-- Claude 上游事件透传式 SSE
+- 直连上游 SSE 透传
+- 外部 Anthropic fallback 返回 JSON 时自动合成为 Anthropic SSE，兼容 `Claude Code`
 
 ### OpenAI 兼容
 
@@ -110,6 +113,7 @@ npm run desktop:start
 - `/v1/responses` 未补齐 reasoning item 等完整事件语义
 - 图片 block 只做 URL / base64 级别最小映射
 - Anthropic `thinking` 目前仅在 `direct-llm` 路径受理，`local-ws` 路径仍不支持
+- 外部 fallback 主要定位为文本兜底；tools / 图片等复杂语义不承诺完整跨协议保持
 - 上游是否正式、稳定支持 reasoning 字段目前未知；以下仅是当前环境下的实测观察，不构成官方能力声明：Gemini 在 `include_thoughts + thinking_level` 下可观察到 `thoughtSignature` / `thoughtsTokenCount`；GPT 目前只观察到 `reasoning_tokens` 统计；Claude 目前未确认存在可见 thinking 输出
 - 响应缓存只覆盖低风险纯文本请求
 
@@ -201,9 +205,11 @@ ACCIO_GATEWAY_POLL_MS=500
 ACCIO_MODELS_SOURCE=static        # static | gateway | hybrid
 ACCIO_MODELS_CACHE_TTL_MS=30000
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
-ACCIO_FALLBACK_OPENAI_BASE_URL=     # 可选，最后兜底的 OpenAI 兼容上游
+ACCIO_FALLBACK_PROTOCOL=openai    # openai | anthropic
+ACCIO_FALLBACK_OPENAI_BASE_URL=   # 可选，最后兜底的外部上游 base URL
 ACCIO_FALLBACK_OPENAI_API_KEY=
 ACCIO_FALLBACK_OPENAI_MODEL=
+ACCIO_FALLBACK_ANTHROPIC_VERSION=2023-06-01
 ACCIO_FALLBACK_OPENAI_TIMEOUT_MS=60000
 
 # 安全防护
@@ -253,8 +259,9 @@ LOG_LEVEL=info
 - **默认输出上限**：客户端没传 `max_tokens` 时自动补 `ACCIO_DEFAULT_MAX_OUTPUT_TOKENS`（默认 4096）
 - **短 TTL 精确请求缓存**：只缓存完全相同输入的非流式纯文本请求，默认 TTL 10s，容量 128 条。不缓存 tools/thinking/图片/流式请求
 - **额度预检跳过**：默认会在 `direct-llm` 发送前检查当前候选账号额度；若已 100% 且还有其他候选账号，则本次请求直接切到下一个账号
+- **基于刷新时间的账号冷却**：账号一旦被判定满额，会按 `refreshCountdownSeconds` 熔断到下一次刷新窗口，避免每次请求都重复探测同一满额账号
 - **透明切号边界**：仅当上游在首个输出发给客户端之前报 quota/auth/overloaded 类错误时，bridge 才会自动在同一请求内切到下一个账号；一旦流式输出已经开始，就只记录失败，不会伪造续写
-- **外部上游兜底**：配置 `ACCIO_FALLBACK_OPENAI_*` 后，若账号池和本地链路因 quota/auth/timeout/5xx 等原因失败，bridge 会把纯文本请求转发到额外的 OpenAI 兼容上游；tools、thinking、图片请求不会静默降级
+- **外部上游兜底**：配置 `ACCIO_FALLBACK_*` 后，若账号池和本地链路因 quota/auth/timeout/5xx 等原因失败，bridge 会把请求转发到额外的外部上游。支持 OpenAI 兼容和 Anthropic Messages 两种协议；Anthropic 协议下会自动兼容 `/messages` 与 `/v1/messages` 路径差异，并处理部分上游返回的 `200 + wrapped 404` 场景
 
 命中缓存时返回 `x-accio-cache: hit`。
 
@@ -265,8 +272,9 @@ LOG_LEVEL=info
 - `x-accio-account-id` 按请求指定账号
 - 会话级账号粘性和可识别错误下的多账号 failover
 - 额度预检会优先跳过已满额账号；流式请求仅在首个输出前支持透明切号重试
-- 可选外部 OpenAI 兼容 fallback，仅对纯文本请求生效
+- 可选外部 OpenAI fallback 仅对纯文本请求生效；Anthropic fallback 走 Messages 协议透传，更适合 `Claude Code`
 - 管理台账号卡片展示额度状态和刷新倒计时（短 TTL 缓存）
+- 管理台支持外部上游配置持久化、连通性测试和 API Key 显隐
 - 自动发现 Accio 本地 agent / workspace / source
 - 对本地网关超时/连接失败/429/5xx 做错误分类和指数退避重试
 - 响应顶层附加 `accio.*` 调试字段
@@ -486,20 +494,23 @@ accio-anthropic-bridge/
 
 - `GET /healthz`、`GET /v1/models`、`POST /v1/messages/count_tokens`
 - `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses` 最小子集
+- 外部 OpenAI fallback 与外部 Anthropic fallback
+- Anthropic fallback 在上游返回 JSON 时可合成 SSE；已实测 `Claude Code` 这一类流式客户端所需事件格式
+- `https://open.bigmodel.cn/api/anthropic` 这类 base URL 可自动补 `v1/messages` 兼容路径
 - `GET /debug/traces` / `GET /debug/traces/:id` / `GET /debug/traces/:id/replay`
 - `session_id` 复用同一 `conversation_id`，会话级账号粘性
-- 默认输出上限兜底、短 TTL 精确请求缓存
+- 默认输出上限兜底、短 TTL 精确请求缓存、满额账号按刷新时间冷却切回
 - 失败请求自动 trace 采样和脱敏 replay 导出
 - `tool_use` / `tool_calls` / `accio.tool_results` 响应
-- `GET /admin` 管理台、`GET /admin/api/state`、OAuth 登录流、快照删除
-- 45 项单元测试全部通过
+- `GET /admin` 管理台、`GET /admin/api/state`、外部上游配置与测试、OAuth 登录流、快照删除
+- 60 项单元测试全部通过
 
 ## 后续还可以继续做
 
 1. 补齐 `tool_result` 往返协议，包括更完整的 multi-turn tool loop
 2. 扩展 `/v1/responses` 的 reasoning item、tool_result item 事件覆盖
 3. 更完整的图片/多模态上传桥接
-4. 如果找到更稳定的 Accio 上游 LLM 代发入口，做更深的直连适配
+4. 为外部 fallback 增加更细的健康检查、熔断和统计
 5. 在 trace store 基础上补 trace diff、导出 CLI 和自动复跑工具
 6. 补充 live integration test
 7. 将桌面壳打包为 `.app` / `.exe` / `.deb` 发布物
