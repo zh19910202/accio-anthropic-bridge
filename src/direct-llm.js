@@ -846,6 +846,8 @@ class DirectLlmClient {
     this._utdid = readAccioUtdid(config.accioHome);
     this._accountStandbyEnabled = config.accountStandbyEnabled !== false;
     this._accountStandbyRefreshMs = Number(config.accountStandbyRefreshMs || 30000);
+    this._currentServingCredential = null;
+    this._currentServingAt = 0;
     this._preparedCredentials = [];
     this._preparedCredentialsAt = 0;
     this._preparedLastError = null;
@@ -1193,6 +1195,11 @@ class DirectLlmClient {
       options.excludeIds.length > 0;
 
     if (this.authProvider && authMode !== "gateway") {
+      const currentCredential = this._resolveCurrentServingCredential(options);
+      if (currentCredential) {
+        return currentCredential;
+      }
+
       let standbyCredential = this._resolvePreparedCredential(options);
       if (!standbyCredential && failoverMode) {
         await this.refreshPreparedCredentials();
@@ -1282,6 +1289,13 @@ class DirectLlmClient {
   getStandbyState() {
     return {
       enabled: this._accountStandbyEnabled,
+      currentAccountId: this._currentServingCredential && this._currentServingCredential.accountId
+        ? String(this._currentServingCredential.accountId)
+        : null,
+      currentAccountName: this._currentServingCredential && this._currentServingCredential.accountName
+        ? String(this._currentServingCredential.accountName)
+        : null,
+      currentAccountSelectedAt: this._currentServingAt ? new Date(this._currentServingAt).toISOString() : null,
       refreshedAt: this._preparedCredentialsAt ? new Date(this._preparedCredentialsAt).toISOString() : null,
       lastError: this._preparedLastError || null,
       candidateCount: this._preparedCredentials.length,
@@ -1310,6 +1324,66 @@ class DirectLlmClient {
     return () => {
       this._standbyListeners.delete(listener);
     };
+  }
+
+  _setCurrentServingCredential(credential) {
+    if (!credential || !credential.accountId || credential.source === "gateway") {
+      return;
+    }
+
+    this._currentServingCredential = {
+      accountId: credential.accountId,
+      accountName: credential.accountName || null,
+      token: credential.token || null,
+      refreshToken: credential.refreshToken || null,
+      cookie: credential.cookie || null,
+      user: credential.user || null,
+      expiresAt: credential.expiresAt || null,
+      expiresAtRaw: credential.expiresAtRaw || null,
+      source: credential.source || null
+    };
+    this._currentServingAt = Date.now();
+    this._emitStandbyState();
+  }
+
+  _clearCurrentServingCredential(accountId = null) {
+    if (!this._currentServingCredential) {
+      return;
+    }
+
+    if (accountId && String(this._currentServingCredential.accountId || "") !== String(accountId)) {
+      return;
+    }
+
+    this._currentServingCredential = null;
+    this._currentServingAt = 0;
+    this._emitStandbyState();
+  }
+
+  _resolveCurrentServingCredential(options = {}) {
+    if (
+      !this._currentServingCredential ||
+      options.accountId ||
+      options.stickyAccountId ||
+      !this.authProvider ||
+      !this._currentServingCredential.accountId
+    ) {
+      return null;
+    }
+
+    const excludeIds = new Set(Array.isArray(options.excludeIds) ? options.excludeIds.map(String) : []);
+    const currentAccountId = String(this._currentServingCredential.accountId);
+
+    if (excludeIds.has(currentAccountId)) {
+      return null;
+    }
+
+    if (typeof this.authProvider.isAccountUsable === "function" && !this.authProvider.isAccountUsable(currentAccountId)) {
+      this._clearCurrentServingCredential(currentAccountId);
+      return null;
+    }
+
+    return { ...this._currentServingCredential };
   }
 
   _resolvePreparedCredential(options = {}) {
@@ -1844,6 +1918,7 @@ class DirectLlmClient {
           });
         }
 
+        this._clearCurrentServingCredential(auth.accountId);
         this.refreshPreparedCredentials().catch(() => {});
         continue;
       }
@@ -1874,6 +1949,7 @@ class DirectLlmClient {
           }
 
           triedAccounts.add(activeAuth.accountId);
+          this._clearCurrentServingCredential(activeAuth.accountId);
           this.refreshPreparedCredentials().catch(() => {});
 
           if (this._canContinueFailover(activeAuth, triedAccounts, stickyAccountId)) {
@@ -1948,6 +2024,7 @@ class DirectLlmClient {
         ) {
           this.authProvider.invalidateAccount(activeAuth.accountId, upstreamError.message);
         }
+        this._clearCurrentServingCredential(activeAuth.accountId);
 
         const shouldContinue = this._maybeContinueAfterAccountError({
           auth: activeAuth,
@@ -2003,6 +2080,7 @@ class DirectLlmClient {
         ) {
           this.authProvider.invalidateAccount(activeAuth.accountId, state.error.message);
         }
+        this._clearCurrentServingCredential(activeAuth.accountId);
 
         const shouldContinue = this._maybeContinueAfterAccountError({
           auth: activeAuth,
@@ -2035,6 +2113,8 @@ class DirectLlmClient {
 
       if (activeAuth.source === "gateway") {
         this._clearGatewayQuotaCooldown();
+      } else if (activeAuth.accountId) {
+        this._setCurrentServingCredential(activeAuth);
       }
 
       return {

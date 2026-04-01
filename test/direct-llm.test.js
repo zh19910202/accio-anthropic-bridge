@@ -761,6 +761,87 @@ test("DirectLlmClient uses prepared standby queue during failover instead of re-
   assert.equal(resolveCalls, 0);
 });
 
+test("DirectLlmClient keeps using the current serving account across requests when it remains healthy", async () => {
+  let resolveCalls = 0;
+  const seenTokens = [];
+  const authProvider = {
+    resolveCredential() {
+      resolveCalls++;
+      return resolveCalls === 1
+        ? {
+            accountId: "acct_a",
+            accountName: "Account A",
+            token: "token_a",
+            source: "accounts-file"
+          }
+        : {
+            accountId: "acct_b",
+            accountName: "Account B",
+            token: "token_b",
+            source: "accounts-file"
+          };
+    },
+    isAccountUsable() {
+      return true;
+    }
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+
+    if (value.endsWith("/models")) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        async json() {
+          return {
+            data: [
+              { provider: "claude", modelList: [{ modelName: "claude-opus-4-6", visible: true }] }
+            ]
+          };
+        }
+      };
+    }
+
+    if (value.includes("/generateContent")) {
+      const body = JSON.parse(options.body || "{}");
+      seenTokens.push(body.token);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error("Unexpected URL: " + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: "file",
+    authProvider,
+    quotaPreflightEnabled: false,
+    requestTimeoutMs: 1000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: "http://127.0.0.1:4097",
+    upstreamBaseUrl: "https://example.test/api/adk/llm",
+    fetchImpl
+  });
+
+  await client.run({ model: "claude-opus-4-6", requestBody: { model: "claude-opus-4-6" } });
+  await client.run({ model: "claude-opus-4-6", requestBody: { model: "claude-opus-4-6" } });
+
+  assert.equal(resolveCalls, 1);
+  assert.deepEqual(seenTokens, ["token_a", "token_a"]);
+  assert.equal(client.getStandbyState().currentAccountId, "acct_a");
+});
+
 test("DirectLlmClient refreshes standby queue on failover and does not fall back to direct traversal", async () => {
   let resolveCalls = 0;
   let listCalls = 0;
