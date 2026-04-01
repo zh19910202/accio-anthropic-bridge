@@ -1517,6 +1517,61 @@ button { font: inherit; cursor: pointer; }
 .dot.good { background: var(--good); animation: pulse 2s ease-in-out infinite; }
 .dot.warn { background: var(--warn); animation: pulseWarn 2s ease-in-out infinite; }
 .dot.bad { background: var(--bad); }
+
+/* ── StatusBadge Quota Mode ── */
+.statusBadge {
+  position: relative;
+  overflow: hidden;
+  z-index: 0;
+  transition: border-color var(--transition-fast);
+}
+.statusBadge .badgeFill {
+  position: absolute;
+  top: 0; left: 0; bottom: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(26,138,90,0.18) 0%, rgba(26,138,90,0.08) 100%);
+  transition: width 0.8s cubic-bezier(0.4,0,0.2,1), background 0.4s ease;
+  pointer-events: none;
+}
+.statusBadge .badgeFill[data-level="mid"] {
+  background: linear-gradient(90deg, rgba(184,122,26,0.18) 0%, rgba(184,122,26,0.08) 100%);
+}
+.statusBadge .badgeFill[data-level="low"] {
+  background: linear-gradient(90deg, rgba(224,104,72,0.22) 0%, rgba(196,60,60,0.10) 100%);
+}
+.statusBadge .badgeFill[data-level="empty"] {
+  background: linear-gradient(90deg, rgba(196,60,60,0.22) 0%, rgba(196,60,60,0.10) 100%);
+}
+@keyframes quotaShimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes quotaPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.statusBadge.quota-active .badgeFill {
+  background-size: 200% 100%;
+  animation: quotaShimmer 3s ease-in-out infinite;
+}
+.statusBadge .badgeFill[data-level="low"],
+.statusBadge .badgeFill[data-level="empty"] {
+  animation: quotaPulse 2s ease-in-out infinite, quotaShimmer 3s ease-in-out infinite;
+}
+.statusBadge .badgeQuota {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--good);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+.statusBadge.quota-active .badgeQuota { opacity: 1; }
+.statusBadge .badgeQuota[data-level="mid"] { color: var(--warn); }
+.statusBadge .badgeQuota[data-level="low"],
+.statusBadge .badgeQuota[data-level="empty"] { color: var(--bad); }
 .kv {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2448,7 +2503,7 @@ button { font: inherit; cursor: pointer; }
   <section class="topbar topbar-head topbar-compact statusActionsRow" id="primary-topbar">
     <aside class="statusCard statusCard-wide">
       <div class="statusHeader">
-        <div class="statusBadge"><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span></div>
+        <div class="statusBadge" id="status-badge"><span class="badgeFill" id="badge-fill"></span><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span><span class="badgeQuota" id="badge-quota"></span></div>
         <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
       </div>
       <div class="kv" id="overview-kv"></div>
@@ -3239,12 +3294,49 @@ function renderSnapshots(data) {
       + '</div>';
   }).join('');
 }
+function renderQuotaBar(data) {
+  const badge = document.getElementById('status-badge');
+  const fill = document.getElementById('badge-fill');
+  const quotaSpan = document.getElementById('badge-quota');
+  if (!badge || !fill || !quotaSpan) return;
+
+  const activity = data && data.recentActivity ? data.recentActivity : null;
+  const isDirectLlm = activity && activity.transportSelected === 'direct-llm';
+  const snapshot = data && data.currentSnapshot ? data.currentSnapshot : null;
+  const quota = snapshot && snapshot.quota && snapshot.quota.available ? snapshot.quota : null;
+
+  if (!isDirectLlm || !quota || typeof quota.usagePercent !== 'number') {
+    badge.classList.remove('quota-active');
+    fill.style.width = '0%';
+    fill.removeAttribute('data-level');
+    quotaSpan.textContent = '';
+    return;
+  }
+
+  const used = Math.min(100, Math.max(0, quota.usagePercent));
+  const remaining = 100 - used;
+  let level = 'full';
+  if (remaining <= 0) level = 'empty';
+  else if (remaining <= 15) level = 'low';
+  else if (remaining <= 40) level = 'mid';
+
+  fill.style.width = remaining + '%';
+  if (level === 'full') { fill.removeAttribute('data-level'); }
+  else { fill.setAttribute('data-level', level); }
+
+  quotaSpan.textContent = Math.round(remaining) + '%';
+  if (level === 'full') { quotaSpan.removeAttribute('data-level'); }
+  else { quotaSpan.setAttribute('data-level', level); }
+
+  badge.classList.add('quota-active');
+}
 function renderState(data, options = {}) {
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
   const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
   const [, gatewaySummary] = badgeState(data.gateway);
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary;
+  renderQuotaBar(data);
   renderKv(els.overviewKv, [
     ['最近请求', describeRecentActivityCompact(recentActivity)],
     ['当前网关', describeGatewayCompact(data.gateway)],

@@ -465,6 +465,184 @@ test("DirectLlmClient cools down a saturated account until refresh time instead 
   assert.ok((invalidUntilById.get('acct_full') || 0) > Date.now());
 });
 
+test("DirectLlmClient replays auth callback before using the next file account after quota failover", async () => {
+  const seenTokens = [];
+  let currentGatewayUserId = 'user_full';
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      if (!excluded.has('acct_full')) {
+        return {
+          accountId: 'acct_full',
+          accountName: 'Full',
+          token: 'token_full',
+          refreshToken: 'refresh_full',
+          cookie: 'cna=full-cna',
+          user: { id: 'user_full', name: 'Full' },
+          source: 'accounts-file'
+        };
+      }
+
+      if (!excluded.has('acct_ok')) {
+        return {
+          accountId: 'acct_ok',
+          accountName: 'Okay',
+          token: 'token_ok',
+          refreshToken: 'refresh_ok',
+          cookie: 'cna=ok-cna',
+          user: { id: 'user_ok', name: 'Okay' },
+          source: 'accounts-file'
+        };
+      }
+
+      return null;
+    },
+    invalidateAccountUntil() {},
+    recordFailure() {},
+    invalidateAccount() {},
+    clearFailure() {},
+    clearInvalidation() {}
+  };
+
+  const gatewayManager = {
+    baseUrl: 'http://127.0.0.1:4097',
+    ensureStarted: async () => {},
+    waitMs: 2000,
+    pollMs: 10
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+
+    if (value.endsWith('/auth/status')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            authenticated: true,
+            user: currentGatewayUserId ? { id: currentGatewayUserId, name: currentGatewayUserId } : null
+          };
+        }
+      };
+    }
+
+    if (value.endsWith('/auth/logout')) {
+      currentGatewayUserId = '';
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return '{}';
+        }
+      };
+    }
+
+    if (value.includes('/auth/callback?')) {
+      const parsed = new URL(value);
+      const refreshToken = parsed.searchParams.get('refreshToken');
+      currentGatewayUserId = refreshToken === 'refresh_ok_new' ? 'user_ok' : 'user_full';
+      return {
+        ok: true,
+        status: 200,
+        headers: { get() { return null; } },
+        async text() {
+          return 'ok';
+        }
+      };
+    }
+
+    if (value.includes('/api/auth/refresh_token')) {
+      const body = JSON.parse(options.body || '{}');
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            success: true,
+            data: {
+              accessToken: body.refreshToken === 'refresh_ok' ? 'token_ok_new' : 'token_full_new',
+              refreshToken: body.refreshToken === 'refresh_ok' ? 'refresh_ok_new' : 'refresh_full_new',
+              expiresAt: String(Math.floor(Date.now() / 1000) + 3600),
+              userId: body.refreshToken === 'refresh_ok' ? 'user_ok' : 'user_full'
+            }
+          });
+        }
+      };
+    }
+
+    if (value.includes('/api/entitlement/quota')) {
+      const parsed = new URL(value);
+      const token = parsed.searchParams.get('accessToken');
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            success: true,
+            data: {
+              usagePercent: token === 'token_full' ? 100 : 20,
+              refreshCountdownSeconds: 3600
+            }
+          };
+        }
+      };
+    }
+
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return {
+            data: [
+              { provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }
+            ]
+          };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      seenTokens.push(body.token);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    gatewayManager,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  const result = await client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } });
+
+  assert.equal(result.accountId, 'acct_ok');
+  assert.deepEqual(seenTokens, ['token_ok_new']);
+  assert.equal(currentGatewayUserId, 'user_ok');
+});
+
 test("DirectLlmClient quota preflight sends the full cookie header for account-scoped quota", async () => {
   const seenHeaders = [];
   const client = new DirectLlmClient({

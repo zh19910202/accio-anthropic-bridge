@@ -425,6 +425,7 @@ async function main() {
   const directClient = new DirectLlmClient({
     authMode: config.authMode,
     authProvider,
+    accountsPath: config.accountsPath,
     gatewayManager,
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,

@@ -4,11 +4,13 @@ const crypto = require("node:crypto");
 
 const modelAliases = require("../config/model-aliases.json");
 
+const { writeAccountToFile } = require("./accounts-file");
 const { shouldFailoverAccount } = require("./errors");
 const { extractGatewayModels } = require("./models");
 const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 const { safeJsonParse } = require("./jsonc");
+const log = require("./logger");
 const { maskToken } = require("./redaction");
 const { readAccioUtdid, extractCnaFromCookie, normalizeCookieHeader } = require("./discovery");
 
@@ -63,6 +65,10 @@ function inferProvider(model) {
   }
 
   return "unknown";
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function toToolDeclarations(tools, pickSchema) {
@@ -835,6 +841,383 @@ class DirectLlmClient {
     this._utdid = readAccioUtdid(config.accioHome);
   }
 
+  _deriveGatewayBaseUrl() {
+    return String(this.gatewayManager && this.gatewayManager.baseUrl
+      ? this.gatewayManager.baseUrl
+      : this.config.localGatewayBaseUrl || "http://127.0.0.1:4097").replace(/\/$/, "");
+  }
+
+  _deriveUpstreamGatewayBaseUrl() {
+    const candidate = this.config && this.config.upstreamBaseUrl ? String(this.config.upstreamBaseUrl).trim() : "";
+    if (candidate) {
+      try {
+        const parsed = new URL(candidate);
+        return `${parsed.protocol}//${parsed.host}`;
+      } catch {
+        // Fall through to the default gateway origin.
+      }
+    }
+
+    return "https://phoenix-gw.alibaba.com";
+  }
+
+  async _readGatewayState() {
+    const normalized = this._deriveGatewayBaseUrl();
+
+    try {
+      const response = await this.fetchImpl(`${normalized}/auth/status`, {
+        signal: AbortSignal.timeout(3000)
+      });
+
+      if (!response.ok) {
+        return {
+          reachable: true,
+          authenticated: false,
+          baseUrl: normalized,
+          status: response.status,
+          user: null
+        };
+      }
+
+      const payload = await response.json();
+      return {
+        reachable: true,
+        authenticated: Boolean(payload && payload.authenticated),
+        baseUrl: normalized,
+        status: response.status,
+        user: payload && payload.user ? payload.user : null
+      };
+    } catch (error) {
+      return {
+        reachable: false,
+        authenticated: false,
+        baseUrl: normalized,
+        status: null,
+        user: null,
+        error: error && error.message ? error.message : String(error)
+      };
+    }
+  }
+
+  async _requestGatewayJson(pathname, options = {}) {
+    const response = await this.fetchImpl(`${this._deriveGatewayBaseUrl()}${pathname}`, {
+      method: options.method || "GET",
+      headers: {
+        "content-type": "application/json",
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: AbortSignal.timeout(Number(options.timeoutMs || 8000))
+    });
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
+
+    if (!response.ok) {
+      const error = new Error(`Gateway request failed for ${pathname}: ${response.status}`);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
+
+    return payload;
+  }
+
+  _isGatewayConnectionError(error) {
+    const message = error && error.message ? String(error.message) : String(error || "");
+    return /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up/i.test(message);
+  }
+
+  async _waitForGatewayReachable(waitMs = 20000, pollMs = 500) {
+    const deadline = Date.now() + waitMs;
+    let lastGateway = null;
+
+    while (Date.now() < deadline) {
+      const gateway = await this._readGatewayState();
+      lastGateway = gateway;
+
+      if (gateway && gateway.reachable) {
+        return gateway;
+      }
+
+      await delay(pollMs);
+    }
+
+    return lastGateway;
+  }
+
+  async _requestGatewayText(pathname, options = {}) {
+    const response = await this.fetchImpl(`${this._deriveGatewayBaseUrl()}${pathname}`, {
+      method: options.method || "GET",
+      headers: {
+        ...(options.headers || {})
+      },
+      body: options.body || undefined,
+      redirect: options.redirect || "manual",
+      signal: AbortSignal.timeout(Number(options.timeoutMs || 15000))
+    });
+    const text = await response.text();
+
+    if (!response.ok) {
+      const error = new Error(`Gateway request failed for ${pathname}: ${response.status}`);
+      error.status = response.status;
+      error.body = text;
+      throw error;
+    }
+
+    return {
+      status: response.status,
+      text,
+      location: response.headers.get("location") || null
+    };
+  }
+
+  async _requestGatewayTextWithAutostart(pathname, options = {}) {
+    try {
+      return await this._requestGatewayText(pathname, options);
+    } catch (error) {
+      if (!this._isGatewayConnectionError(error)) {
+        throw error;
+      }
+
+      if (!this.gatewayManager || typeof this.gatewayManager.ensureStarted !== "function") {
+        throw error;
+      }
+
+      log.warn("gateway text request failed before autostart retry", {
+        pathname,
+        baseUrl: this._deriveGatewayBaseUrl(),
+        error: error && error.message ? error.message : String(error)
+      });
+
+      await this.gatewayManager.ensureStarted();
+      const gateway = await this._waitForGatewayReachable(
+        Number(this.gatewayManager.waitMs || 20000),
+        Number(this.gatewayManager.pollMs || 500)
+      );
+
+      if (!gateway || !gateway.reachable) {
+        const retryError = new Error(`Gateway did not become reachable after launching Accio for ${pathname}`);
+        retryError.type = "gateway_unreachable";
+        throw retryError;
+      }
+
+      return this._requestGatewayText(pathname, options);
+    }
+  }
+
+  _buildGatewayAuthCallbackQuery(payload, options = {}) {
+    const query = new URLSearchParams();
+    query.set("accessToken", String(payload.accessToken || ""));
+    query.set("refreshToken", String(payload.refreshToken || ""));
+    query.set("expiresAt", String(payload.expiresAtRaw || payload.expiresAt || ""));
+
+    if (payload.cookie) {
+      query.set("cookie", String(payload.cookie));
+    }
+
+    if (options.includeState && payload.state) {
+      query.set("state", String(payload.state));
+    }
+
+    return query.toString();
+  }
+
+  async _forwardGatewayAuthCallback(payload, options = {}) {
+    const query = this._buildGatewayAuthCallbackQuery(payload, options);
+    return this._requestGatewayTextWithAutostart(`/auth/callback?${query}`, {
+      method: "GET",
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"
+      },
+      timeoutMs: Number(options.timeoutMs || 15000)
+    });
+  }
+
+  async _waitForGatewayAuthenticatedUser(expectedUserId = "", waitMs = 15000, pollMs = 500) {
+    const deadline = Date.now() + waitMs;
+    let lastGateway = null;
+
+    while (Date.now() < deadline) {
+      const gateway = await this._readGatewayState();
+      lastGateway = gateway;
+      const currentUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
+
+      if (gateway && gateway.reachable && gateway.authenticated && (!expectedUserId || currentUserId === String(expectedUserId))) {
+        return gateway;
+      }
+
+      await delay(pollMs);
+    }
+
+    return lastGateway;
+  }
+
+  async _refreshAuthPayloadViaUpstream(auth, context = {}) {
+    if (!auth || !auth.token || !auth.refreshToken) {
+      throw new Error("Auth payload is missing accessToken or refreshToken");
+    }
+
+    const upstreamBaseUrl = this._deriveUpstreamGatewayBaseUrl();
+    const requestBody = {
+      utdid: this._utdid || "",
+      version: "0.0.0",
+      accessToken: String(auth.token),
+      refreshToken: String(auth.refreshToken)
+    };
+    const response = await this.fetchImpl(`${upstreamBaseUrl}/api/auth/refresh_token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-language": this.config && this.config.language ? String(this.config.language) : "zh",
+        "x-utdid": this._utdid || "",
+        "x-app-version": "0.0.0",
+        "x-os": process.platform,
+        "x-cna": extractCnaFromCookie(auth.cookie)
+      },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(15000)
+    });
+    const responseText = await response.text();
+
+    let payload;
+    try {
+      payload = responseText ? JSON.parse(responseText) : {};
+    } catch (error) {
+      throw new Error(`Upstream refresh returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (!response.ok || !payload || payload.success !== true || !payload.data || !payload.data.accessToken || !payload.data.refreshToken || !payload.data.expiresAt) {
+      const message = payload && payload.message ? String(payload.message) : `HTTP ${response.status}`;
+      throw new Error(`Upstream refresh failed: ${message}`);
+    }
+
+    const expiresAtMs = Number(payload.data.expiresAt) * 1000;
+    const refreshed = {
+      accessToken: String(payload.data.accessToken),
+      refreshToken: String(payload.data.refreshToken),
+      expiresAtRaw: String(payload.data.expiresAt),
+      expiresAtMs: Number.isFinite(expiresAtMs) && expiresAtMs > 0 ? expiresAtMs : null,
+      cookie: auth.cookie || null,
+      user: auth.user || null,
+      source: "upstream-refresh",
+      refreshBoundUserId: payload.data.userId ? String(payload.data.userId) : null,
+      refreshedAt: new Date().toISOString()
+    };
+
+    log.info("auth payload upstream refresh succeeded", {
+      accountId: auth.accountId || null,
+      previousUserId: context.previousUserId || null,
+      expectedUserId: auth && auth.user && auth.user.id ? String(auth.user.id) : null,
+      boundUserId: refreshed.refreshBoundUserId,
+      upstreamBaseUrl,
+      accessToken: maskToken(refreshed.accessToken),
+      refreshToken: maskToken(refreshed.refreshToken)
+    });
+
+    return refreshed;
+  }
+
+  _persistCredentialRefresh(auth, refreshedAuth) {
+    if (!this.config.accountsPath || !auth || !auth.accountId || !refreshedAuth || !refreshedAuth.accessToken) {
+      return;
+    }
+
+    try {
+      writeAccountToFile(this.config.accountsPath, auth.accountId, refreshedAuth.accessToken, {
+        user: refreshedAuth.user || auth.user || null,
+        expiresAtMs: refreshedAuth.expiresAtMs || auth.expiresAt || null,
+        expiresAtRaw: refreshedAuth.expiresAtRaw || auth.expiresAtRaw || null,
+        refreshToken: refreshedAuth.refreshToken || auth.refreshToken || null,
+        cookie: refreshedAuth.cookie || auth.cookie || null,
+        source: "gateway-auth-callback",
+        authPayload: {
+          accessToken: refreshedAuth.accessToken,
+          refreshToken: refreshedAuth.refreshToken || auth.refreshToken || null,
+          expiresAtRaw: refreshedAuth.expiresAtRaw || auth.expiresAtRaw || null,
+          expiresAtMs: refreshedAuth.expiresAtMs || auth.expiresAt || null,
+          cookie: refreshedAuth.cookie || auth.cookie || null,
+          user: refreshedAuth.user || auth.user || null,
+          source: "gateway-auth-callback",
+          capturedAt: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      log.warn("persist auth payload after automatic gateway switch failed", {
+        accountId: auth.accountId,
+        error: error && error.message ? error.message : String(error)
+      });
+    }
+  }
+
+  async ensureGatewayAccountReady(auth) {
+    if (!auth || auth.source === "gateway" || !auth.refreshToken || !auth.user || !auth.user.id) {
+      return auth;
+    }
+
+    const expectedUserId = String(auth.user.id);
+    const gatewayBefore = await this._readGatewayState();
+    const currentGatewayUserId = gatewayBefore && gatewayBefore.user && gatewayBefore.user.id
+      ? String(gatewayBefore.user.id)
+      : "";
+
+    if (gatewayBefore && gatewayBefore.reachable && gatewayBefore.authenticated && currentGatewayUserId === expectedUserId) {
+      return auth;
+    }
+
+    const primedAuthPayload = await this._refreshAuthPayloadViaUpstream(auth, {
+      previousUserId: currentGatewayUserId || null
+    });
+
+    if (gatewayBefore && gatewayBefore.reachable && gatewayBefore.authenticated) {
+      await this._requestGatewayJson("/auth/logout", { method: "POST", body: {} }).catch((error) => {
+        log.warn("automatic account switch logout before callback replay failed", {
+          accountId: auth.accountId || null,
+          error: error && error.message ? error.message : String(error)
+        });
+      });
+    }
+
+    await this._forwardGatewayAuthCallback(primedAuthPayload, { includeState: false, timeoutMs: 20000 });
+    const gatewayAfter = await this._waitForGatewayAuthenticatedUser(expectedUserId, 20000, 500);
+    const currentUserId = gatewayAfter && gatewayAfter.user && gatewayAfter.user.id
+      ? String(gatewayAfter.user.id)
+      : "";
+    const switched = Boolean(gatewayAfter && gatewayAfter.reachable && gatewayAfter.authenticated && currentUserId === expectedUserId);
+
+    if (!switched) {
+      const error = new Error(`Automatic gateway account switch did not confirm target user ${expectedUserId}`);
+      error.status = 502;
+      error.type = "gateway_account_switch_failed";
+      error.details = {
+        expectedUserId,
+        currentUserId: currentUserId || null
+      };
+      throw error;
+    }
+
+    const nextAuth = {
+      ...auth,
+      token: primedAuthPayload.accessToken,
+      refreshToken: primedAuthPayload.refreshToken,
+      expiresAtRaw: primedAuthPayload.expiresAtRaw,
+      expiresAt: primedAuthPayload.expiresAtMs || auth.expiresAt || null,
+      cookie: primedAuthPayload.cookie || auth.cookie || null,
+      user: gatewayAfter && gatewayAfter.user ? gatewayAfter.user : auth.user,
+      source: "gateway-auth-callback"
+    };
+
+    this._persistCredentialRefresh(auth, {
+      accessToken: nextAuth.token,
+      refreshToken: nextAuth.refreshToken,
+      expiresAtRaw: nextAuth.expiresAtRaw,
+      expiresAtMs: nextAuth.expiresAt,
+      cookie: nextAuth.cookie,
+      user: nextAuth.user
+    });
+
+    return nextAuth;
+  }
+
   async getGatewayToken(options = {}) {
     if (this._cachedToken && Date.now() - this._cachedAt < this._cacheTtlMs) {
       return this._cachedToken;
@@ -1344,12 +1727,48 @@ class DirectLlmClient {
         continue;
       }
 
+      let activeAuth = auth;
+      if (activeAuth.accountId && activeAuth.source !== "gateway") {
+        try {
+          activeAuth = await this.ensureGatewayAccountReady(activeAuth);
+        } catch (error) {
+          if (activeAuth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+            this.authProvider.recordFailure(activeAuth.accountId, error);
+          }
+
+          if (activeAuth.accountId && this.authProvider && typeof this.authProvider.invalidateAccount === "function") {
+            this.authProvider.invalidateAccount(activeAuth.accountId, error && error.message ? error.message : String(error));
+          }
+
+          if (typeof options.onDecision === "function") {
+            options.onDecision({
+              type: "account_failover",
+              accountId: activeAuth.accountId,
+              accountName: activeAuth.accountName || null,
+              authSource: activeAuth.source,
+              reason: error && error.message ? error.message : String(error),
+              status: error && error.status ? error.status : 502,
+              phase: "account-switch"
+            });
+          }
+
+          triedAccounts.add(activeAuth.accountId);
+
+          if (this._canContinueFailover(activeAuth, triedAccounts, stickyAccountId)) {
+            lastError = error;
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
       if (typeof options.onDecision === "function") {
         options.onDecision({
           type: "direct_attempt",
-          accountId: auth.accountId,
-          accountName: auth.accountName || null,
-          authSource: auth.source,
+          accountId: activeAuth.accountId,
+          accountName: activeAuth.accountName || null,
+          authSource: activeAuth.source,
           requestedModel: modelInfo.requestedModel,
           normalizedModel: modelInfo.normalizedModel,
           resolvedProviderModel: modelInfo.resolvedProviderModel,
@@ -1361,7 +1780,7 @@ class DirectLlmClient {
       const upstreamBody = {
         ...request.requestBody,
         model: modelInfo.resolvedProviderModel,
-        token
+        token: activeAuth.token
       };
       let res;
 
@@ -1376,7 +1795,7 @@ class DirectLlmClient {
           signal: AbortSignal.timeout(this.config.requestTimeoutMs)
         });
       } catch (error) {
-        if (auth.source === "gateway") {
+        if (activeAuth.source === "gateway") {
           this.clearTokenCache();
         }
 
@@ -1385,31 +1804,31 @@ class DirectLlmClient {
 
       if (!res.ok) {
         const rawText = await res.text().catch(() => "");
-        const upstreamError = new UpstreamHttpError(res.status, res.statusText, rawText, token);
+        const upstreamError = new UpstreamHttpError(res.status, res.statusText, rawText, activeAuth.token);
 
-        if (auth.source === "gateway" && (res.status === 401 || res.status === 403)) {
+        if (activeAuth.source === "gateway" && (res.status === 401 || res.status === 403)) {
           this.clearTokenCache();
         }
 
-        if (auth.source === "gateway") {
+        if (activeAuth.source === "gateway") {
           this._rememberGatewayQuotaFailure(upstreamError);
         }
 
-        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
-          this.authProvider.recordFailure(auth.accountId, upstreamError);
+        if (activeAuth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(activeAuth.accountId, upstreamError);
         }
 
         if (
           shouldFailoverAccount(upstreamError) &&
-          auth.accountId &&
+          activeAuth.accountId &&
           this.authProvider &&
           typeof this.authProvider.invalidateAccount === "function"
         ) {
-          this.authProvider.invalidateAccount(auth.accountId, upstreamError.message);
+          this.authProvider.invalidateAccount(activeAuth.accountId, upstreamError.message);
         }
 
         const shouldContinue = this._maybeContinueAfterAccountError({
-          auth,
+          auth: activeAuth,
           error: upstreamError,
           explicitAccountId,
           stickyAccountId,
@@ -1446,25 +1865,25 @@ class DirectLlmClient {
       }
 
       if (state.error) {
-        if (auth.source === "gateway") {
+        if (activeAuth.source === "gateway") {
           this._rememberGatewayQuotaFailure(state.error);
         }
 
-        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
-          this.authProvider.recordFailure(auth.accountId, state.error);
+        if (activeAuth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(activeAuth.accountId, state.error);
         }
 
         if (
           shouldFailoverAccount(state.error) &&
-          auth.accountId &&
+          activeAuth.accountId &&
           this.authProvider &&
           typeof this.authProvider.invalidateAccount === "function"
         ) {
-          this.authProvider.invalidateAccount(auth.accountId, state.error.message);
+          this.authProvider.invalidateAccount(activeAuth.accountId, state.error.message);
         }
 
         const shouldContinue = this._maybeContinueAfterAccountError({
-          auth,
+          auth: activeAuth,
           error: state.error,
           explicitAccountId,
           stickyAccountId,
@@ -1482,25 +1901,25 @@ class DirectLlmClient {
         throw state.error;
       }
 
-      if (auth.accountId && this.authProvider) {
+      if (activeAuth.accountId && this.authProvider) {
         if (typeof this.authProvider.clearFailure === "function") {
-          this.authProvider.clearFailure(auth.accountId);
+          this.authProvider.clearFailure(activeAuth.accountId);
         }
 
         if (typeof this.authProvider.clearInvalidation === "function") {
-          this.authProvider.clearInvalidation(auth.accountId);
+          this.authProvider.clearInvalidation(activeAuth.accountId);
         }
       }
 
-      if (auth.source === "gateway") {
+      if (activeAuth.source === "gateway") {
         this._clearGatewayQuotaCooldown();
       }
 
       return {
         ...state.toResult(),
-        accountId: auth.accountId,
-        accountName: auth.accountName || null,
-        authSource: auth.source,
+        accountId: activeAuth.accountId,
+        accountName: activeAuth.accountName || null,
+        authSource: activeAuth.source,
         resolvedProviderModel: modelInfo.resolvedProviderModel,
         thinking: request.thinking || null
       };
