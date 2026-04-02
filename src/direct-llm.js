@@ -849,11 +849,204 @@ class DirectLlmClient {
     this._currentServingCredential = null;
     this._currentServingAt = 0;
     this._preparedCredentials = [];
+    this._standbyCooldownCredentials = [];
     this._preparedCredentialsAt = 0;
     this._preparedLastError = null;
     this._standbyRefreshPromise = null;
     this._standbyTimer = null;
     this._standbyListeners = new Set();
+  }
+
+  _mapConfiguredAccountToCredential(account) {
+    if (!account) {
+      return null;
+    }
+
+    return {
+      accountId: account.id,
+      accountName: account.name,
+      token: account.accessToken,
+      refreshToken: account.refreshToken || null,
+      cookie: account.cookie || null,
+      user: account.user || null,
+      expiresAt: account.expiresAt || null,
+      expiresAtRaw: account.expiresAtRaw || null,
+      source: account.source,
+      transportOverride: account.transportOverride || null,
+      baseUrl: account.baseUrl || null
+    };
+  }
+
+  _getCurrentServingAccountId() {
+    return this._currentServingCredential && this._currentServingCredential.accountId
+      ? String(this._currentServingCredential.accountId)
+      : "";
+  }
+
+  _buildStandbyRecord(credential, extras = {}) {
+    return {
+      accountId: credential && credential.accountId ? String(credential.accountId) : null,
+      accountName: credential && credential.accountName ? String(credential.accountName) : null,
+      source: credential && credential.source ? String(credential.source) : null,
+      state: extras.state ? String(extras.state) : "ready",
+      quotaCheckedAt: extras.quotaCheckedAt ? String(extras.quotaCheckedAt) : null,
+      nextCheckAt: extras.nextCheckAt ? new Date(extras.nextCheckAt).toISOString() : null,
+      reason: extras.reason ? String(extras.reason) : null,
+      usagePercent: typeof extras.usagePercent === "number" ? extras.usagePercent : null,
+      refreshCountdownSeconds: typeof extras.refreshCountdownSeconds === "number" ? extras.refreshCountdownSeconds : null
+    };
+  }
+
+  _sortCooldownCredentials(records) {
+    return [...records].sort((left, right) => {
+      const leftAt = left && left.nextCheckAt ? new Date(left.nextCheckAt).getTime() : Number.POSITIVE_INFINITY;
+      const rightAt = right && right.nextCheckAt ? new Date(right.nextCheckAt).getTime() : Number.POSITIVE_INFINITY;
+      if (leftAt !== rightAt) {
+        return leftAt - rightAt;
+      }
+
+      return String(left && left.accountId ? left.accountId : "").localeCompare(String(right && right.accountId ? right.accountId : ""));
+    });
+  }
+
+  _upsertPreparedCredential(credential) {
+    if (!credential || !credential.accountId) {
+      return;
+    }
+
+    const accountId = String(credential.accountId);
+    const next = this._preparedCredentials.filter((item) => String(item && item.accountId ? item.accountId : "") !== accountId);
+    next.push(credential);
+    this._preparedCredentials = next;
+    this._standbyCooldownCredentials = this._standbyCooldownCredentials.filter((item) => String(item && item.accountId ? item.accountId : "") !== accountId);
+    this._preparedCredentialsAt = Date.now();
+  }
+
+  _upsertCooldownCredential(record) {
+    if (!record || !record.accountId) {
+      return;
+    }
+
+    const accountId = String(record.accountId);
+    this._preparedCredentials = this._preparedCredentials.filter((item) => String(item && item.accountId ? item.accountId : "") !== accountId);
+    const next = this._standbyCooldownCredentials.filter((item) => String(item && item.accountId ? item.accountId : "") !== accountId);
+    next.push(record);
+    this._standbyCooldownCredentials = this._sortCooldownCredentials(next);
+    this._preparedCredentialsAt = Date.now();
+  }
+
+  _findCooldownProbeCandidate(options = {}) {
+    if (
+      !this._accountStandbyEnabled ||
+      !this.authProvider ||
+      typeof this.authProvider.getConfiguredAccounts !== "function" ||
+      options.accountId ||
+      options.stickyAccountId ||
+      !Array.isArray(options.excludeIds) ||
+      options.excludeIds.length === 0
+    ) {
+      return null;
+    }
+
+    const excluded = new Set(options.excludeIds.map(String));
+    const now = Date.now();
+    const candidateRecord = this._standbyCooldownCredentials.find((record) => {
+      if (!record || !record.accountId || excluded.has(String(record.accountId))) {
+        return false;
+      }
+
+      const nextCheckAtMs = record.nextCheckAt ? new Date(record.nextCheckAt).getTime() : 0;
+      return !Number.isFinite(nextCheckAtMs) || nextCheckAtMs <= now;
+    });
+
+    if (!candidateRecord || !candidateRecord.accountId) {
+      return null;
+    }
+
+    const invalidUntil = typeof this.authProvider.getInvalidUntil === "function"
+      ? Number(this.authProvider.getInvalidUntil(candidateRecord.accountId) || 0)
+      : 0;
+    if (invalidUntil > now) {
+      return null;
+    }
+
+    const account = this.authProvider.getConfiguredAccounts().find((item) => {
+      if (!item || !item.id || String(item.id) !== String(candidateRecord.accountId)) {
+        return false;
+      }
+
+      if (item.source === "gateway" || !item.enabled || !item.accessToken) {
+        return false;
+      }
+
+      if (item.expiresAt && Number(item.expiresAt) <= now) {
+        return false;
+      }
+
+      return true;
+    });
+
+    if (!account) {
+      return null;
+    }
+
+    return {
+      record: candidateRecord,
+      credential: this._mapConfiguredAccountToCredential(account)
+    };
+  }
+
+  async _probeCooldownCredential(options = {}) {
+    const matched = this._findCooldownProbeCandidate(options);
+    if (!matched || !matched.credential || !matched.credential.accountId) {
+      return null;
+    }
+
+    const { credential } = matched;
+    const checkedAt = new Date().toISOString();
+
+    try {
+      const quota = await this.fetchQuotaStatus(credential);
+      const usagePercent = Number(quota && quota.usagePercent);
+
+      if (Number.isFinite(usagePercent) && usagePercent >= 100) {
+        const refreshUntilMs = this._getQuotaRefreshUntilMs(quota);
+        const reason = `quota precheck skipped account at ${Math.round(usagePercent)}%`;
+        if (typeof this.authProvider.invalidateAccountUntil === "function") {
+          this.authProvider.invalidateAccountUntil(credential.accountId, refreshUntilMs, reason);
+        } else if (typeof this.authProvider.invalidateAccount === "function") {
+          this.authProvider.invalidateAccount(credential.accountId, reason, refreshUntilMs);
+        }
+
+        this._upsertCooldownCredential(this._buildStandbyRecord(credential, {
+          state: "cooldown",
+          quotaCheckedAt: quota && quota.checkedAt ? quota.checkedAt : checkedAt,
+          nextCheckAt: refreshUntilMs || (Date.now() + this._quotaCacheTtlMs),
+          reason,
+          usagePercent: Number.isFinite(usagePercent) ? usagePercent : null,
+          refreshCountdownSeconds: Number(quota && quota.refreshCountdownSeconds) || null
+        }));
+        this._emitStandbyState();
+        return null;
+      }
+
+      const preparedCredential = {
+        ...credential,
+        quotaCheckedAt: quota && quota.checkedAt ? quota.checkedAt : checkedAt
+      };
+      this._upsertPreparedCredential(preparedCredential);
+      this._emitStandbyState();
+      return preparedCredential;
+    } catch (error) {
+      this._upsertCooldownCredential(this._buildStandbyRecord(credential, {
+        state: "rechecking",
+        quotaCheckedAt: matched.record && matched.record.quotaCheckedAt ? matched.record.quotaCheckedAt : checkedAt,
+        nextCheckAt: Date.now() + Math.min(30000, Math.max(5000, this._accountStandbyRefreshMs)),
+        reason: error && error.message ? error.message : String(error)
+      }));
+      this._emitStandbyState();
+      return null;
+    }
   }
 
   _deriveGatewayBaseUrl() {
@@ -1204,6 +1397,9 @@ class DirectLlmClient {
       if (!standbyCredential && failoverMode) {
         await this.refreshPreparedCredentials();
         standbyCredential = this._resolvePreparedCredential(options);
+        if (!standbyCredential) {
+          standbyCredential = await this._probeCooldownCredential(options);
+        }
       }
 
       if (standbyCredential) {
@@ -1211,6 +1407,18 @@ class DirectLlmClient {
       }
 
       if (failoverMode) {
+        const emergencyCredential = this.authProvider.resolveCredential({
+          excludeIds: options.excludeIds
+        });
+        if (emergencyCredential && emergencyCredential.accountId && emergencyCredential.source !== "gateway") {
+          log.warn("failover falling back to unprepared credential", {
+            accountId: emergencyCredential.accountId,
+            accountName: emergencyCredential.accountName || null,
+            excludeIds: Array.isArray(options.excludeIds) ? options.excludeIds.map(String) : []
+          });
+          return emergencyCredential;
+        }
+
         throw new Error("No prepared standby credential available for failover");
       }
 
@@ -1287,6 +1495,9 @@ class DirectLlmClient {
   }
 
   getStandbyState() {
+    const prepared = this._preparedCredentials;
+    const cooldown = this._standbyCooldownCredentials;
+    const nextRecover = cooldown[0] || null;
     return {
       enabled: this._accountStandbyEnabled,
       currentAccountId: this._currentServingCredential && this._currentServingCredential.accountId
@@ -1298,19 +1509,38 @@ class DirectLlmClient {
       currentAccountSelectedAt: this._currentServingAt ? new Date(this._currentServingAt).toISOString() : null,
       refreshedAt: this._preparedCredentialsAt ? new Date(this._preparedCredentialsAt).toISOString() : null,
       lastError: this._preparedLastError || null,
-      candidateCount: this._preparedCredentials.length,
-      nextAccountId: this._preparedCredentials[0] && this._preparedCredentials[0].accountId
-        ? String(this._preparedCredentials[0].accountId)
+      trackedCount: prepared.length + cooldown.length,
+      candidateCount: prepared.length,
+      readyCount: prepared.length,
+      cooldownCount: cooldown.length,
+      nextAccountId: prepared[0] && prepared[0].accountId
+        ? String(prepared[0].accountId)
         : null,
-      nextAccountName: this._preparedCredentials[0] && this._preparedCredentials[0].accountName
-        ? String(this._preparedCredentials[0].accountName)
+      nextAccountName: prepared[0] && prepared[0].accountName
+        ? String(prepared[0].accountName)
         : null,
-      candidates: this._preparedCredentials.map((credential, index) => ({
+      nextRecoverAccountId: nextRecover && nextRecover.accountId ? String(nextRecover.accountId) : null,
+      nextRecoverAccountName: nextRecover && nextRecover.accountName ? String(nextRecover.accountName) : null,
+      nextRecoverAt: nextRecover && nextRecover.nextCheckAt ? String(nextRecover.nextCheckAt) : null,
+      candidates: prepared.map((credential, index) => ({
         order: index + 1,
         accountId: credential && credential.accountId ? String(credential.accountId) : null,
         accountName: credential && credential.accountName ? String(credential.accountName) : null,
         source: credential && credential.source ? String(credential.source) : null,
         quotaCheckedAt: credential && credential.quotaCheckedAt ? String(credential.quotaCheckedAt) : null
+      })),
+      cooldownCandidates: cooldown.map((credential, index) => ({
+        order: index + 1,
+        accountId: credential && credential.accountId ? String(credential.accountId) : null,
+        accountName: credential && credential.accountName ? String(credential.accountName) : null,
+        source: credential && credential.source ? String(credential.source) : null,
+        quotaCheckedAt: credential && credential.quotaCheckedAt ? String(credential.quotaCheckedAt) : null,
+        nextCheckAt: credential && credential.nextCheckAt ? String(credential.nextCheckAt) : null,
+        reason: credential && credential.reason ? String(credential.reason) : null,
+        usagePercent: credential && typeof credential.usagePercent === "number" ? credential.usagePercent : null,
+        refreshCountdownSeconds: credential && typeof credential.refreshCountdownSeconds === "number"
+          ? credential.refreshCountdownSeconds
+          : null
       }))
     };
   }
@@ -1414,7 +1644,8 @@ class DirectLlmClient {
       !this._accountStandbyEnabled ||
       !this.authProvider ||
       !this._quotaPreflightEnabled ||
-      typeof this.authProvider.listCredentials !== "function"
+      typeof this.authProvider.listCredentials !== "function" ||
+      typeof this.authProvider.getConfiguredAccounts !== "function"
     ) {
       return [];
     }
@@ -1425,21 +1656,71 @@ class DirectLlmClient {
 
     this._standbyRefreshPromise = (async () => {
       const prepared = [];
-      const credentials = this.authProvider.listCredentials();
+      const cooling = [];
+      const now = Date.now();
+      const currentServingAccountId = this._getCurrentServingAccountId();
+      const credentials = this.authProvider.listCredentials({
+        excludeIds: currentServingAccountId ? [currentServingAccountId] : []
+      });
+      const credentialByAccountId = new Map(
+        credentials
+          .filter((credential) => credential && credential.accountId && credential.source !== "gateway")
+          .map((credential) => [String(credential.accountId), credential])
+      );
+      const configuredAccounts = this.authProvider.getConfiguredAccounts()
+        .filter((account) => {
+          if (!account || !account.id || account.source === "gateway") {
+            return false;
+          }
 
-      for (const credential of credentials) {
-        if (!credential || !credential.accountId || credential.source === "gateway") {
+          if (currentServingAccountId && String(account.id) === currentServingAccountId) {
+            return false;
+          }
+
+          if (!account.enabled || !account.accessToken) {
+            return false;
+          }
+
+          if (account.expiresAt && Number(account.expiresAt) <= now) {
+            return false;
+          }
+
+          return true;
+        });
+
+      for (const account of configuredAccounts) {
+        const accountId = String(account.id);
+        const credential = credentialByAccountId.get(accountId) || this._mapConfiguredAccountToCredential(account);
+
+        if (!credential || !credential.accountId) {
           continue;
         }
 
-        if (!this.authProvider.isAccountUsable(credential.accountId)) {
+        const invalidUntil = typeof this.authProvider.getInvalidUntil === "function"
+          ? Number(this.authProvider.getInvalidUntil(accountId) || 0)
+          : 0;
+        const lastFailure = typeof this.authProvider.getLastFailure === "function"
+          ? this.authProvider.getLastFailure(accountId)
+          : null;
+
+        if (invalidUntil > now) {
+          cooling.push(this._buildStandbyRecord(credential, {
+            state: "cooldown",
+            nextCheckAt: invalidUntil,
+            reason: lastFailure && lastFailure.reason ? lastFailure.reason : "账号冷却中"
+          }));
           continue;
         }
 
         let quota = null;
         try {
           quota = await this.fetchQuotaStatus(credential);
-        } catch {
+        } catch (error) {
+          cooling.push(this._buildStandbyRecord(credential, {
+            state: "rechecking",
+            nextCheckAt: now + Math.min(30000, Math.max(5000, this._accountStandbyRefreshMs)),
+            reason: error && error.message ? error.message : String(error)
+          }));
           continue;
         }
 
@@ -1452,6 +1733,14 @@ class DirectLlmClient {
           } else if (typeof this.authProvider.invalidateAccount === "function") {
             this.authProvider.invalidateAccount(credential.accountId, reason, refreshUntilMs);
           }
+          cooling.push(this._buildStandbyRecord(credential, {
+            state: "cooldown",
+            quotaCheckedAt: quota && quota.checkedAt ? quota.checkedAt : new Date().toISOString(),
+            nextCheckAt: refreshUntilMs || (now + this._quotaCacheTtlMs),
+            reason,
+            usagePercent: Number.isFinite(usagePercent) ? usagePercent : null,
+            refreshCountdownSeconds: Number(quota && quota.refreshCountdownSeconds) || null
+          }));
           continue;
         }
 
@@ -1462,6 +1751,7 @@ class DirectLlmClient {
       }
 
       this._preparedCredentials = prepared;
+      this._standbyCooldownCredentials = this._sortCooldownCredentials(cooling);
       this._preparedCredentialsAt = Date.now();
       this._preparedLastError = null;
       this._emitStandbyState();

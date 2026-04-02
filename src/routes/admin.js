@@ -2799,16 +2799,31 @@ function describeStandbyCompact(data) {
     return '已关闭';
   }
 
-  const count = Number(standby.candidateCount || 0);
-  if (count <= 0) {
-    return standby.lastError
-      ? ('空队列 · ' + String(standby.lastError))
-      : '空队列';
+  const readyCount = Number(standby.readyCount != null ? standby.readyCount : standby.candidateCount || 0);
+  const cooldownCount = Number(standby.cooldownCount || 0);
+  const refreshedAt = standby.refreshedAt ? formatTime(standby.refreshedAt) : '';
+
+  if (readyCount > 0) {
+    const nextLabel = standby.nextAccountName || standby.nextAccountId || '未知账号';
+    const parts = ['下一个 ' + nextLabel, '就绪 ' + readyCount + ' 个'];
+    if (cooldownCount > 0) {
+      parts.push('冷却 ' + cooldownCount + ' 个');
+    }
+    if (refreshedAt) {
+      parts.push(refreshedAt);
+    }
+    return parts.join(' · ');
   }
 
-  const nextLabel = standby.nextAccountName || standby.nextAccountId || '未知账号';
-  const refreshedAt = standby.refreshedAt ? formatTime(standby.refreshedAt) : '';
-  return '下一个 ' + nextLabel + ' · 共 ' + count + ' 个' + (refreshedAt ? (' · ' + refreshedAt) : '');
+  if (cooldownCount > 0) {
+    const nextRecoverLabel = standby.nextRecoverAccountName || standby.nextRecoverAccountId || '未知账号';
+    const nextRecoverAt = standby.nextRecoverAt ? formatTime(standby.nextRecoverAt) : '';
+    return ['冷却中 ' + cooldownCount + ' 个', '最快 ' + nextRecoverLabel, nextRecoverAt].filter(Boolean).join(' · ');
+  }
+
+  return standby.lastError
+    ? ('空队列 · ' + String(standby.lastError))
+    : '空队列';
 }
 function simplifySnapshotAliasLabel(alias) {
   const text = String(alias || '').trim();
@@ -3153,11 +3168,12 @@ function renderSnapshots(data) {
   const activeAccountId = data && data.authRuntime && data.authRuntime.activeAccount ? String(data.authRuntime.activeAccount) : '';
   const standby = data && data.accountStandby ? data.accountStandby : null;
   const standbyByAccountId = new Map(
-    Array.isArray(standby && standby.candidates)
-      ? standby.candidates
-        .filter((item) => item && item.accountId)
-        .map((item) => [String(item.accountId), item])
-      : []
+    [
+      ...(Array.isArray(standby && standby.candidates) ? standby.candidates : []),
+      ...(Array.isArray(standby && standby.cooldownCandidates) ? standby.cooldownCandidates : [])
+    ]
+      .filter((item) => item && item.accountId)
+      .map((item) => [String(item.accountId), item])
   );
   if (snapshots.length === 0) {
     els.snapshotList.innerHTML = '<div class="empty"><span class="empty-icon">📋</span>还没有已记录账号。点击左侧"添加账号登录"完成第一个 Accio 登录吧！</div>';
@@ -3208,16 +3224,25 @@ function renderSnapshots(data) {
     const standbyEntry = accountState && accountState.id ? standbyByAccountId.get(String(accountState.id)) : null;
     const standbyStatus = accountState
       ? (
-          standbyEntry
+          standbyEntry && standbyEntry.nextCheckAt
+            ? ('冷却中，预计 ' + formatTime(standbyEntry.nextCheckAt) + ' 恢复')
+            : standbyEntry
             ? ('已就位 #' + String(standbyEntry.order || 1))
             : (cooling ? ('冷却中，约 ' + formatCountdown(cooldownSeconds) + ' 后恢复') : '待下一轮预检')
         )
       : '未关联账号条目';
-    const lastFailure = accountState && accountState.lastFailure && accountState.lastFailure.reason
-      ? escapeInline(accountState.lastFailure.reason)
-      : '';
+    const lastFailure = standbyEntry && standbyEntry.reason
+      ? escapeInline(standbyEntry.reason)
+      : (accountState && accountState.lastFailure && accountState.lastFailure.reason
+        ? escapeInline(accountState.lastFailure.reason)
+        : '')
+    ;
     const standbyMeta = standbyEntry && standbyEntry.quotaCheckedAt
-      ? ('预检于 ' + formatTime(standbyEntry.quotaCheckedAt))
+      ? (
+          standbyEntry.nextCheckAt
+            ? ('上次检查于 ' + formatTime(standbyEntry.quotaCheckedAt))
+            : ('预检于 ' + formatTime(standbyEntry.quotaCheckedAt))
+        )
       : '';
     return '<div class="' + itemClass + '">'
       + '<div class="itemAvatar">' + avatarChar + '</div>'
