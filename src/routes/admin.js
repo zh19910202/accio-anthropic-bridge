@@ -605,6 +605,20 @@ async function resolveSnapshotQuotaForAdmin(config, snapshot, authPayload, optio
   };
 }
 
+async function primeSnapshotQuotaState(config, snapshot, authPayload) {
+  if (!snapshot || !snapshot.dir) {
+    return null;
+  }
+
+  const liveQuota = await resolveSnapshotQuota(config, snapshot, authPayload);
+  const persistedQuota = {
+    ...liveQuota,
+    stale: false
+  };
+  writeSnapshotQuotaState(snapshot.dir, persistedQuota);
+  return persistedQuota;
+}
+
 function syncSnapshotAccountState(authProvider, snapshot) {
   const accountState = snapshot && snapshot.accountState ? snapshot.accountState : null;
   const quota = snapshot && snapshot.quota ? snapshot.quota : null;
@@ -4281,6 +4295,32 @@ async function handleAdminAccountCallback(req, res, config, url, gatewayManager)
       authPayload: persistedAuth
     });
 
+    let primedQuota = null;
+    try {
+      const snapshotEntry = getSnapshotEntry(alias);
+      primedQuota = await primeSnapshotQuotaState(config, {
+        alias,
+        dir: snapshotEntry && snapshotEntry.dir ? snapshotEntry.dir : null,
+        gatewayUser: user
+      }, persistedAuth);
+      log.info("direct login quota primed", {
+        flowId,
+        alias,
+        userId: userId || null,
+        available: primedQuota ? primedQuota.available === true : null,
+        usagePercent: primedQuota && typeof primedQuota.usagePercent === "number"
+          ? primedQuota.usagePercent
+          : null
+      });
+    } catch (quotaError) {
+      log.warn("direct login quota prime failed", {
+        flowId,
+        alias,
+        userId: userId || null,
+        error: quotaError && quotaError.message ? quotaError.message : String(quotaError)
+      });
+    }
+
     invalidateSharedAdminState();
     const finalResult = {
       ok: true,
@@ -4291,6 +4331,7 @@ async function handleAdminAccountCallback(req, res, config, url, gatewayManager)
       user,
       currentUserId: userId,
       hasAuthCallback: true,
+      quota: primedQuota,
       note: `新账号登录成功，已记录为 ${alias}。`
     };
 
