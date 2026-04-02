@@ -371,6 +371,16 @@ function rewriteGatewayLoginUrl(loginUrl, callbackUrl) {
   return parsed.toString();
 }
 
+const ACCIO_LOGIN_BASE_URL = "https://www.accio.com/login";
+
+function buildDirectLoginUrl(callbackUrl) {
+  const state = crypto.randomBytes(32).toString("hex");
+  const url = new URL(ACCIO_LOGIN_BASE_URL);
+  url.searchParams.set("return_url", callbackUrl);
+  url.searchParams.set("state", state);
+  return { loginUrl: url.toString(), state };
+}
+
 function buildQuotaCacheKey(alias, userId) {
   return `${String(alias || "")}:${String(userId || "")}`;
 }
@@ -4285,57 +4295,29 @@ async function handleAdminCaptureAccount(req, res, config, gatewayManager) {
 async function handleAdminAccountLogin(req, res, config, gatewayManager) {
   await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
 
-  const gateway = await readGatewayState(config.baseUrl);
-  const previousUserId = extractGatewayUserId(gateway);
-  let preservedSnapshot = null;
+  const flow = createPendingAccountLogin("", {});
+  const callbackUrl = buildAccountLoginCallbackUrl(req, config, flow.id);
+  const { loginUrl, state } = buildDirectLoginUrl(callbackUrl);
+  let loginOpened = false;
 
-  if (gateway && gateway.reachable && gateway.authenticated && gateway.user) {
-    const preservedAlias = deriveSnapshotAliasFromGatewayUser(gateway.user);
-    preservedSnapshot = snapshotActiveCredentials(preservedAlias, {
-      gatewayUser: gateway.user,
-      notes: "auto-captured before add-account login flow"
-    });
-    log.info("current account snapshot preserved before add-account login", {
-      alias: preservedSnapshot.alias,
-      previousUserId: previousUserId || null,
-      gateway: summarizeGatewayState(gateway)
-    });
-    await requestGatewayJsonWithAutostart(gatewayManager, "/auth/logout", { method: "POST", body: {} });
+  flow.loginUrl = loginUrl;
+  flow.callbackUrl = callbackUrl;
+  flow.loginState = state;
+
+  if (loginUrl) {
+    loginOpened = await openExternalUrl(loginUrl).catch(() => false);
   }
 
-  const flow = createPendingAccountLogin(previousUserId, {
-    preservedAlias: preservedSnapshot ? preservedSnapshot.alias : null,
-    preservedKind: preservedSnapshot && preservedSnapshot.metadata ? preservedSnapshot.metadata.kind : null,
-    preservedCapturedAt: preservedSnapshot && preservedSnapshot.metadata ? preservedSnapshot.metadata.capturedAt : null
+  log.info("direct login flow started", { flowId: flow.id, loginOpened });
+
+  writeJson(res, 200, {
+    ok: true,
+    flowId: flow.id,
+    previousUserId: null,
+    preservedAlias: null,
+    loginUrl,
+    loginOpened
   });
-
-  try {
-    const payload = await requestGatewayJsonWithAutostart(gatewayManager, "/auth/login", { method: "POST", body: {} });
-    const gatewayLoginUrl = payload && payload.loginUrl ? String(payload.loginUrl) : null;
-    const callbackUrl = buildAccountLoginCallbackUrl(req, config, flow.id);
-    const loginUrl = rewriteGatewayLoginUrl(gatewayLoginUrl, callbackUrl);
-    let loginOpened = false;
-
-    flow.loginUrl = loginUrl;
-    flow.gatewayLoginUrl = gatewayLoginUrl;
-    flow.callbackUrl = callbackUrl;
-
-    if (loginUrl) {
-      loginOpened = await openExternalUrl(loginUrl).catch(() => false);
-    }
-
-    writeJson(res, 200, {
-      ok: true,
-      flowId: flow.id,
-      previousUserId: previousUserId || null,
-      preservedAlias: flow.preservedAlias,
-      loginUrl,
-      loginOpened
-    });
-  } catch (error) {
-    deletePendingAccountLogin(flow.id);
-    throw error;
-  }
 }
 
 async function handleAdminAccountCallback(req, res, config, url, gatewayManager) {
@@ -4378,40 +4360,22 @@ async function handleAdminAccountCallback(req, res, config, url, gatewayManager)
       previousUserId: flow.previousUserId || null
     });
     flow.capturedAuth = primedAuthPayload;
-    await forwardGatewayAuthCallback(gatewayManager, primedAuthPayload, { includeState: true, timeoutMs: 20000 });
-    const gateway = await waitForGatewayAuthenticatedUser(
-      () => readGatewayState(config.baseUrl),
-      "",
-      20000,
-      500
-    );
-    const currentUserId = extractGatewayUserId(gateway);
 
-    if (!gateway || !gateway.reachable || !gateway.authenticated || !currentUserId) {
-      throw new Error("Gateway did not become authenticated after auth callback");
-    }
-
-    const sameAccount = Boolean(flow.previousUserId && currentUserId === flow.previousUserId);
-    const alias = sameAccount && flow.preservedAlias
-      ? flow.preservedAlias
-      : deriveSnapshotAliasFromGatewayUser(gateway.user || null);
+    const userId = primedAuthPayload.refreshBoundUserId || "";
+    const user = userId ? { id: userId, name: userId } : null;
+    const alias = deriveSnapshotAliasFromGatewayUser(user);
     const persistedAuth = {
       ...primedAuthPayload,
-      user: gateway.user || null,
-      source: "gateway-auth-callback"
+      user,
+      source: "bridge-direct-login"
     };
-    const snapshot = snapshotActiveCredentials(alias, {
-      gatewayUser: gateway.user || null,
-      notes: sameAccount ? "captured again after logging back into the same account" : "captured from bridge auth callback",
-      authPayload: persistedAuth
-    });
 
     writeSnapshotAuthPayload(alias, persistedAuth);
     writeAccountToFile(config.accountsPath, alias, persistedAuth.accessToken, {
-      user: gateway.user || null,
+      user,
       expiresAtMs: persistedAuth.expiresAtMs,
       expiresAtRaw: persistedAuth.expiresAtRaw,
-      source: "gateway-auth-callback",
+      source: "bridge-direct-login",
       authPayload: persistedAuth
     });
 
@@ -4419,40 +4383,28 @@ async function handleAdminAccountCallback(req, res, config, url, gatewayManager)
     const finalResult = {
       ok: true,
       completed: true,
-      state: sameAccount ? "same_account_returned" : "completed",
+      state: "completed",
       alias,
-      kind: snapshot.metadata.kind,
-      capturedAt: snapshot.metadata.capturedAt,
-      user: gateway.user || null,
-      currentUserId,
+      capturedAt: new Date().toISOString(),
+      user,
+      currentUserId: userId,
       hasAuthCallback: true,
-      note: sameAccount
-        ? `你登录回了当前账号，已更新该账号的完整凭证记录：${alias}`
-        : `新账号登录成功，已记录为 ${alias}。后续切换将优先使用原生回调凭证。`,
-      gatewayState: { ...summarizeGatewayState(gateway), baseUrl: config.baseUrl }
+      note: `新账号登录成功，已记录为 ${alias}。`
     };
 
     flow.finalResult = finalResult;
-    logPendingAccountLoginState(flow, finalResult.state, {
-      currentUserId,
-      alias,
-      gateway: summarizeGatewayState(gateway)
-    });
-
-    writeHtml(res, 200, renderAccountCallbackPage("Accio 登录已完成", finalResult.note, "ok"));
+    logPendingAccountLoginState(flow, "completed", { currentUserId: userId, alias });
+    writeHtml(res, 200, renderAccountCallbackPage("登录已完成", finalResult.note, "ok"));
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     flow.finalResult = {
       ok: false,
       completed: true,
       state: "login_failed",
-      note: `登录回调已收到，但桥接层未能完成账号接管：${message}`,
-      gatewayState: { ...(await readGatewayState(config.baseUrl)), baseUrl: config.baseUrl }
+      note: `登录回调已收到，但未能完成账号接管：${message}`
     };
-    logPendingAccountLoginState(flow, "login_failed", {
-      error: message
-    });
-    writeHtml(res, 500, renderAccountCallbackPage("Accio 登录接管失败", message, "error"));
+    logPendingAccountLoginState(flow, "login_failed", { error: message });
+    writeHtml(res, 500, renderAccountCallbackPage("登录接管失败", message, "error"));
   }
 }
 
@@ -4489,73 +4441,17 @@ async function handleAdminAccountLoginStatus(req, res, config, url) {
       ok: true,
       completed: false,
       state: "finalizing_login",
-      message: "登录回调已收到，桥接层正在接管并记录该账号。",
-      gatewayState: { ...(await readGatewayState(config.baseUrl)), baseUrl: config.baseUrl }
+      message: "登录回调已收到，正在处理中。"
     });
     return;
   }
 
-  const gateway = await readGatewayState(config.baseUrl);
-  const currentUserId = extractGatewayUserId(gateway);
-
-  if (!gateway || !gateway.reachable) {
-    logPendingAccountLoginState(flow, "waiting_gateway", {
-      gateway: summarizeGatewayState(gateway)
-    });
-    writeJson(res, 200, { ok: true, completed: false, state: "waiting_gateway", message: "正在等待本地网关恢复。", gatewayState: { ...summarizeGatewayState(gateway), baseUrl: config.baseUrl } });
-    return;
-  }
-
-  if (!gateway.authenticated || !currentUserId) {
-    logPendingAccountLoginState(flow, "waiting_login", {
-      gateway: summarizeGatewayState(gateway)
-    });
-    writeJson(res, 200, { ok: true, completed: false, state: "waiting_login", message: "登录页已打开，等待你在 Accio 完成账号登录。", gatewayState: { ...summarizeGatewayState(gateway), baseUrl: config.baseUrl } });
-    return;
-  }
-
-  if (flow.previousUserId && currentUserId === flow.previousUserId) {
-    logPendingAccountLoginState(flow, "same_account_returned", {
-      currentUserId,
-      preservedAlias: flow.preservedAlias || null,
-      gateway: summarizeGatewayState(gateway)
-    });
-    deletePendingAccountLogin(flowId);
-    writeJson(res, 200, {
-      ok: true,
-      completed: true,
-      state: "same_account_returned",
-      currentUserId,
-      alias: flow.preservedAlias || deriveSnapshotAliasFromGatewayUser(gateway.user || null),
-      kind: flow.preservedKind || null,
-      capturedAt: flow.preservedCapturedAt || null,
-      user: gateway.user || null,
-      note: flow.preservedAlias
-        ? `你登录回了当前账号，已保留并更新该账号快照：${flow.preservedAlias}`
-        : "你登录回了当前账号，没有新增账号。",
-      gatewayState: { ...summarizeGatewayState(gateway), baseUrl: config.baseUrl }
-    });
-    return;
-  }
-
-  const derivedAlias = deriveSnapshotAliasFromGatewayUser(gateway.user || null);
-  const result = snapshotActiveCredentials(derivedAlias, { gatewayUser: gateway.user || null });
-  invalidateSharedAdminState();
-  logPendingAccountLoginState(flow, "completed", {
-    currentUserId,
-    alias: result.alias,
-    gateway: summarizeGatewayState(gateway)
-  });
-  deletePendingAccountLogin(flowId);
+  logPendingAccountLoginState(flow, "waiting_login");
   writeJson(res, 200, {
     ok: true,
-    completed: true,
-    alias: result.alias,
-    kind: result.metadata.kind,
-    capturedAt: result.metadata.capturedAt,
-    user: gateway.user || null,
-    currentUserId,
-    gatewayState: { ...summarizeGatewayState(gateway), baseUrl: config.baseUrl }
+    completed: false,
+    state: "waiting_login",
+    message: "登录页已打开，等待你完成账号登录。"
   });
 }
 
