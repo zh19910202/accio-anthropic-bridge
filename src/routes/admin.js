@@ -2422,7 +2422,7 @@ button { font: inherit; cursor: pointer; }
   <section class="topbar topbar-head topbar-compact statusActionsRow" id="primary-topbar">
     <aside class="statusCard statusCard-wide">
       <div class="statusHeader">
-        <div class="statusBadge" id="status-badge"><span class="badgeFill" id="badge-fill"></span><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span><span class="badgeQuota" id="badge-quota"></span></div>
+        <div class="statusBadge" id="status-badge"><span class="badgeFill" id="badge-fill"></span><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5 Bridge \u72B6\u6001</span><span class="badgeQuota" id="badge-quota"></span></div>
         <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
       </div>
       <div class="kv" id="overview-kv"></div>
@@ -2647,10 +2647,29 @@ function formatTime(value) {
   if (!value) return '—';
   try { return new Date(value).toLocaleString(); } catch { return String(value); }
 }
-function badgeState(gateway) {
-  if (!gateway || !gateway.reachable) return ['bad', '网关不可达'];
-  if (gateway.authenticated) return ['good', '网关已登录'];
-  return ['warn', '网关在线但未登录'];
+function bridgeBadgeState(data) {
+  const runtime = data && data.authRuntime ? data.authRuntime : null;
+  if (!runtime) {
+    return ['warn', 'Bridge 状态未知'];
+  }
+
+  const activeAccountId = runtime.activeAccount ? String(runtime.activeAccount) : '';
+  const usableAccounts = Number(runtime.usableAccounts || 0);
+  const totalAccounts = Number(runtime.totalAccounts || 0);
+
+  if (activeAccountId && usableAccounts > 0) {
+    return ['good', 'Bridge 已就绪 · 默认 ' + activeAccountId];
+  }
+
+  if (usableAccounts > 0) {
+    return ['good', 'Bridge 已加载 ' + usableAccounts + ' 个可用账号'];
+  }
+
+  if (totalAccounts > 0) {
+    return ['warn', '已记录 ' + totalAccounts + ' 个账号，但暂无可用账号'];
+  }
+
+  return ['bad', 'Bridge 暂无可用账号'];
 }
 function describeRecentActivity(activity) {
   if (!activity || !activity.transportSelected) {
@@ -2678,16 +2697,16 @@ function describeRecentActivity(activity) {
       return '号池直连 · ' + accountLabel + ' · ' + model;
     }
 
-    return '本地网关直连 · ' + model;
+    return 'Bridge 直连 · ' + model;
   }
 
   return model && model !== 'unknown'
     ? (transport + ' · ' + model)
     : transport;
 }
-function recentActivityBadge(activity, gateway) {
+function recentActivityBadge(activity, data) {
   if (!activity || !activity.transportSelected) {
-    return badgeState(gateway);
+    return bridgeBadgeState(data);
   }
 
   const transport = String(activity.transportSelected);
@@ -2699,67 +2718,23 @@ function recentActivityBadge(activity, gateway) {
 
   return ['good', summary];
 }
-function basenamePath(value) {
-  const text = String(value || '').trim();
-  if (!text) {
-    return '—';
+function describeBridgeCompact(data) {
+  const runtime = data && data.authRuntime ? data.authRuntime : null;
+  const bridge = data && data.bridge ? data.bridge : null;
+  const parts = [];
+
+  if (bridge && bridge.transportMode) {
+    parts.push('出口 ' + String(bridge.transportMode));
   }
 
-  const parts = text.split(/[\\\\/]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : text;
-}
-function describeGatewayIdentity(gateway) {
-  if (!gateway || !gateway.reachable) {
-    return '网关不可达';
+  if (bridge && bridge.authMode) {
+    parts.push('鉴权 ' + String(bridge.authMode));
   }
 
-  if (!gateway.authenticated) {
-    return '网关在线，但未登录';
+  if (runtime) {
+    parts.push('可用 ' + String(runtime.usableAccounts || 0) + ' 个');
   }
-
-  const user = gateway.user || null;
-  if (!user) {
-    return '网关已登录';
-  }
-
-  const userId = user.id ? String(user.id) : '';
-  const userName = user.name ? String(user.name) : '';
-  if (userName && userId) {
-    return userName + ' · ' + userId;
-  }
-
-  return userName || userId || '网关已登录';
-}
-function describeGatewayCompact(gateway) {
-  const status = badgeState(gateway)[1];
-  const identity = describeGatewayIdentity(gateway);
-  return identity && identity !== status
-    ? (status + ' · ' + identity)
-    : status;
-}
-function describeSnapshotCompact(snapshot) {
-  if (!snapshot) {
-    return '无';
-  }
-
-  const details = [];
-  details.push(snapshot.alias || '未命名快照');
-  details.push(snapshot.hasFullAuthState ? '完整凭证' : '轻量凭证');
-  details.push(snapshot.hasAuthCallback ? '可刷新回调' : '仅文件');
-  return details.join(' · ');
-}
-function describeRuntimeCompact(data) {
-  const storageKind = data && data.storage && data.storage.kind ? String(data.storage.kind) : 'none';
-  const gatewayHost = data && data.gateway && data.gateway.baseUrl ? String(data.gateway.baseUrl).replace(/^https?:\\/\\//, '') : '';
-  const appName = data && data.bridge && data.bridge.appPath ? basenamePath(data.bridge.appPath) : '';
-  return [storageKind, gatewayHost, appName].filter(Boolean).join(' · ');
-}
-function describeAccountsCompact(data) {
-  const count = Array.isArray(data && data.snapshots) ? data.snapshots.length : 0;
-  const activeAccountId = data && data.authRuntime && data.authRuntime.activeAccount ? String(data.authRuntime.activeAccount) : '';
-  return activeAccountId
-    ? (String(count) + ' 个已记录快照 · 默认 ' + activeAccountId)
-    : (String(count) + ' 个已记录快照');
+  return parts.length > 0 ? parts.join(' · ') : '未知';
 }
 function describeRecentActivityCompact(activity) {
   if (!activity || !activity.transportSelected) {
@@ -2786,6 +2761,25 @@ function describeAuthPoolCompact(data) {
   }
 
   return parts.join(' · ');
+}
+function describeActiveAccountCompact(data) {
+  const activeAccountId = data && data.authRuntime && data.authRuntime.activeAccount
+    ? String(data.authRuntime.activeAccount)
+    : '';
+  if (!activeAccountId) {
+    return '未设置';
+  }
+
+  const snapshots = Array.isArray(data && data.snapshots) ? data.snapshots : [];
+  const activeSnapshot = snapshots.find((snapshot) => snapshot
+    && snapshot.accountState
+    && String(snapshot.accountState.id || '') === activeAccountId) || null;
+  const user = activeSnapshot && activeSnapshot.gatewayUser ? activeSnapshot.gatewayUser : null;
+  const userName = user && user.name ? String(user.name) : '';
+
+  return userName && userName !== activeAccountId
+    ? (userName + ' · ' + activeAccountId)
+    : activeAccountId;
 }
 function describeStandbyCompact(data) {
   const standby = data && data.accountStandby ? data.accountStandby : null;
@@ -3291,17 +3285,16 @@ function renderQuotaBar(data) {
 }
 function renderState(data, options = {}) {
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
-  const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
-  const [, gatewaySummary] = badgeState(data.gateway);
+  const [dotClass, summary] = recentActivityBadge(recentActivity, data);
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary;
   renderQuotaBar(data);
   renderKv(els.overviewKv, [
     ['最近请求', describeRecentActivityCompact(recentActivity)],
     ['等待区', describeStandbyCompact(data)],
-    ['当前网关', describeGatewayCompact(data.gateway)],
-    ['快照数量', describeAccountsCompact(data)],
-    ['本地存储', describeRuntimeCompact(data)]
+    ['默认账号', describeActiveAccountCompact(data)],
+    ['账号池', describeAuthPoolCompact(data)],
+    ['Bridge 状态', describeBridgeCompact(data)]
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
@@ -3386,9 +3379,9 @@ async function pollAccountLogin(flowId) {
         ? (payload.gatewayState.userId + (payload.gatewayState.userName ? ' (' + payload.gatewayState.userName + ')' : ''))
         : (payload.gatewayState.authenticated ? '已登录但未返回用户ID' : '未登录');
       renderKv(els.overviewKv, [
-        ['当前网关', currentText],
-        ['快照数量', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个已记录快照') : '—'],
-        ['本地存储', ['同步中', payload.gatewayState.baseUrl || '—'].filter(Boolean).join(' · ')]
+        ['当前识别账号', currentText],
+        ['已记录账号', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个已记录快照') : '—'],
+        ['登录进度', payload.message || '等待登录完成']
       ]);
     }
 
