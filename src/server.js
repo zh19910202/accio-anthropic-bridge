@@ -33,7 +33,8 @@ const {
   handleAdminCaptureAccount,
   handleAdminAccountLogin,
   handleAdminAccountCallback,
-  handleAdminAccountLoginStatus
+  handleAdminAccountLoginStatus,
+  handleAdminAccountLoginCancel
 } = require("./routes/admin");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
 const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic");
@@ -271,6 +272,12 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
 
       if (req.method === "GET" && url.pathname === "/admin/api/accounts/login-status") {
         await handleAdminAccountLoginStatus(req, res, config, url);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/accounts/login/cancel") {
+        await handleAdminAccountLoginCancel(req, res);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }

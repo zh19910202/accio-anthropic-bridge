@@ -903,8 +903,9 @@ function deriveSnapshotAliasFromGatewayUser(user) {
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
+  const normalizedUserId = userId.toLowerCase();
 
-  if (normalizedName && userId) {
+  if (normalizedName && userId && normalizedName !== normalizedUserId) {
     return `acct-${normalizedName}-${userId}`;
   }
 
@@ -2429,14 +2430,12 @@ button { font: inherit; cursor: pointer; }
     </aside>
     <aside class="panel actionPanel">
       <h2>\u8D26\u53F7\u64CD\u4F5C</h2>
-      <div class="panelSub">\u65B0\u589E\u8D26\u53F7\u3001\u4FDD\u5B58\u5F53\u524D\u8D26\u53F7\u3001\u9000\u51FA Accio \u5F53\u524D\u767B\u5F55\u3002</div>
+      <div class="panelSub">\u901A\u8FC7 bridge \u76F4\u63A5\u65B0\u589E\u8D26\u53F7\u3002\u767B\u5F55\u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u8BB0\u5F55\u5230\u5217\u8868\u3002</div>
       <div class="actionList">
         <button class="btn primary" id="account-login-btn">\uFF0B \u6DFB\u52A0\u8D26\u53F7\u767B\u5F55</button>
-        <button class="btn" id="capture-current-btn">\u4FDD\u5B58\u5F53\u524D\u8D26\u53F7</button>
-        <button class="btn warn" id="logout-btn">\u767B\u51FA\u5F53\u524D Accio</button>
+        <button class="btn" id="cancel-account-login-btn" style="display:none">\u653E\u5F03\u672C\u6B21\u767B\u5F55</button>
       </div>
       <div id="action-message" class="message info"></div>
-      <div id="current-account-note" class="note note-info" style="display:none"></div>
     </aside>
   </section>
   <section class="tabPanel active" data-tab-panel="accounts">
@@ -2533,11 +2532,9 @@ const els = {
   snapshotList: document.getElementById('snapshot-list'),
   actionMessage: document.getElementById('action-message'),
   configMessage: document.getElementById('config-message'),
-  currentAccountNote: document.getElementById('current-account-note'),
   refreshBtn: document.getElementById('refresh-btn'),
-  logoutBtn: document.getElementById('logout-btn'),
   accountLoginBtn: document.getElementById('account-login-btn'),
-  snapshotBtn: document.getElementById('capture-current-btn'),
+  cancelAccountLoginBtn: document.getElementById('cancel-account-login-btn'),
   addFallbackTargetBtn: document.getElementById('add-fallback-target-btn'),
   saveFallbackConfigBtn: document.getElementById('save-fallback-config-btn'),
   reloadFallbackConfigBtn: document.getElementById('reload-fallback-config-btn'),
@@ -2568,6 +2565,7 @@ let logsLoaded = false;
 let refreshLogsInFlight = null;
 let logFollow = true;
 let latestLogSeq = 0;
+const cancelledLoginFlows = new Set();
 const MAX_RENDERED_LOGS = 300;
 const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
 function setScopedMessage(target, type, text, scope) {
@@ -2798,6 +2796,24 @@ function describeStandbyCompact(data) {
   const refreshedAt = standby.refreshedAt ? formatTime(standby.refreshedAt) : '';
   return '下一个 ' + nextLabel + ' · 共 ' + count + ' 个' + (refreshedAt ? (' · ' + refreshedAt) : '');
 }
+function simplifySnapshotAliasLabel(alias) {
+  const text = String(alias || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  const repeatedId = text.match(/^acct-([A-Za-z0-9._-]+)-\\1$/);
+  if (repeatedId && repeatedId[1]) {
+    return repeatedId[1];
+  }
+
+  const plainId = text.match(/^acct-([A-Za-z0-9._-]+)$/);
+  if (plainId && plainId[1]) {
+    return plainId[1];
+  }
+
+  return text;
+}
 function describeRecentAuthCompact(activity) {
   if (!activity || !activity.transportSelected) {
     return '暂无最近认证';
@@ -2852,49 +2868,6 @@ function renderKv(target, rows) {
       + '<div class="kvValue' + (mono ? ' mono' : '') + (subtle ? ' subtle' : '') + '">' + escapeInline(value) + '</div>'
       + '</div>';
   }).join('');
-}
-function renderCurrentAccountNote(data) {
-  if (!els.currentAccountNote) {
-    return;
-  }
-
-  const gatewayUser = data.gateway && data.gateway.user ? data.gateway.user : null;
-  const currentSnapshot = data.currentSnapshot || null;
-  const canCapture = Boolean(data.gateway && data.gateway.reachable && data.gateway.authenticated && gatewayUser && gatewayUser.id);
-
-  if (els.snapshotBtn) {
-    els.snapshotBtn.disabled = !canCapture;
-  }
-
-  function showNote(text) {
-    els.currentAccountNote.textContent = text;
-    els.currentAccountNote.style.display = '';
-  }
-  function hideNote() {
-    els.currentAccountNote.textContent = '';
-    els.currentAccountNote.style.display = 'none';
-  }
-
-  if (!gatewayUser || !gatewayUser.id) {
-    if (els.snapshotBtn) els.snapshotBtn.textContent = '保存当前账号';
-    showNote('当前没有识别到已登录账号，"保存当前账号"不可用。');
-    return;
-  }
-
-  if (!currentSnapshot) {
-    if (els.snapshotBtn) els.snapshotBtn.textContent = '保存当前账号';
-    showNote('当前账号还没有本地记录，点击"保存当前账号"新建记录。');
-    return;
-  }
-
-  if (currentSnapshot.hasFullAuthState) {
-    if (els.snapshotBtn) els.snapshotBtn.textContent = '更新当前账号';
-    hideNote();
-    return;
-  }
-
-  if (els.snapshotBtn) els.snapshotBtn.textContent = '补全当前账号';
-  showNote('当前账号是轻量凭证记录，bridge 仍可正常使用；如需完整桌面快照，再重新登录即可。');
 }
 function formatCountdown(seconds) {
   const value = Number(seconds);
@@ -3180,8 +3153,19 @@ function renderSnapshots(data) {
   els.snapshotList.innerHTML = snapshots.map((item) => {
     const userId = item.gatewayUser && item.gatewayUser.id ? String(item.gatewayUser.id) : '';
     const userName = item.gatewayUser && item.gatewayUser.name ? String(item.gatewayUser.name) : '';
-    const displayName = userName || userId || item.alias;
-    const subLabel = userName && userId ? userId : (userName ? '' : '');
+    const aliasText = item.alias ? String(item.alias) : '';
+    const aliasDisplay = simplifySnapshotAliasLabel(aliasText);
+    const sameIdentityLabel = userName && userId && userName === userId;
+    const displayName = userName || userId || aliasDisplay || item.alias;
+    const subLabel = userName && userId && !sameIdentityLabel ? userId : '';
+    const redundantAlias = Boolean(aliasText && (
+      (userId && (
+        aliasText === ('acct-' + userId) ||
+        aliasText === ('acct-' + userId + '-' + userId)
+      )) ||
+      aliasText === displayName ||
+      aliasDisplay === displayName
+    ));
     const avatarChar = displayName ? displayName.charAt(0).toUpperCase() : '?';
     const accountState = item.accountState || null;
     const current = currentUserId && userId && currentUserId === userId;
@@ -3230,7 +3214,7 @@ function renderSnapshots(data) {
       + statusPill
       + '</div>'
       + (subLabel ? '<div class="itemMeta">' + subLabel + '</div>' : '')
-      + '<div class="itemMeta">' + item.alias + '</div>'
+      + (!redundantAlias ? '<div class="itemMeta">' + item.alias + '</div>' : '')
       + (active ? '<div class="itemMeta">Bridge 默认账号：后续额度请求将优先使用该账号</div>' : '')
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
       + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
@@ -3296,7 +3280,6 @@ function renderState(data, options = {}) {
     ['账号池', describeAuthPoolCompact(data)],
     ['Bridge 状态', describeBridgeCompact(data)]
   ]);
-  renderCurrentAccountNote(data);
   renderSnapshots(data);
   if (options.allowSettings !== false) {
     renderSettings(data);
@@ -3367,6 +3350,20 @@ async function waitForGatewayUser(expectedUserId, timeoutMs = 30000) {
 
 let activeLoginFlowId = null;
 
+function setAccountLoginPendingState(pending) {
+  if (els.accountLoginBtn) {
+    els.accountLoginBtn.disabled = Boolean(pending);
+    els.accountLoginBtn.classList.toggle('loading', Boolean(pending));
+    els.accountLoginBtn.textContent = pending ? '等待登录完成...' : '\uFF0B 添加账号登录';
+  }
+
+  if (els.cancelAccountLoginBtn) {
+    els.cancelAccountLoginBtn.style.display = pending ? '' : 'none';
+    els.cancelAccountLoginBtn.disabled = false;
+    els.cancelAccountLoginBtn.classList.remove('loading');
+  }
+}
+
 async function pollAccountLogin(flowId) {
   const deadline = Date.now() + 5 * 60 * 1000;
   let lastState = '';
@@ -3418,13 +3415,14 @@ async function observeAccountLogin(flowId) {
       setMessage('ok', (result && result.note) || ('新账号已记录：' + ((result && result.alias) || 'acct-auto')));
     }
   } catch (error) {
-    setMessage('error', error && error.message ? error.message : String(error));
+    if (!cancelledLoginFlows.has(flowId)) {
+      setMessage('error', error && error.message ? error.message : String(error));
+    }
   } finally {
+    cancelledLoginFlows.delete(flowId);
     if (activeLoginFlowId === flowId) {
       activeLoginFlowId = null;
-      els.accountLoginBtn.disabled = false;
-      els.accountLoginBtn.textContent = '\uFF0B 添加账号登录';
-      els.accountLoginBtn.classList.remove('loading');
+      setAccountLoginPendingState(false);
     }
   }
 }
@@ -3494,18 +3492,14 @@ if (els.toggleLogFollowBtn) {
     }
   });
 }
-els.logoutBtn.addEventListener('click', () => withAction(els.logoutBtn, async () => { clearMessage(); await api('/admin/api/gateway/logout', { method: 'POST', body: {} }); await refreshState(); setMessage('warn', '已请求 Accio 登出。'); }));
-els.snapshotBtn.addEventListener('click', () => withAction(els.snapshotBtn, async () => { clearMessage(); const actionLabel = els.snapshotBtn.textContent || '保存当前账号'; const payload = await api('/admin/api/snapshots', { method: 'POST', body: {} }); await refreshState(); setMessage('ok', actionLabel + '已完成：' + (payload.alias || 'acct-auto')); }));
 els.accountLoginBtn.addEventListener('click', async () => {
   if (activeLoginFlowId) {
-    setMessage('info', '当前已有一个账号登录流程在等待完成。请先完成当前登录，或等待它超时。');
+    setMessage('info', '当前已有一个账号登录流程在等待完成。你可以继续完成登录，或点击“放弃本次登录”。');
     return;
   }
 
   clearMessage();
-  els.accountLoginBtn.disabled = true;
-  els.accountLoginBtn.classList.add('loading');
-  els.accountLoginBtn.textContent = '等待登录完成...';
+  setAccountLoginPendingState(true);
 
   try {
     const payload = await api('/admin/api/accounts/login', { method: 'POST', body: {} });
@@ -3518,17 +3512,34 @@ els.accountLoginBtn.addEventListener('click', async () => {
       ? (' 当前账号快照已预先记录/刷新：' + payload.preservedAlias + '。')
       : '';
     setMessage(payload.loginOpened ? 'info' : 'warn', (payload.loginOpened
-      ? '已在本机打开 Accio 登录页。完成新账号登录后，系统会自动记录到列表。'
-      : '登录流程已创建，但本机未能自动打开登录页，请手动使用返回的链接完成登录。') + preservedNote);
+      ? '已在本机打开 Accio 登录页。完成新账号登录后，系统会自动记录到列表；如果不继续，可以点击“放弃本次登录”。'
+      : '登录流程已创建，但本机未能自动打开登录页，请手动使用返回的链接完成登录；如果不继续，可以点击“放弃本次登录”。') + preservedNote);
     observeAccountLogin(payload.flowId);
   } catch (error) {
     activeLoginFlowId = null;
-    els.accountLoginBtn.disabled = false;
-    els.accountLoginBtn.classList.remove('loading');
-    els.accountLoginBtn.textContent = '\uFF0B 添加账号登录';
+    setAccountLoginPendingState(false);
     setMessage('error', error && error.message ? error.message : String(error));
   }
 });
+if (els.cancelAccountLoginBtn) {
+  els.cancelAccountLoginBtn.addEventListener('click', () => withAction(els.cancelAccountLoginBtn, async () => {
+    const flowId = activeLoginFlowId;
+    if (!flowId) {
+      setAccountLoginPendingState(false);
+      setMessage('info', '当前没有进行中的登录流程。');
+      return;
+    }
+
+    clearMessage();
+    cancelledLoginFlows.add(flowId);
+    activeLoginFlowId = null;
+    await api('/admin/api/accounts/login/cancel', { method: 'POST', body: { flowId } });
+    setAccountLoginPendingState(false);
+    setMessage('warn', '已放弃本次登录，你现在可以重新发起登录。');
+  }).catch((error) => {
+    setMessage('error', error && error.message ? error.message : String(error));
+  }));
+}
 document.addEventListener('click', async (event) => {
   const activate = event.target.closest('[data-activate-snapshot]');
   if (activate) {
@@ -4346,6 +4357,35 @@ async function handleAdminAccountLoginStatus(req, res, config, url) {
   });
 }
 
+async function handleAdminAccountLoginCancel(req, res) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const flowId = body && body.flowId ? String(body.flowId).trim() : "";
+  if (!flowId) {
+    writeJson(res, 400, { error: { type: "invalid_request_error", message: "flowId is required" } });
+    return;
+  }
+
+  const flow = getPendingAccountLogin(flowId);
+  if (!flow) {
+    writeJson(res, 200, {
+      ok: true,
+      cancelled: false,
+      flowId,
+      note: "该登录流程已结束。"
+    });
+    return;
+  }
+
+  logPendingAccountLoginState(flow, "cancelled");
+  deletePendingAccountLogin(flowId);
+  writeJson(res, 200, {
+    ok: true,
+    cancelled: true,
+    flowId,
+    note: "已取消当前登录流程。"
+  });
+}
+
 module.exports = {
   handleAdminPage,
   handleAdminState,
@@ -4363,6 +4403,7 @@ module.exports = {
   handleAdminAccountLogin,
   handleAdminAccountCallback,
   handleAdminAccountLoginStatus,
+  handleAdminAccountLoginCancel,
   __private__: {
     hasSnapshotArtifactState,
     isQuotaPendingFailure,
