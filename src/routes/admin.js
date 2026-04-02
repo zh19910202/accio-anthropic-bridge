@@ -3246,7 +3246,6 @@ function renderSnapshots(data) {
       + (standbyMeta ? '<div class="itemMeta hint">' + standbyMeta + '</div>' : '')
       + (cooling ? '<div class="itemMeta">恢复时间：' + formatTime(accountState.invalidUntil) + '</div>' : '')
       + (lastFailure ? '<div class="itemMeta hint">最近失败：' + lastFailure + '</div>' : '')
-      + (!item.hasFullAuthState ? '<div class="itemMeta hint">未保存桌面文件，当前 bridge 仍可正常使用</div>' : '')
       + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
       + (!canActivate ? '<div class="itemMeta hint">该快照缺少完整登录槽位，不能直接切换。</div>' : '')
       + '<div class="itemSpacer"></div>'
