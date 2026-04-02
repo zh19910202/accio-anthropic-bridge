@@ -353,20 +353,21 @@ class AuthProvider {
     return [...fileState.accounts, ...envAccounts];
   }
 
-  _pickAccount(accounts, options = {}) {
+  _orderAccounts(accounts, options = {}) {
     const requestedAccountId = options.accountId ? String(options.accountId) : null;
     const stickyAccountId = options.stickyAccountId ? String(options.stickyAccountId) : null;
     const activeAccount = options.activeAccount ? String(options.activeAccount) : null;
 
     if (requestedAccountId) {
-      return accounts.find((account) => account.id === requestedAccountId || account.name === requestedAccountId) || null;
+      const requested = accounts.find((account) => account.id === requestedAccountId || account.name === requestedAccountId);
+      return requested ? [requested] : [];
     }
 
     if (stickyAccountId) {
       const sticky = accounts.find((account) => account.id === stickyAccountId || account.name === stickyAccountId);
 
       if (sticky) {
-        return sticky;
+        return [sticky, ...accounts.filter((account) => account.id !== sticky.id)];
       }
     }
 
@@ -374,55 +375,86 @@ class AuthProvider {
       const active = accounts.find((account) => account.id === activeAccount || account.name === activeAccount);
 
       if (active) {
-        return active;
+        return [active, ...accounts.filter((account) => account.id !== active.id)];
       }
     }
 
     if (accounts.length === 0) {
-      return null;
+      return [];
     }
 
     const strategy = normalizeStrategy(this._fileStrategy || this.strategy);
 
     if (strategy === "fixed") {
-      return accounts[0];
+      return [...accounts];
     }
 
     if (strategy === "random") {
-      return accounts[Math.floor(Math.random() * accounts.length)] || null;
+      const shuffled = [...accounts];
+      for (let index = shuffled.length - 1; index > 0; index--) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+      }
+      return shuffled;
     }
 
-    const account = accounts[this._rrIndex % accounts.length] || null;
-    this._rrIndex = (this._rrIndex + 1) % Math.max(1, accounts.length);
-    return account;
+    const startIndex = this._rrIndex % accounts.length;
+    return [
+      ...accounts.slice(startIndex),
+      ...accounts.slice(0, startIndex)
+    ];
   }
 
-  resolveCredential(options = {}) {
+  _mapAccountToCredential(account) {
+    if (!account) {
+      return null;
+    }
+
+    return {
+      accountId: account.id,
+      accountName: account.name,
+      token: account.accessToken,
+      refreshToken: account.refreshToken || null,
+      cookie: account.cookie || null,
+      user: account.user || null,
+      expiresAt: account.expiresAt || null,
+      expiresAtRaw: account.expiresAtRaw || null,
+      source: account.source,
+      transportOverride: account.transportOverride || null,
+      baseUrl: account.baseUrl || null
+    };
+  }
+
+  listCredentials(options = {}) {
     const excludeIds = new Set(Array.isArray(options.excludeIds) ? options.excludeIds.map(String) : []);
     const candidates = this.getConfiguredAccounts().filter(
       (account) => this._isAccountUsable(account) && !excludeIds.has(account.id)
     );
-    const account = this._pickAccount(candidates, {
+
+    return this._orderAccounts(candidates, {
       accountId: options.accountId,
       stickyAccountId: options.stickyAccountId,
       activeAccount: this._activeAccount
-    });
+    }).map((account) => this._mapAccountToCredential(account)).filter(Boolean);
+  }
 
-    return account
-      ? {
-          accountId: account.id,
-          accountName: account.name,
-          token: account.accessToken,
-          refreshToken: account.refreshToken || null,
-          cookie: account.cookie || null,
-          user: account.user || null,
-          expiresAt: account.expiresAt || null,
-          expiresAtRaw: account.expiresAtRaw || null,
-          source: account.source,
-          transportOverride: account.transportOverride || null,
-          baseUrl: account.baseUrl || null
-        }
-      : null;
+  resolveCredential(options = {}) {
+    const credentials = this.listCredentials(options);
+    const credential = credentials[0] || null;
+
+    if (
+      credential &&
+      !options.accountId &&
+      !options.stickyAccountId &&
+      !(Array.isArray(options.excludeIds) && options.excludeIds.length > 0) &&
+      !this._activeAccount &&
+      normalizeStrategy(this._fileStrategy || this.strategy) === "round_robin"
+    ) {
+      const accountCount = Math.max(1, this.getConfiguredAccounts().filter((account) => this._isAccountUsable(account)).length);
+      this._rrIndex = (this._rrIndex + 1) % accountCount;
+    }
+
+    return credential;
   }
 
   invalidateAccount(accountId, reason = null, untilMs = null) {

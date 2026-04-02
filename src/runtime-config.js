@@ -121,6 +121,8 @@ function createConfig() {
     authCacheTtlMs: Number(env("ACCIO_AUTH_CACHE_TTL_MS", String(2 * 60 * 1000))),
     quotaPreflightEnabled: parseFlag(env("ACCIO_QUOTA_PREFLIGHT_ENABLED", "1"), true),
     quotaCacheTtlMs: Number(env("ACCIO_QUOTA_CACHE_TTL_MS", "30000")),
+    accountStandbyEnabled: parseFlag(env("ACCIO_ACCOUNT_STANDBY_ENABLED", "1"), true),
+    accountStandbyRefreshMs: Number(env("ACCIO_ACCOUNT_STANDBY_REFRESH_MS", "30000")),
     defaultMaxOutputTokens: Number(env("ACCIO_DEFAULT_MAX_OUTPUT_TOKENS", "4096")),
     responseCacheTtlMs: Number(env("ACCIO_RESPONSE_CACHE_TTL_MS", "10000")),
     responseCacheMaxEntries: Number(env("ACCIO_RESPONSE_CACHE_MAX_ENTRIES", "128")),

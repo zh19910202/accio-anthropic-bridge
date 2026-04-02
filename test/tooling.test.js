@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { validateAnthropicMessages, validateOpenAiMessages } = require("../src/tooling");
+const { repairAnthropicMessages, validateAnthropicMessages, validateOpenAiMessages } = require("../src/tooling");
 
 test("validateAnthropicMessages accepts tool_use followed by tool_result", () => {
   const result = validateAnthropicMessages([
@@ -32,6 +32,44 @@ test("validateAnthropicMessages rejects tool_result without known tool_use_id", 
       ]),
     (error) => error && error.status === 400
   );
+});
+
+test("repairAnthropicMessages moves misplaced tool_result blocks into user messages", () => {
+  const repaired = repairAnthropicMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Calling tool" },
+        { type: "tool_use", id: "tool_1", name: "lookup", input: { q: "weather" } },
+        { type: "tool_result", tool_use_id: "tool_1", content: "sunny" }
+      ]
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Done" }]
+    }
+  ]);
+
+  assert.deepEqual(repaired, [
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Calling tool" },
+        { type: "tool_use", id: "tool_1", name: "lookup", input: { q: "weather" } }
+      ]
+    },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "tool_1", content: "sunny" }]
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Done" }]
+    }
+  ]);
+
+  const validated = validateAnthropicMessages(repaired);
+  assert.equal(validated.toolResults[0].toolUseId, "tool_1");
 });
 
 test("validateOpenAiMessages rejects unknown tool_call_id", () => {

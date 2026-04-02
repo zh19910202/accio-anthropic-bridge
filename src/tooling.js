@@ -14,6 +14,75 @@ function normalizeAnthropicContent(content) {
   return [];
 }
 
+function cloneAnthropicBlock(block) {
+  if (!block || typeof block !== "object") {
+    return block;
+  }
+
+  if (Array.isArray(block)) {
+    return block.map((item) => cloneAnthropicBlock(item));
+  }
+
+  return {
+    ...block,
+    ...(Array.isArray(block.content)
+      ? { content: block.content.map((item) => cloneAnthropicBlock(item)) }
+      : {})
+  };
+}
+
+function repairAnthropicMessages(messages) {
+  const source = Array.isArray(messages) ? messages : [];
+  const repaired = [];
+
+  for (const message of source) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    const originalRole = String(message.role || "user");
+    const normalizedRole = originalRole === "assistant" ? "assistant" : "user";
+    const normalizedContent = normalizeAnthropicContent(message.content);
+    const ownBlocks = [];
+    const displacedToolResults = [];
+
+    for (const block of normalizedContent) {
+      if (!block || typeof block !== "object") {
+        continue;
+      }
+
+      if (normalizedRole !== "user" && block.type === "tool_result") {
+        displacedToolResults.push(cloneAnthropicBlock(block));
+        continue;
+      }
+
+      ownBlocks.push(cloneAnthropicBlock(block));
+    }
+
+    if (ownBlocks.length > 0 || (normalizedRole === "user" && displacedToolResults.length === 0)) {
+      repaired.push({
+        ...message,
+        role: normalizedRole,
+        content: ownBlocks
+      });
+    }
+
+    if (displacedToolResults.length > 0) {
+      const lastMessage = repaired[repaired.length - 1];
+      if (lastMessage && lastMessage.role === "user") {
+        lastMessage.content = normalizeAnthropicContent(lastMessage.content).concat(displacedToolResults);
+      } else {
+        repaired.push({
+          role: "user",
+          content: displacedToolResults
+        });
+      }
+    }
+  }
+
+  return repaired;
+}
+
 function validateAnthropicMessages(messages) {
   const knownToolIds = new Map();
   const toolRequests = [];
@@ -154,6 +223,7 @@ function validateOpenAiMessages(messages) {
 
 module.exports = {
   normalizeAnthropicContent,
+  repairAnthropicMessages,
   validateAnthropicMessages,
   validateOpenAiMessages
 };

@@ -154,8 +154,60 @@ function writeAccountToFile(filePath, accountId, accessToken, extras = {}) {
   return resolvedPath;
 }
 
+function removeAccountFromFile(filePath, lookup = {}) {
+  const resolvedPath = path.resolve(filePath);
+  const state = loadAccountsFile(resolvedPath);
+  const candidates = [
+    lookup.alias,
+    lookup.accountId,
+    lookup.userId,
+    lookup.name
+  ].filter(Boolean).map((value) => String(value));
+
+  if (candidates.length === 0) {
+    return {
+      removed: false,
+      path: resolvedPath,
+      removedAccounts: []
+    };
+  }
+
+  const removedAccounts = state.accounts.filter((account) => matchesAccountCandidate(account, candidates));
+  if (removedAccounts.length === 0) {
+    return {
+      removed: false,
+      path: resolvedPath,
+      removedAccounts: []
+    };
+  }
+
+  const nextAccounts = state.accounts.filter((account) => !matchesAccountCandidate(account, candidates));
+  const removedIds = new Set(removedAccounts.map((account) => String(account && (account.id || account.accountId || ""))).filter(Boolean));
+  const nextActiveAccount = state.activeAccount && removedIds.has(String(state.activeAccount))
+    ? null
+    : state.activeAccount;
+
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  fs.writeFileSync(
+    resolvedPath,
+    JSON.stringify({ strategy: state.strategy, activeAccount: nextActiveAccount, accounts: nextAccounts }, null, 2) + "\n",
+    "utf8"
+  );
+
+  return {
+    removed: true,
+    path: resolvedPath,
+    removedAccounts: removedAccounts.map((account) => ({
+      id: account && account.id ? String(account.id) : null,
+      accountId: account && account.accountId ? String(account.accountId) : null,
+      name: account && account.name ? String(account.name) : null
+    }))
+  };
+}
+
 module.exports = {
   loadAccountsFile,
   findStoredAccountAuthPayload,
-  writeAccountToFile
+  writeAccountToFile,
+  removeAccountFromFile
 };

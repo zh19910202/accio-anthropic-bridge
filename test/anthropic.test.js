@@ -141,3 +141,29 @@ test("selectAnthropicTransport marks thinking unsupported when neither direct no
   assert.equal(decision.useExternalFallback, false);
   assert.equal(decision.unsupportedThinking, true);
 });
+
+test("selectAnthropicTransport routes thinking requests to external openai fallback when direct model does not support thinking", () => {
+  const decision = selectAnthropicTransport({
+    body: {
+      model: "gpt-5.4",
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+    },
+    client: { config: { transportMode: "auto" } },
+    directAllowed: true,
+    directThinkingSupported: false,
+    fallbackPool: {
+      getEligibleAnthropic() {
+        return [{
+          target: { id: "openai-fallback" },
+          client: { protocol: "openai" }
+        }];
+      }
+    },
+    thinking: { type: "enabled" }
+  });
+
+  assert.equal(decision.transportSelected, "external-openai");
+  assert.equal(decision.useExternalFallback, true);
+  assert.equal(decision.unsupportedThinking, false);
+});

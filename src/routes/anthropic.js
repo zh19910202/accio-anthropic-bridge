@@ -23,7 +23,7 @@ const { readJsonBody } = require("../middleware/body-parser");
 const { applyAnthropicDefaults, canCacheAnthropicRequest } = require("../request-defaults");
 const { buildCacheKey } = require("../response-cache");
 const { AnthropicStreamWriter } = require("../stream/anthropic-sse");
-const { validateAnthropicMessages } = require("../tooling");
+const { repairAnthropicMessages, validateAnthropicMessages } = require("../tooling");
 const {
   executeBridgeQuery,
   sessionHeaders,
@@ -48,14 +48,15 @@ function fallbackCandidatesForAnthropic(fallbackPool, body) {
   return fallbackPool.getEligibleAnthropic(body);
 }
 
-function selectAnthropicTransport({ body, client, directAllowed, fallbackPool, thinking }) {
+function selectAnthropicTransport({ body, client, directAllowed, fallbackPool, thinking, directThinkingSupported = true }) {
   const fallbackCandidates = fallbackCandidatesForAnthropic(fallbackPool, body);
   const fallbackTransport = fallbackCandidates.length > 0
     ? fallbackTransportName(fallbackCandidates[0].client)
     : "external-openai";
   const externalEligible = fallbackCandidates.length > 0;
+  const canUseDirectThinking = Boolean(directAllowed && directThinkingSupported);
 
-  if (directAllowed) {
+  if (!thinking && directAllowed) {
     return {
       transportSelected: "direct-llm",
       directAllowed: true,
@@ -65,6 +66,15 @@ function selectAnthropicTransport({ body, client, directAllowed, fallbackPool, t
   }
 
   if (thinking) {
+    if (canUseDirectThinking) {
+      return {
+        transportSelected: "direct-llm",
+        directAllowed: true,
+        useExternalFallback: false,
+        unsupportedThinking: false
+      };
+    }
+
     if (externalEligible) {
       return {
         transportSelected: fallbackTransport,
@@ -693,12 +703,14 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config
   );
+  body.messages = repairAnthropicMessages(body.messages);
   validateAnthropicMessages(body.messages);
 
   const binding = resolveSessionBinding(req.headers, body, "anthropic");
   const storedSession = binding.sessionId ? sessionStore.get(binding.sessionId) : null;
   const directRequest = buildDirectRequestFromAnthropic(body);
   const thinking = extractThinkingConfigFromAnthropic(body);
+  const directThinkingSupported = !thinking || supportsThinkingForModel(directRequest.model);
   const cacheEligible = canCacheAnthropicRequest(body);
   const cacheKey = cacheEligible ? buildAnthropicCacheKey(req, body, binding) : null;
 
@@ -743,17 +755,14 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
     }
   }
 
-  if (thinking && !supportsThinkingForModel(directRequest.model)) {
-    throw createBridgeError(400, `Model ${directRequest.model} does not support thinking`, "invalid_request_error");
-  }
-
   const directAllowed = await shouldUseDirectTransport(client, directClient);
   const transportDecision = selectAnthropicTransport({
     body,
     client,
     directAllowed,
     fallbackPool,
-    thinking
+    thinking,
+    directThinkingSupported
   });
   logRequest(req, "anthropic transport selected", {
     transportSelected: transportDecision.transportSelected,
@@ -776,6 +785,10 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
   }
 
   if (transportDecision.unsupportedThinking) {
+    if (!directThinkingSupported) {
+      throw createBridgeError(400, `Model ${directRequest.model} does not support thinking on direct-llm and no eligible external fallback is available`, "invalid_request_error");
+    }
+
     throw createBridgeError(501, "Thinking mode is only supported through direct-llm transport", "unsupported_error");
   }
 

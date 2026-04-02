@@ -126,3 +126,31 @@ test("resolveSnapshotQuotaForAdmin keeps inactive snapshot quota isolated from c
   assert.equal(result.stale, true);
   assert.equal(result.source, "snapshot-cache");
 });
+
+test("hasSnapshotArtifactState returns true for full login-slot snapshots", () => {
+  assert.equal(
+    __private__.hasSnapshotArtifactState({
+      metadata: {
+        artifacts: [
+          { relativePath: "credentials.enc" },
+          { relativePath: "Local Storage" },
+          { relativePath: "Session Storage" }
+        ]
+      }
+    }),
+    true
+  );
+});
+
+test("hasSnapshotArtifactState returns false for legacy auth-callback-only snapshots", () => {
+  assert.equal(
+    __private__.hasSnapshotArtifactState({
+      metadata: {
+        artifacts: [
+          { relativePath: "credentials.json" }
+        ]
+      }
+    }),
+    false
+  );
+});

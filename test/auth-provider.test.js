@@ -183,3 +183,28 @@ test("AuthProvider prefers activeAccount over round robin", () => {
   const provider = new AuthProvider({ authMode: "file", accountsPath: filePath });
   assert.equal(provider.resolveCredential().accountId, "acct_b");
 });
+
+test("AuthProvider lists usable credentials in current rotation order without consuming it", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));
+  const filePath = path.join(tempDir, "accounts.json");
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      strategy: "round_robin",
+      accounts: [
+        { id: "acct_a", accessToken: "token_a", enabled: true, priority: 1 },
+        { id: "acct_b", accessToken: "token_b", enabled: true, priority: 2 },
+        { id: "acct_c", accessToken: "token_c", enabled: true, priority: 3 }
+      ]
+    })
+  );
+
+  const provider = new AuthProvider({ authMode: "file", accountsPath: filePath });
+  assert.equal(provider.resolveCredential().accountId, "acct_a");
+  assert.deepEqual(
+    provider.listCredentials().map((item) => item.accountId),
+    ["acct_b", "acct_c", "acct_a"]
+  );
+  assert.equal(provider.resolveCredential().accountId, "acct_b");
+});

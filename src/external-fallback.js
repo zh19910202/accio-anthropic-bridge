@@ -1,7 +1,9 @@
 "use strict";
 
+const modelAliases = require("../config/model-aliases.json");
 const log = require("./logger");
 const { flattenAnthropicRequest, normalizeContent, normalizeSystemPrompt } = require("./anthropic");
+const { normalizeRequestedModel } = require("./model");
 const { flattenOpenAiRequest } = require("./openai");
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
@@ -68,6 +70,41 @@ function stripTrailingSlash(value) {
   return String(value || "").trim().replace(/\/$/, "");
 }
 
+function normalizeSupportedModelId(value) {
+  const requested = normalizeRequestedModel(value);
+  if (!requested) {
+    return "";
+  }
+
+  return String(modelAliases[requested] || requested).trim();
+}
+
+function normalizeSupportedModels(value, fallbackModel = "") {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\n,]+/)
+      : [];
+  const seen = new Set();
+  const normalized = [];
+
+  for (const item of rawValues) {
+    const model = normalizeSupportedModelId(item);
+    if (!model || seen.has(model)) {
+      continue;
+    }
+    seen.add(model);
+    normalized.push(model);
+  }
+
+  const fallback = normalizeSupportedModelId(fallbackModel);
+  if (normalized.length === 0 && fallback) {
+    normalized.push(fallback);
+  }
+
+  return normalized;
+}
+
 function normalizeFallbackTarget(target = {}, index = 0) {
   const selection = normalizeProtocolSelection(target.protocol, target.openaiApiStyle);
 
@@ -78,6 +115,7 @@ function normalizeFallbackTarget(target = {}, index = 0) {
     baseUrl: stripTrailingSlash(target.baseUrl || ""),
     apiKey: String(target.apiKey || "").trim(),
     model: String(target.model || "").trim(),
+    supportedModels: normalizeSupportedModels(target.supportedModels, target.model),
     protocol: selection.protocol,
     openaiApiStyle: selection.openaiApiStyle,
     anthropicVersion: String(target.anthropicVersion || DEFAULT_ANTHROPIC_VERSION).trim() || DEFAULT_ANTHROPIC_VERSION,
@@ -103,6 +141,7 @@ function serializeFallbackTarget(target = {}) {
     baseUrl: normalized.baseUrl,
     apiKey: normalized.apiKey,
     model: normalized.model,
+    supportedModels: normalized.supportedModels,
     protocol,
     anthropicVersion: normalized.anthropicVersion,
     timeoutMs: normalized.timeoutMs,
@@ -372,6 +411,124 @@ function normalizeAnthropicToolResultText(content) {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function sanitizeAnthropicToolResultContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return JSON.stringify(content || "");
+  }
+
+  const textBlocks = [];
+
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+
+    if (block.type === "text") {
+      textBlocks.push({
+        type: "text",
+        text: typeof block.text === "string" ? block.text : ""
+      });
+      continue;
+    }
+
+    return normalizeAnthropicToolResultText(content);
+  }
+
+  return textBlocks;
+}
+
+function sanitizeAnthropicInputMessages(messages) {
+  const sanitized = [];
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    const role = message.role === "assistant" ? "assistant" : "user";
+    const content = message.content;
+
+    if (typeof content === "string") {
+      sanitized.push({
+        ...message,
+        role,
+        content
+      });
+      continue;
+    }
+
+    if (!Array.isArray(content)) {
+      sanitized.push({
+        ...message,
+        role,
+        content: [{ type: "text", text: normalizeContentString(content) || "" }]
+      });
+      continue;
+    }
+
+    const nextContent = [];
+
+    for (const block of content) {
+      if (!block || typeof block !== "object") {
+        continue;
+      }
+
+      const type = String(block.type || "").trim().toLowerCase();
+
+      if (type === "thinking" || type === "redacted_thinking") {
+        continue;
+      }
+
+      if (type === "tool_result") {
+        nextContent.push({
+          type: "tool_result",
+          tool_use_id: block.tool_use_id,
+          content: sanitizeAnthropicToolResultContent(block.content)
+        });
+        continue;
+      }
+
+      if (type === "text") {
+        nextContent.push({
+          ...block,
+          type: "text",
+          text: typeof block.text === "string" ? block.text : ""
+        });
+        continue;
+      }
+
+      nextContent.push(block);
+    }
+
+    if (nextContent.length === 0) {
+      nextContent.push({ type: "text", text: "" });
+    }
+
+    sanitized.push({
+      ...message,
+      role,
+      content: nextContent
+    });
+  }
+
+  return sanitized;
+}
+
+function sanitizeAnthropicRequestBody(body) {
+  if (!body || typeof body !== "object") {
+    return {};
+  }
+
+  return {
+    ...body,
+    messages: sanitizeAnthropicInputMessages(body.messages)
+  };
 }
 
 function normalizeContentString(content) {
@@ -982,6 +1139,7 @@ class ExternalFallbackClient {
     this.baseUrl = stripTrailingSlash(config.baseUrl || "");
     this.apiKey = String(config.apiKey || "");
     this.model = String(config.model || "");
+    this.supportedModels = normalizeSupportedModels(config.supportedModels, this.model);
     this.timeoutMs = Number(config.timeoutMs || 60000);
     this.protocol = String(config.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai";
     this.openaiApiStyle = normalizeOpenAiApiStyle(config.openaiApiStyle);
@@ -999,6 +1157,15 @@ class ExternalFallbackClient {
 
   transportName() {
     return this.protocol === "anthropic" ? "external-anthropic" : "external-openai";
+  }
+
+  supportsRequestedModel(requestedModel) {
+    const normalized = normalizeSupportedModelId(requestedModel);
+    if (!normalized || this.supportedModels.length === 0) {
+      return false;
+    }
+
+    return this.supportedModels.includes(normalized);
   }
 
   buildAnthropicMessageUrls() {
@@ -1326,7 +1493,7 @@ class ExternalFallbackClient {
     }
 
     const payload = {
-      ...(body && typeof body === "object" ? body : {}),
+      ...sanitizeAnthropicRequestBody(body),
       model: this.model,
       stream: body && body.stream === true
     };
@@ -1618,15 +1785,31 @@ class ExternalFallbackPool {
   }
 
   getEligibleAnthropic(body) {
-    return this.entries.filter((entry) => entry.client.isEligibleAnthropic(body));
+    return this._rankEntriesByRequestedModel(
+      this.entries.filter((entry) => entry.client.isEligibleAnthropic(body)),
+      body && body.model
+    );
   }
 
   getEligibleOpenAi(body) {
-    return this.entries.filter((entry) => entry.client.isEligibleOpenAi(body));
+    return this._rankEntriesByRequestedModel(
+      this.entries.filter((entry) => entry.client.isEligibleOpenAi(body)),
+      body && body.model
+    );
   }
 
   getConfiguredEntries() {
     return this.entries.filter((entry) => entry.client.isConfigured());
+  }
+
+  _rankEntriesByRequestedModel(entries, requestedModel) {
+    const nativeMatches = entries.filter((entry) => entry.client.supportsRequestedModel(requestedModel));
+    if (nativeMatches.length === 0) {
+      return entries;
+    }
+
+    const matchedIds = new Set(nativeMatches.map((entry) => entry.target.id));
+    return nativeMatches.concat(entries.filter((entry) => !matchedIds.has(entry.target.id)));
   }
 }
 
@@ -1640,6 +1823,7 @@ module.exports = {
   normalizeFallbackTargets,
   openAiMessagesToResponsesInput,
   serializeFallbackTarget,
+  sanitizeAnthropicRequestBody,
   openAiToAnthropicPayload,
   openAiToFallbackMessages,
   shouldFallbackToExternalProvider

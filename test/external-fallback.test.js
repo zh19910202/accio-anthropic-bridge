@@ -11,6 +11,7 @@ const {
   normalizeFallbackTargets,
   openAiMessagesToResponsesInput,
   openAiToFallbackMessages,
+  sanitizeAnthropicRequestBody,
   shouldFallbackToExternalProvider
 } = require("../src/external-fallback");
 
@@ -63,7 +64,15 @@ test("ExternalFallbackClient eligibility allows anthropic tools for openai-compa
 
 test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   const targets = normalizeFallbackTargets([
-    { name: "Primary", protocol: "anthropic", baseUrl: "https://a.example/v1/", apiKey: "k1", model: "m1", reasoningEffort: "high" },
+    {
+      name: "Primary",
+      protocol: "anthropic",
+      baseUrl: "https://a.example/v1/",
+      apiKey: "k1",
+      model: "m1",
+      supportedModels: "claude-sonnet-4-5, claude-opus-4-6",
+      reasoningEffort: "high"
+    },
     { name: "Secondary", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2", enabled: false }
   ]);
 
@@ -72,27 +81,62 @@ test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   assert.equal(targets[0].protocol, "anthropic");
   assert.equal(targets[0].baseUrl, "https://a.example/v1");
   assert.equal(targets[0].reasoningEffort, "high");
+  assert.deepEqual(targets[0].supportedModels, ["claude-sonnet-4-6", "claude-opus-4-6"]);
   assert.ok(targets[0].id);
 });
 
-test("ExternalFallbackPool returns eligible candidates in configured order", () => {
+test("ExternalFallbackPool prioritizes native model matches before protocol adaptation", () => {
   const pool = new ExternalFallbackPool({
     targets: [
-      { id: "a", name: "A", protocol: "openai", baseUrl: "https://a.example/v1", apiKey: "k1", model: "m1" },
-      { id: "b", name: "B", protocol: "anthropic", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2" }
+      {
+        id: "a",
+        name: "A",
+        protocol: "openai",
+        baseUrl: "https://a.example/v1",
+        apiKey: "k1",
+        model: "gpt-5.4",
+        supportedModels: ["gpt-5.4"]
+      },
+      {
+        id: "b",
+        name: "B",
+        protocol: "anthropic",
+        baseUrl: "https://b.example/v1",
+        apiKey: "k2",
+        model: "anthropic/claude-sonnet-4.6",
+        supportedModels: ["claude-sonnet-4-6"]
+      }
     ]
   });
 
   const anthropicCandidates = pool.getEligibleAnthropic({
+    model: "claude-sonnet-4-5",
     messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
     thinking: { type: "enabled" }
   });
   const openAiCandidates = pool.getEligibleOpenAi({
+    model: "gpt-5.4",
     messages: [{ role: "user", content: "hi" }]
   });
 
-  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["a", "b"]);
+  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["b", "a"]);
   assert.deepEqual(openAiCandidates.map((entry) => entry.target.id), ["a", "b"]);
+});
+
+test("ExternalFallbackPool keeps configured priority when no native model supplier matches", () => {
+  const pool = new ExternalFallbackPool({
+    targets: [
+      { id: "a", name: "A", protocol: "openai", baseUrl: "https://a.example/v1", apiKey: "k1", model: "gpt-5.4", supportedModels: ["gpt-5.4"] },
+      { id: "b", name: "B", protocol: "anthropic", baseUrl: "https://b.example/v1", apiKey: "k2", model: "anthropic/claude-sonnet-4.6", supportedModels: ["claude-sonnet-4-6"] }
+    ]
+  });
+
+  const candidates = pool.getEligibleAnthropic({
+    model: "claude-haiku-4-5",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+  });
+
+  assert.deepEqual(candidates.map((entry) => entry.target.id), ["a", "b"]);
 });
 
 test("ExternalFallbackClient completes through OpenAI compatible endpoint", async () => {
@@ -602,6 +646,113 @@ test("ExternalFallbackClient requestAnthropicMessage preserves body and override
   assert.equal(payload.model, "claude-opus-4-1");
   assert.equal(payload.stream, true);
   assert.deepEqual(payload.thinking, { type: "enabled", budget_tokens: 2048 });
+});
+
+test("sanitizeAnthropicRequestBody strips thinking blocks and normalizes tool_reference tool results", () => {
+  const sanitized = sanitizeAnthropicRequestBody({
+    model: "claude-sonnet-4-6",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal", signature: "sig_1" },
+          { type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool_1",
+            content: [{ type: "tool_reference", tool_name: "WebFetch" }]
+          },
+          { type: "text", text: "continue" }
+        ]
+      }
+    ]
+  });
+
+  assert.deepEqual(sanitized.messages, [
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }]
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool_1",
+          content: "{\"type\":\"tool_reference\",\"tool_name\":\"WebFetch\"}"
+        },
+        { type: "text", text: "continue" }
+      ]
+    }
+  ]);
+});
+
+test("ExternalFallbackClient requestAnthropicMessage sanitizes unsupported anthropic history blocks", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-1",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async text() {
+          return JSON.stringify({ ok: true });
+        }
+      };
+    }
+  });
+
+  await client.requestAnthropicMessage({
+    model: "should-be-overridden",
+    stream: false,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hidden", signature: "sig_1" },
+          { type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool_1",
+            content: [{ type: "tool_reference", tool_name: "WebFetch" }]
+          }
+        ]
+      }
+    ]
+  });
+
+  const payload = JSON.parse(seen[0].options.body);
+  assert.deepEqual(payload.messages, [
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }]
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool_1",
+          content: "{\"type\":\"tool_reference\",\"tool_name\":\"WebFetch\"}"
+        }
+      ]
+    }
+  ]);
 });
 
 test("ExternalFallbackClient accepts anthropic baseUrl ending with /v1", async () => {
