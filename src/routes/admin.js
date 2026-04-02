@@ -1096,6 +1096,8 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
   const gateway = await readGatewayState(config.baseUrl);
   const storage = detectActiveStorage();
   const configuredAccounts = authProvider.getConfiguredAccounts();
+  const authSummary = authProvider.getSummary();
+  const activeAccountId = authSummary && authSummary.activeAccount ? String(authSummary.activeAccount) : "";
   const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
   const snapshotEntries = listSnapshots().map((entry) => {
     const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
@@ -1139,6 +1141,11 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
         snapshot &&
         snapshot.gatewayUser &&
         String(snapshot.gatewayUser.id || "") === currentGatewayUserId
+      ) || Boolean(
+        activeAccountId &&
+        snapshot &&
+        snapshot.accountState &&
+        String(snapshot.accountState.id || "") === activeAccountId
       )
     })
   })));
@@ -1154,8 +1161,6 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
     invalidUntil: authProvider.getInvalidUntil(account.id),
     lastFailure: authProvider.getLastFailure(account.id) || null
   }));
-  const authSummary = authProvider.getSummary();
-  const activeAccountId = authSummary && authSummary.activeAccount ? String(authSummary.activeAccount) : "";
   const activeSnapshots = activeAccountId
     ? normalizedSnapshots.filter((snapshot) => snapshot.accountState && String(snapshot.accountState.id || "") === activeAccountId)
     : [];
