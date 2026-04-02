@@ -7,3 +7,4 @@ config/accounts.json
 /.ace-tool
 desktop/dist/
 .tmp/
+/.playwright-mcp

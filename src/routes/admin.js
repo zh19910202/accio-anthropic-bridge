@@ -1782,7 +1782,7 @@ button { font: inherit; cursor: pointer; }
   display: grid;
   grid-template-columns: 110px 1fr;
   gap: 8px 12px;
-
+}
 
 /* ── StatusBadge Quota Mode ── */
 .statusBadge {
@@ -2195,7 +2195,8 @@ button { font: inherit; cursor: pointer; }
 }
 
 
-.pageHead {
+.pageHead,
+.pageHeadWrap {
   display: grid;
   gap: 12px;
   margin-bottom: 14px;
