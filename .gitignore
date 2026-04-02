@@ -4,5 +4,7 @@ node_modules/
 .DS_Store
 npm-debug.log*
 config/accounts.json
+/.ace-tool
 desktop/dist/
 .tmp/
+/.playwright-mcp

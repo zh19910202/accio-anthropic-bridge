@@ -561,6 +561,7 @@ async function runDirectAnthropic(body, req, res, directClient, sessionStore, st
     outputTokens: completionTokens,
     sessionId: binding.sessionId,
     stopReason: result.stopReason,
+    thinkingBlocks: result.thinkingBlocks,
     toolCalls,
     toolResults: [],
     accountId: result.accountId,

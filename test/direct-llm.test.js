@@ -22,9 +22,14 @@ test("mapRequestedModel uses external alias config", () => {
   assert.equal(mapRequestedModel("gemini-3-pro-preview"), "gemini-3.1-pro-preview");
 });
 
-test("buildDirectRequestFromAnthropic maps tool_result and aliased model", () => {
+test("buildDirectRequestFromAnthropic maps tool_result, aliased model and thinking", () => {
   const request = buildDirectRequestFromAnthropic({
     model: "gpt-5",
+    max_tokens: 512,
+    thinking: {
+      type: "enabled",
+      budget_tokens: 256
+    },
     messages: [
       {
         role: "assistant",
@@ -40,11 +45,17 @@ test("buildDirectRequestFromAnthropic maps tool_result and aliased model", () =>
   assert.equal(request.model, "claude-opus-4-6");
   assert.equal(request.requestBody.model, "claude-opus-4-6");
   assert.equal(request.requestBody.contents[1].parts[0].function_response.name, "shell_echo");
+  assert.deepEqual(request.requestBody.thinking, {
+    type: "enabled",
+    budget_tokens: 256
+  });
 });
 
-test("buildDirectRequestFromOpenAi maps tools into declarations", () => {
+test("buildDirectRequestFromOpenAi maps tools into declarations and reasoning effort into thinking", () => {
   const request = buildDirectRequestFromOpenAi({
     model: "claude-opus-4-6",
+    max_tokens: 1000,
+    reasoning_effort: "high",
     tools: [
       {
         type: "function",
@@ -60,6 +71,10 @@ test("buildDirectRequestFromOpenAi maps tools into declarations", () => {
 
   assert.equal(request.requestBody.tools[0].name, "lookup_weather");
   assert.match(request.requestBody.tools[0].parameters_json, /city/);
+  assert.deepEqual(request.requestBody.thinking, {
+    type: "enabled",
+    budget_tokens: 800
+  });
 });
 
 test("UpstreamHttpError preserves upstream status and sanitizes token", async () => {

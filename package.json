@@ -15,7 +15,7 @@
     "accounts:activate": "node scripts/accounts.js activate",
     "accounts:validate": "node scripts/accounts.js validate",
     "start": "node src/start.js",
-    "test": "node --test",
+    "test": "node --test test/**/*.test.js",
     "check": "node --check src/server.js && node --check src/runtime-config.js && node --check src/models.js && node --check src/request-defaults.js && node --check src/response-cache.js && node --check src/tooling.js && node --check src/direct-llm.js && node --check src/gateway-auth.js && node --check src/gateway-manager.js && node --check src/debug-traces.js && node --check src/redaction.js && node --check src/routes/anthropic.js && node --check src/routes/openai.js && node --check src/routes/health.js && node --check src/routes/debug.js && node --check src/stream/anthropic-sse.js && node --check src/stream/openai-sse.js && node --check src/stream/responses-sse.js && node --check src/auth-state.js && node --check scripts/capture-token.js && node --check scripts/auth-relogin.js && node --check src/accounts-file.js && node --check src/routes/admin.js && node --check scripts/auth-state.js && node --check scripts/open-admin.js && node --check scripts/accounts.js && npm test",
     "manager:open": "node scripts/open-admin.js",
     "desktop:install": "npm --prefix desktop install",

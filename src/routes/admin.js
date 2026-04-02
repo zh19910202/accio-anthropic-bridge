@@ -7,7 +7,8 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 
 const { readJsonBody } = require("../middleware/body-parser");
-const { writeJson, writeSse, ADMIN_CORS_HEADERS } = require("../http");
+const { writeJson, writeSse, CORS_HEADERS } = require("../http");
+const { parseEnvValue } = require("../env-file");
 const { readAccioUtdid, extractCnaFromCookie, normalizeCookieHeader } = require("../discovery");
 const {
   buildGatewayAuthCallbackQuery,
@@ -16,7 +17,6 @@ const {
   refreshAuthPayloadViaUpstream,
   waitForGatewayAuthenticatedUser
 } = require("../gateway-auth");
-const { parseEnvValue } = require("../env-file");
 const {
   detectActiveStorage,
   readGatewayState,
@@ -33,9 +33,10 @@ const { maskToken } = require("../redaction");
 const log = require("../logger");
 
 const execFileAsync = promisify(execFile);
+const ADMIN_QUOTA_CACHE_TTL_MS = 30 * 1000;
+const adminQuotaCache = new Map();
 
 const QUOTA_CACHE_TTL_MS = 15 * 1000;
-const QUOTA_CACHE_MAX = 64;
 const quotaCache = new Map();
 const SNAPSHOT_QUOTA_FILE = "quota-state.json";
 
@@ -90,6 +91,350 @@ function writeSnapshotQuotaState(snapshotDir, quota) {
   fs.writeFileSync(targetPath, JSON.stringify(quota, null, 2) + "\n", "utf8");
 }
 
+function buildQuotaErrorResult(error, fetchedAt = new Date().toISOString()) {
+  const message = error instanceof Error && error.message ? error.message : String(error || "unknown_quota_error");
+  return {
+    ok: false,
+    available: false,
+    source: "upstream-entitlement",
+    fetchedAt,
+    checkedAt: fetchedAt,
+    usagePercent: null,
+    refreshCountdownSeconds: null,
+    refreshAtMs: null,
+    refreshAt: null,
+    error: message
+  };
+}
+
+function isAuthPayloadExpiring(authPayload, windowMs = 60 * 1000) {
+  const expiresAtMs = Number(authPayload && authPayload.expiresAtMs || 0);
+  return Boolean(expiresAtMs && expiresAtMs <= Date.now() + Math.max(0, Number(windowMs || 0)));
+}
+
+function shouldRetryQuotaAfterRefresh(error) {
+  const status = Number(error && error.status || 0);
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return status === 401 || status === 403 || /unauthorized|forbidden|expired|invalid token|login/i.test(message);
+}
+
+function didAuthPayloadChange(previous, next) {
+  if (!previous || !next) {
+    return false;
+  }
+
+  return ["accessToken", "refreshToken", "expiresAtRaw", "expiresAtMs", "cookie"].some(
+    (key) => String(previous[key] || "") !== String(next[key] || "")
+  );
+}
+
+function quotaTokenFingerprint(authPayload) {
+  if (!authPayload || typeof authPayload !== "object") {
+    return "";
+  }
+
+  return String(authPayload.refreshToken || authPayload.accessToken || "");
+}
+
+function resolveQuotaExpectedUserId(snapshot, authPayload) {
+  return authPayload && authPayload.user && authPayload.user.id
+    ? String(authPayload.user.id)
+    : snapshot && snapshot.authPayloadUser && snapshot.authPayloadUser.id
+      ? String(snapshot.authPayloadUser.id)
+      : snapshot && snapshot.gatewayUser && snapshot.gatewayUser.id
+        ? String(snapshot.gatewayUser.id)
+        : "";
+}
+
+function readQuotaCache(alias, authPayload, options = {}) {
+  if (options.forceRefresh) {
+    return null;
+  }
+
+  const entry = adminQuotaCache.get(String(alias || ""));
+
+  if (!entry) {
+    return null;
+  }
+
+  if (Date.now() - entry.updatedAt > ADMIN_QUOTA_CACHE_TTL_MS) {
+    adminQuotaCache.delete(String(alias || ""));
+    return null;
+  }
+
+  if (entry.tokenFingerprint !== quotaTokenFingerprint(authPayload)) {
+    adminQuotaCache.delete(String(alias || ""));
+    return null;
+  }
+
+  return {
+    quota: entry.quota ? { ...entry.quota } : null,
+    authPayload: entry.authPayload ? { ...entry.authPayload } : authPayload || null
+  };
+}
+
+function writeQuotaCache(alias, authPayload, quota) {
+  adminQuotaCache.set(String(alias || ""), {
+    updatedAt: Date.now(),
+    tokenFingerprint: quotaTokenFingerprint(authPayload),
+    quota: quota ? { ...quota } : null,
+    authPayload: authPayload ? { ...authPayload } : null
+  });
+}
+
+function syncSnapshotAccountState(authProvider, snapshot) {
+  const accountState = snapshot && snapshot.accountState && snapshot.accountState.id
+    ? { ...snapshot.accountState }
+    : null;
+
+  if (!authProvider || !accountState) {
+    return snapshot;
+  }
+
+  const quota = snapshot && snapshot.quota ? snapshot.quota : null;
+
+  if (
+    quota &&
+    quota.available &&
+    typeof quota.usagePercent === "number" &&
+    quota.usagePercent >= 100 &&
+    typeof quota.refreshCountdownSeconds === "number"
+  ) {
+    const checkedAtMs = Date.parse(quota.checkedAt || quota.fetchedAt || "") || Date.now();
+    const refreshUntilMs = checkedAtMs + Math.max(0, Number(quota.refreshCountdownSeconds)) * 1000;
+    const currentInvalidUntil = authProvider.getInvalidUntil(accountState.id) || 0;
+
+    if (refreshUntilMs > currentInvalidUntil && typeof authProvider.invalidateAccountUntil === "function") {
+      authProvider.invalidateAccountUntil(accountState.id, refreshUntilMs, "quota refresh pending");
+    }
+  } else if (quota && quota.available) {
+    const lastFailure = authProvider.getLastFailure(accountState.id) || accountState.lastFailure || null;
+
+    if (typeof authProvider.clearInvalidation === "function") {
+      authProvider.clearInvalidation(accountState.id);
+    }
+
+    if (
+      lastFailure &&
+      isQuotaPendingFailure(lastFailure.reason) &&
+      typeof authProvider.clearFailure === "function"
+    ) {
+      authProvider.clearFailure(accountState.id);
+    }
+  }
+
+  return {
+    ...snapshot,
+    accountState: {
+      ...accountState,
+      invalidUntil: authProvider.getInvalidUntil(accountState.id) || 0,
+      lastFailure: authProvider.getLastFailure(accountState.id) || null
+    }
+  };
+}
+
+async function resolveSnapshotQuotaForAdmin(config, snapshot, authPayload, options = {}) {
+  const snapshotDir = snapshot && snapshot.dir ? snapshot.dir : "";
+  const isCurrentGatewayAccount = options && options.isCurrentGatewayAccount === true;
+
+  if (!isCurrentGatewayAccount) {
+    const persisted = readSnapshotQuotaState(snapshotDir);
+    if (persisted) {
+      return {
+        ...persisted,
+        stale: true
+      };
+    }
+  }
+
+  const resolved = await fetchSnapshotQuota(config, snapshot, authPayload, options);
+  const quota = resolved && resolved.quota ? resolved.quota : buildQuotaErrorResult("missing_quota_result");
+
+  if (snapshotDir && quota && typeof quota === "object") {
+    writeSnapshotQuotaState(snapshotDir, {
+      ...quota,
+      stale: false
+    });
+  }
+
+  return {
+    ...quota,
+    stale: false
+  };
+}
+
+async function requestQuotaWithAccessToken(config, accessToken) {
+  const fetchedAtMs = Date.now();
+  const fetchedAt = new Date(fetchedAtMs).toISOString();
+  const quotaUrl = new URL("/api/entitlement/quota", deriveUpstreamGatewayBaseUrl(config));
+  const utdid = readAccioUtdid(config && config.accioHome);
+
+  quotaUrl.searchParams.set("accessToken", String(accessToken || ""));
+  if (utdid) {
+    quotaUrl.searchParams.set("utdid", utdid);
+  }
+
+  const response = await fetch(quotaUrl, {
+    signal: AbortSignal.timeout(10000)
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : {};
+
+  if (!response.ok || !payload || payload.success !== true || !payload.data) {
+    const message = payload && payload.message ? String(payload.message) : `HTTP ${response.status}`;
+    const error = new Error(`Quota request failed: ${message}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+
+  const usagePercent = Number(payload.data.usagePercent);
+  const refreshCountdownSeconds = Number(payload.data.refreshCountdownSeconds);
+  const refreshAtMs = Number.isFinite(refreshCountdownSeconds) && refreshCountdownSeconds >= 0
+    ? fetchedAtMs + refreshCountdownSeconds * 1000
+    : null;
+
+  return {
+    ok: true,
+    available: true,
+    source: "upstream-entitlement",
+    fetchedAt,
+    checkedAt: fetchedAt,
+    usagePercent: Number.isFinite(usagePercent) ? usagePercent : null,
+    refreshCountdownSeconds: Number.isFinite(refreshCountdownSeconds) ? refreshCountdownSeconds : null,
+    refreshAtMs,
+    refreshAt: refreshAtMs ? new Date(refreshAtMs).toISOString() : null,
+    error: null
+  };
+}
+
+async function fetchQuotaForAuthPayload(config, authPayload, context = {}) {
+  if (!authPayload || (!authPayload.accessToken && !authPayload.refreshToken)) {
+    return {
+      quota: buildQuotaErrorResult("missing_auth_payload"),
+      authPayload: authPayload || null
+    };
+  }
+
+  let effectiveAuthPayload = authPayload;
+  const expectedUserId = context.expectedUserId || "";
+  let refreshedForBinding = false;
+
+  if (effectiveAuthPayload.refreshToken) {
+    try {
+      effectiveAuthPayload = await refreshAuthPayloadViaUpstream(config, effectiveAuthPayload, context);
+      refreshedForBinding = true;
+    } catch (error) {
+      return {
+        quota: buildQuotaErrorResult(error),
+        authPayload: effectiveAuthPayload
+      };
+    }
+  } else if (isAuthPayloadExpiring(effectiveAuthPayload)) {
+    return {
+      quota: buildQuotaErrorResult("missing_refresh_token_for_quota_binding"),
+      authPayload: effectiveAuthPayload
+    };
+  }
+
+  try {
+    return {
+      quota: {
+        ...(await requestQuotaWithAccessToken(config, effectiveAuthPayload.accessToken)),
+        expectedUserId: expectedUserId || null,
+        boundUserId: effectiveAuthPayload.refreshBoundUserId || expectedUserId || null
+      },
+      authPayload: effectiveAuthPayload
+    };
+  } catch (error) {
+    if (effectiveAuthPayload.refreshToken && (shouldRetryQuotaAfterRefresh(error) || !refreshedForBinding)) {
+      try {
+        effectiveAuthPayload = await refreshAuthPayloadViaUpstream(config, effectiveAuthPayload, context);
+        return {
+          quota: {
+            ...(await requestQuotaWithAccessToken(config, effectiveAuthPayload.accessToken)),
+            expectedUserId: expectedUserId || null,
+            boundUserId: effectiveAuthPayload.refreshBoundUserId || expectedUserId || null
+          },
+          authPayload: effectiveAuthPayload
+        };
+      } catch (refreshError) {
+        return {
+          quota: buildQuotaErrorResult(refreshError),
+          authPayload: effectiveAuthPayload
+        };
+      }
+    }
+
+    return {
+      quota: buildQuotaErrorResult(error),
+      authPayload: effectiveAuthPayload
+    };
+  }
+}
+
+async function fetchSnapshotQuota(config, snapshot, authPayload, options = {}) {
+  const normalizedAuthPayload = authPayload
+    ? {
+        ...authPayload,
+        user: authPayload.user || snapshot.authPayloadUser || snapshot.gatewayUser || null
+      }
+    : null;
+  const readOnlyCache = options && options.readOnlyCache === true;
+  const cached = readQuotaCache(snapshot.alias, normalizedAuthPayload, {
+    ...options,
+    forceRefresh: false
+  });
+
+  if (cached) {
+    return cached;
+  }
+
+  if (readOnlyCache) {
+    return {
+      quota: buildQuotaErrorResult("quota_not_refreshed_in_partial_update"),
+      authPayload: normalizedAuthPayload
+    };
+  }
+
+  const cachedForNormalFlow = readQuotaCache(snapshot.alias, normalizedAuthPayload, options);
+  if (cachedForNormalFlow) {
+    return cachedForNormalFlow;
+  }
+
+  const expectedUserId = resolveQuotaExpectedUserId(snapshot, normalizedAuthPayload);
+  const result = await fetchQuotaForAuthPayload(config, normalizedAuthPayload, {
+    alias: snapshot.alias,
+    expectedUserId,
+    previousUserId: expectedUserId || null,
+    forceRefresh: options.forceRefresh === true
+  });
+  const effectiveAuthPayload = result.authPayload
+    ? {
+        ...result.authPayload,
+        user: result.authPayload.user || snapshot.authPayloadUser || snapshot.gatewayUser || null
+      }
+    : normalizedAuthPayload;
+
+  if (effectiveAuthPayload && didAuthPayloadChange(normalizedAuthPayload, effectiveAuthPayload)) {
+    writeSnapshotAuthPayload(snapshot.alias, effectiveAuthPayload);
+    writeAccountToFile(config.accountsPath, snapshot.alias, effectiveAuthPayload.accessToken, {
+      user: effectiveAuthPayload.user || null,
+      expiresAtMs: effectiveAuthPayload.expiresAtMs,
+      expiresAtRaw: effectiveAuthPayload.expiresAtRaw,
+      source: effectiveAuthPayload.source || "upstream-refresh",
+      authPayload: effectiveAuthPayload
+    });
+  }
+
+  writeQuotaCache(snapshot.alias, effectiveAuthPayload, result.quota);
+
+  return {
+    quota: result.quota,
+    authPayload: effectiveAuthPayload
+  };
+}
+
 function quoteEnvValue(value) {
   const text = String(value == null ? "" : value);
   if (!text) {
@@ -138,13 +483,27 @@ function upsertEnvValues(filePath, values) {
 
 function getFallbackSettings(config) {
   const targets = normalizeFallbackTargets(config.fallbackTargets || []);
+  const primary = targets[0] || normalizeFallbackTarget({
+    baseUrl: config.fallbackOpenAiBaseUrl || "",
+    apiKey: config.fallbackOpenAiApiKey || "",
+    model: config.fallbackOpenAiModel || "",
+    protocol: config.fallbackOpenAiProtocol || "openai",
+    anthropicVersion: config.fallbackAnthropicVersion || "2023-06-01",
+    timeoutMs: Number(config.fallbackOpenAiTimeoutMs || 60000)
+  }, 0);
+
   return {
+    ...serializeFallbackTarget(primary),
     targets: targets.map((target) => serializeFallbackTarget(target))
   };
 }
 
 function applyFallbackSettings(config, fallbackPool, settings) {
-  const targets = normalizeFallbackTargets(Array.isArray(settings.targets) ? settings.targets : []);
+  const targets = normalizeFallbackTargets(
+    Array.isArray(settings.targets) && settings.targets.length > 0
+      ? settings.targets
+      : [settings]
+  );
   const primary = targets[0] || normalizeFallbackTarget({}, 0);
 
   config.fallbackTargets = targets;
@@ -167,7 +526,11 @@ function applyFallbackSettings(config, fallbackPool, settings) {
     fallbackPool.updateConfig({ targets });
   }
 
-  return { targets: targets.map((target) => serializeFallbackTarget(target)), normalizedTargets: targets };
+  return {
+    ...serializeFallbackTarget(primary),
+    targets: targets.map((target) => serializeFallbackTarget(target)),
+    normalizedTargets: targets
+  };
 }
 
 function escapeHtml(value) {
@@ -307,7 +670,7 @@ async function waitForGatewayReachable(baseUrl, waitMs = 20000, pollMs = 500) {
       return gateway;
     }
 
-    await delay(pollMs);
+    await delayMs(pollMs);
   }
 
   return lastGateway;
@@ -403,7 +766,7 @@ async function requestQuotaViaUpstream(config, authPayload) {
   }
 
   const upstreamBaseUrl = deriveUpstreamGatewayBaseUrl(config);
-  const utdid = readAccioUtdid(config.accioHome);
+  const utdid = readAccioUtdid(config && config.accioHome);
   const cna = extractCnaFromCookie(authPayload.cookie);
   const url = new URL("/api/entitlement/quota", upstreamBaseUrl);
   url.searchParams.set("accessToken", String(authPayload.accessToken));
@@ -418,7 +781,7 @@ async function requestQuotaViaUpstream(config, authPayload) {
       "x-app-version": "0.0.0",
       "x-os": process.platform,
       "x-cna": cna,
-      cookie: normalizeCookieHeader(authPayload.cookie),
+      ...(authPayload.cookie ? { cookie: normalizeCookieHeader(authPayload.cookie) } : {}),
       accept: "application/json, text/plain, */*"
     },
     signal: AbortSignal.timeout(8000)
@@ -528,84 +891,6 @@ async function resolveSnapshotQuota(config, snapshot, authPayload) {
     quotaCache.set(cacheKey, { at: Date.now(), value });
     return value;
   }
-}
-
-async function resolveSnapshotQuotaForAdmin(config, snapshot, authPayload, options = {}) {
-  const isCurrentGatewayAccount = options.isCurrentGatewayAccount === true;
-  const persistedQuota = readSnapshotQuotaState(snapshot && snapshot.dir ? snapshot.dir : null);
-
-  if (!isCurrentGatewayAccount) {
-    if (persistedQuota) {
-      return {
-        ...persistedQuota,
-        stale: true
-      };
-    }
-
-    return {
-      available: false,
-      usagePercent: null,
-      refreshCountdownSeconds: null,
-      checkedAt: null,
-      source: null,
-      error: "quota_unverified_for_inactive_account",
-      stale: true
-    };
-  }
-
-  const liveQuota = await resolveSnapshotQuota(config, snapshot, authPayload);
-  writeSnapshotQuotaState(snapshot && snapshot.dir ? snapshot.dir : null, {
-    ...liveQuota,
-    stale: false
-  });
-  return {
-    ...liveQuota,
-    stale: false
-  };
-}
-
-function syncSnapshotAccountState(authProvider, snapshot) {
-  const accountState = snapshot && snapshot.accountState ? snapshot.accountState : null;
-  const quota = snapshot && snapshot.quota ? snapshot.quota : null;
-
-  if (!accountState || !accountState.id) {
-    return snapshot;
-  }
-
-  if (
-    quota &&
-    quota.available &&
-    typeof quota.usagePercent === "number" &&
-    quota.usagePercent >= 100 &&
-    typeof quota.refreshCountdownSeconds === "number"
-  ) {
-    const checkedAtMs = Date.parse(quota.checkedAt || "") || Date.now();
-    const refreshUntilMs = checkedAtMs + Math.max(0, Number(quota.refreshCountdownSeconds)) * 1000;
-    const currentInvalidUntil = authProvider.getInvalidUntil(accountState.id) || 0;
-
-    if (refreshUntilMs > currentInvalidUntil) {
-      authProvider.invalidateAccountUntil(accountState.id, refreshUntilMs, "quota refresh pending");
-    }
-  } else if (
-    quota &&
-    quota.available &&
-    typeof quota.usagePercent === "number" &&
-    quota.usagePercent < 100
-  ) {
-    authProvider.clearInvalidation(accountState.id);
-    const lastFailure = authProvider.getLastFailure(accountState.id);
-    if (lastFailure && isQuotaPendingFailure(lastFailure.reason)) {
-      authProvider.clearFailure(accountState.id);
-    }
-  }
-
-  snapshot.accountState = {
-    ...accountState,
-    invalidUntil: authProvider.getInvalidUntil(accountState.id),
-    lastFailure: authProvider.getLastFailure(accountState.id) || null
-  };
-
-  return snapshot;
 }
 
 async function requestGatewayText(gatewayManager, pathname, options = {}) {
@@ -722,10 +1007,6 @@ async function openExternalUrl(url) {
     return false;
   }
 
-  if (!/^https?:\/\//i.test(target)) {
-    return false;
-  }
-
   if (process.platform === "darwin") {
     await execFileAsync("open", [target]);
     return true;
@@ -784,7 +1065,6 @@ async function requestDesktopHelperLaunch(config) {
 
 
 const ACCOUNT_LOGIN_FLOW_TTL_MS = 10 * 60 * 1000;
-const PENDING_ACCOUNT_LOGIN_MAX = 32;
 const pendingAccountLogins = new Map();
 
 function extractGatewayUserId(gateway) {
@@ -807,10 +1087,6 @@ function prunePendingAccountLogins(now = Date.now()) {
     if (now - flow.createdAtMs >= ACCOUNT_LOGIN_FLOW_TTL_MS) {
       pendingAccountLogins.delete(flowId);
     }
-  }
-  // Evict oldest if over limit
-  while (pendingAccountLogins.size > PENDING_ACCOUNT_LOGIN_MAX) {
-    pendingAccountLogins.delete(pendingAccountLogins.keys().next().value);
   }
 }
 
@@ -883,7 +1159,9 @@ function normalizeAccioProcessName(appPath) {
   return base.endsWith(".app") ? base.slice(0, -4) : base;
 }
 
-const { delay } = require("../utils");
+async function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function getGatewayPort(baseUrl) {
   try {
@@ -917,7 +1195,7 @@ async function stopAccioForSnapshot(config, processName) {
 
   if (process.platform === 'darwin') {
     await execFileAsync('osascript', ['-e', 'tell application id "com.accio.desktop" to quit']).catch(() => {});
-    await delay(800);
+    await delayMs(800);
     await execFileAsync('pkill', ['-x', processName]).catch(() => {});
     if (appContentsPrefix) {
       await execFileAsync('pkill', ['-f', appContentsPrefix]).catch(() => {});
@@ -952,7 +1230,7 @@ async function stopAccioForSnapshot(config, processName) {
       }
     }
 
-    await delay(400);
+    await delayMs(400);
   }
 
   log.warn('snapshot switch stop timed out', { baseUrl, processName, forced });
@@ -994,7 +1272,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
     preStopped: Boolean(stopResult)
   });
 
-  await delay(800);
+  await delayMs(800);
 
   try {
     await startAccioForSnapshot(config, processName);
@@ -1038,7 +1316,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
       desktopHelperLaunch = await requestDesktopHelperLaunch(config);
     }
 
-    await delay(500);
+    await delayMs(500);
   }
 
   log.warn("snapshot switch restart timed out", {
@@ -1051,12 +1329,15 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
 }
 
 
-async function buildAdminState(config, authProvider, directClient, recentActivityStore) {
+async function buildAdminState(config, authProvider, directClient = null, recentActivityStore = null, options = {}) {
   const gateway = await readGatewayState(config.baseUrl);
   const storage = detectActiveStorage();
   const configuredAccounts = authProvider.getConfiguredAccounts();
-  const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
-  const snapshotEntries = listSnapshots().map((entry) => {
+  const normalizedOptions = options && typeof options === "object" ? options : {};
+  const refreshAlias = normalizedOptions && normalizedOptions.alias ? String(normalizedOptions.alias).trim() : "";
+  const forceQuotaRefresh = Boolean(normalizedOptions && normalizedOptions.forceQuotaRefresh);
+  const partialQuotaRefresh = Boolean(forceQuotaRefresh && refreshAlias);
+  const snapshots = await Promise.all(listSnapshots().map(async (entry) => {
     const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
     const storedAuthPayload = resolvedAuth.payload;
     const canActivate = hasSnapshotArtifactState(entry);
@@ -1072,36 +1353,35 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
       hasStoredAuthCallback: Boolean(storedAuthPayload),
       hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
       authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
-      authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null)
+      authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null),
+      authPayloadSource: resolvedAuth.source || null
     };
     const matchedAccount = findMatchingConfiguredAccount(configuredAccounts, snapshotBase);
+    const quotaResult = await fetchSnapshotQuota(config, snapshotBase, storedAuthPayload, {
+      forceRefresh: forceQuotaRefresh && (!refreshAlias || refreshAlias === entry.alias),
+      readOnlyCache: partialQuotaRefresh && refreshAlias !== entry.alias
+    });
 
     return {
-      storedAuthPayload,
-      snapshot: {
-        ...snapshotBase,
-        accountState: matchedAccount
-          ? {
-              id: matchedAccount.id,
-              invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
-              lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
-            }
-          : null
-      }
+      ...snapshotBase,
+      authPayloadUser: quotaResult.authPayload && quotaResult.authPayload.user
+        ? quotaResult.authPayload.user
+        : snapshotBase.authPayloadUser,
+      authPayloadCapturedAt: quotaResult.authPayload && quotaResult.authPayload.capturedAt
+        ? quotaResult.authPayload.capturedAt
+        : snapshotBase.authPayloadCapturedAt,
+      quota: quotaResult.quota,
+      accountState: matchedAccount
+        ? {
+            id: matchedAccount.id,
+            invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
+            lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
+          }
+        : null
     };
-  });
-  const snapshots = await Promise.all(snapshotEntries.map(async ({ snapshot, storedAuthPayload }) => ({
-    ...snapshot,
-    quota: await resolveSnapshotQuotaForAdmin(config, snapshot, storedAuthPayload, {
-      isCurrentGatewayAccount: Boolean(
-        currentGatewayUserId &&
-        snapshot &&
-        snapshot.gatewayUser &&
-        String(snapshot.gatewayUser.id || "") === currentGatewayUserId
-      )
-    })
-  })));
+  }));
   const normalizedSnapshots = snapshots.map((snapshot) => syncSnapshotAccountState(authProvider, snapshot));
+  const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
   const currentSnapshots = currentGatewayUserId
     ? normalizedSnapshots.filter((snapshot) => snapshot.gatewayUser && String(snapshot.gatewayUser.id || "") === currentGatewayUserId)
     : [];
@@ -1146,9 +1426,10 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
       envPath: config.envPath || path.join(process.cwd(), ".env")
     },
     settings: {
-      fallbacks: getFallbackSettings(config)
+      fallbackOpenAi: getFallbackSettings(config)
     },
     gateway,
+    quota: currentSnapshot && currentSnapshot.quota ? currentSnapshot.quota : null,
     storage,
     snapshots: normalizedSnapshots,
     currentSnapshot,
@@ -1175,7 +1456,7 @@ async function buildAdminState(config, authProvider, directClient, recentActivit
 
 function writeHtml(res, statusCode, html) {
   res.writeHead(statusCode, {
-    ...ADMIN_CORS_HEADERS,
+    ...CORS_HEADERS,
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(html)
   });
@@ -1256,9 +1537,7 @@ button { font: inherit; cursor: pointer; }
 .shell {
   width: min(1180px, calc(100vw - 32px));
   margin: 0 auto;
-  padding: 16px 0 16px;
-  display: grid;
-  gap: 20px;
+  padding: 12px 0 16px;
   animation: fadeSlideUp 0.5s ease-out;
 }
 
@@ -1385,6 +1664,125 @@ button { font: inherit; cursor: pointer; }
 .dot.good { background: var(--good); animation: pulse 2s ease-in-out infinite; }
 .dot.warn { background: var(--warn); animation: pulseWarn 2s ease-in-out infinite; }
 .dot.bad { background: var(--bad); }
+.quotaCard {
+  margin-top: 10px;
+  padding: 12px 12px 10px;
+  border-radius: 18px;
+  background: rgba(255,255,255,0.96);
+  border: 1px solid rgba(24,22,20,0.1);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 6px 18px rgba(56,40,28,0.06);
+}
+.quotaCard.is-empty {
+  background: rgba(255,255,255,0.82);
+}
+.quotaHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quotaActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.quotaRefreshBtn {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  font-size: 14px;
+}
+.quotaCard.quotaCardInline .quotaRefreshBtn {
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+}
+.quotaTitleWrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.quotaIcon {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid rgba(24,22,20,0.08);
+  background: rgba(24,22,20,0.03);
+  color: #4e4740;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.quotaTitle {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.quotaMeta {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.quotaProgress {
+  position: relative;
+  margin-top: 10px;
+  height: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background:
+    repeating-linear-gradient(90deg, rgba(24,22,20,0.08) 0 4px, transparent 4px 6px),
+    linear-gradient(180deg, rgba(24,22,20,0.03) 0%, rgba(24,22,20,0.06) 100%);
+}
+.quotaProgressFill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0%;
+  border-radius: inherit;
+  background:
+    repeating-linear-gradient(90deg, #1ec768 0 4px, transparent 4px 6px),
+    linear-gradient(90deg, #18b65c 0%, #35d77d 100%);
+  box-shadow: inset 0 0 0 1px rgba(16,128,64,0.08);
+  transition: width 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.quotaCard.is-empty .quotaProgressFill {
+  background:
+    repeating-linear-gradient(90deg, rgba(138,130,121,0.35) 0 4px, transparent 4px 6px),
+    linear-gradient(90deg, rgba(138,130,121,0.25) 0%, rgba(138,130,121,0.18) 100%);
+}
+.quotaCard.quotaCardInline {
+  margin-top: 12px;
+  padding: 10px 10px 8px;
+  border-radius: 16px;
+  background: rgba(250,248,245,0.9);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.7), 0 2px 10px rgba(56,40,28,0.04);
+}
+.item.current-item .quotaCard.quotaCardInline {
+  border-color: rgba(26,138,90,0.18);
+  background: linear-gradient(180deg, rgba(26,138,90,0.08) 0%, rgba(255,255,255,0.96) 100%);
+}
+.quotaCard.quotaCardInline .quotaTitle {
+  font-size: 12px;
+}
+.quotaCard.quotaCardInline .quotaMeta {
+  margin-top: 7px;
+}
+.kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 12px;
+}
 
 /* ── StatusBadge Quota Mode ── */
 .statusBadge {
@@ -1630,20 +2028,9 @@ button { font: inherit; cursor: pointer; }
 /* ── Section ── */
 .sectionHeader {
   display: flex;
-  align-items: center;
+  align-items: start;
+  justify-content: space-between;
   gap: 12px;
-  margin-bottom: 4px;
-}
-.sectionHeader > div:first-child {
-  flex: 1;
-  min-width: 0;
-}
-.sectionHeader > .btn {
-  flex: 0 0 auto;
-  width: auto;
-  white-space: nowrap;
-  align-self: flex-start;
-  margin-top: 2px;
 }
 
 /* ── Snapshot List ── */
@@ -1790,25 +2177,16 @@ button { font: inherit; cursor: pointer; }
 .sideNotes {
   display: grid;
   gap: 6px;
+  margin-top: 10px;
 }
 .note {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 9px 12px;
+  padding: 7px 10px;
   border-radius: var(--radius-sm);
   background: rgba(24,22,20,0.04);
-  color: var(--ink-secondary);
-  font-size: 11.5px;
-  line-height: 1.55;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
   border-left: 3px solid var(--line-strong);
-}
-.note code {
-  font-family: ui-monospace, "SF Mono", monospace;
-  font-size: 10.5px;
-  background: rgba(24,22,20,0.08);
-  padding: 0 3px;
-  border-radius: 3px;
 }
 .note.note-info {
   border-left-color: var(--accent);
@@ -1817,13 +2195,11 @@ button { font: inherit; cursor: pointer; }
 }
 
 
+.pageHead,
 .pageHeadWrap {
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  display: flex;
-  justify-content: center;
-  padding: 10px 0 12px;
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
 }
 .tabbar {
   display: inline-flex;
@@ -1980,165 +2356,10 @@ button { font: inherit; cursor: pointer; }
   gap: 16px;
   max-width: 920px;
 }
-.settingsToolbar {
-  display: flex;
-  justify-content: flex-start;
-}
 .settingsGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-.fallbackTargets {
-  display: grid;
-  gap: 12px;
-}
-.fallbackCard {
-  display: grid;
-  gap: 0;
-  border-radius: 16px;
-  border: 1px solid var(--line);
-  background: rgba(255,255,255,0.82);
-  box-shadow: var(--shadow-sm);
-  overflow: hidden;
-  transition: box-shadow 160ms ease, border-color 160ms ease;
-}
-.fallbackCard:hover {
-  box-shadow: var(--shadow-md);
-  border-color: var(--line-strong);
-}
-.fallbackCardHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 14px 16px;
-  background: linear-gradient(to right, rgba(194,90,50,0.04), transparent);
-  border-bottom: 1px solid var(--line);
-}
-.fallbackCard[data-enabled="false"] .fallbackCardHeader {
-  background: linear-gradient(to right, rgba(24,22,20,0.03), transparent);
-}
-.fallbackCardTitle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.fallbackCardIndex {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.fallbackCard[data-enabled="false"] .fallbackCardIndex {
-  background: var(--muted);
-}
-.fallbackCardTitle strong {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--ink);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 180px;
-}
-.fallbackCardMeta {
-  font-size: 11px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-.fallbackCardActions {
-  display: flex;
-  gap: 6px;
-  flex-wrap: nowrap;
-  flex-shrink: 0;
-}
-.fallbackCardActions .btn {
-  width: auto;
-  padding: 5px 10px;
-  font-size: 12px;
-  height: auto;
-}
-.fallbackCardBody {
-  padding: 16px;
-  overflow: hidden;
-}
-.fallbackCard[data-collapsed="true"] .fallbackCardBody {
-  display: none;
-}
-/* 折叠按钮 */
-.fallbackCollapseBtn {
-  background: none;
-  border: none;
-  padding: 0 6px;
-  cursor: pointer;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: transform 200ms ease, color 200ms ease;
-  flex-shrink: 0;
-}
-.fallbackCollapseBtn:hover {
-  color: var(--ink);
-}
-.fallbackCard[data-collapsed="true"] .fallbackCollapseBtn {
-  transform: rotate(-90deg);
-}
-/* iOS-style toggle switch */
-.toggleRow {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  cursor: pointer;
-  user-select: none;
-  color: var(--ink-secondary);
-  font-size: 12px;
-  font-weight: 500;
-}
-.toggleRow input[type="checkbox"] {
-  appearance: none;
-  -webkit-appearance: none;
-  width: 28px;
-  height: 16px;
-  border-radius: 999px;
-  background: rgba(24,22,20,0.18);
-  border: none;
-  cursor: pointer;
-  position: relative;
-  flex-shrink: 0;
-  transition: background 200ms ease;
-  margin: 0;
-}
-.toggleRow input[type="checkbox"]::after {
-  content: '';
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #fff;
-  top: 2px;
-  left: 2px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
-  transition: transform 200ms cubic-bezier(0.4,0,0.2,1);
-}
-.toggleRow input[type="checkbox"]:checked {
-  background: var(--good);
-}
-.toggleRow input[type="checkbox"]:checked::after {
-  transform: translateX(12px);
+  gap: 14px;
 }
 .field {
   display: grid;
@@ -2224,92 +2445,34 @@ button { font: inherit; cursor: pointer; }
   color: var(--muted);
   line-height: 1.5;
 }
-.settingsTips {
-  display: grid;
-  gap: 0;
-  border-radius: 12px;
-  border: 1px solid var(--line);
-  overflow: hidden;
-  background: rgba(255,255,255,0.55);
-}
-.settingsTip {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 10px 14px;
-  font-size: 12px;
-  color: var(--ink-secondary);
-  line-height: 1.55;
-  border-bottom: 1px solid var(--line);
-}
-.settingsTip:last-child { border-bottom: none; }
-.settingsTip code {
-  font-family: ui-monospace, "SF Mono", monospace;
-  font-size: 11px;
-  background: rgba(24,22,20,0.07);
-  padding: 0 4px;
-  border-radius: 4px;
-}
-.settingsTipIcon {
-  flex-shrink: 0;
-  font-size: 14px;
-  line-height: 1.6;
-}
-.settingsFooter {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
 .settingsActions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 10px;
-}
-.settingsActions .btn {
-  width: auto;
-  flex-shrink: 0;
-}
-.settingsActions .message {
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-  margin-right: auto;
+  flex-wrap: wrap;
 }
 .settingsMeta {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .miniStat {
-  padding: 10px 14px;
-  border-radius: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
   background: rgba(255,255,255,0.72);
   border: 1px solid var(--line);
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
-.miniStatIcon {
-  font-size: 16px;
-  flex-shrink: 0;
-  opacity: 0.6;
-}
-.miniStatBody { min-width: 0; }
 .miniStatLabel {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--muted);
   text-transform: uppercase;
-  letter-spacing: 0.07em;
+  letter-spacing: 0.06em;
 }
 .miniStatValue {
-  margin-top: 2px;
-  font-size: 13px;
-  font-weight: 600;
+  margin-top: 6px;
+  font-size: 15px;
+  font-weight: 700;
   color: var(--ink);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 @media (max-width: 720px) {
   .settingsGrid,
@@ -2404,48 +2567,63 @@ button { font: inherit; cursor: pointer; }
     <section class="panel settingsPanel">
       <div class="sectionHeader">
         <div>
-          <h2>\u5916\u90E8\u4E0A\u6E38\u6E20\u9053</h2>
-          <div class="panelSub">\u53F7\u6C60\u548C\u672C\u5730\u94FE\u8DEF\u5747\u4E0D\u53EF\u7528\u65F6\uFF0Cbridge \u4F1A\u6309\u4F18\u5148\u7EA7\u4F9D\u6B21\u5C1D\u8BD5\u4EE5\u4E0B\u5916\u90E8\u6E20\u9053\u3002\u652F\u6301 OpenAI compatible \u548C Anthropic Messages \u6DF7\u7528\u3002</div>
+          <h2>\u5916\u90E8\u4E0A\u6E38\u5140\u5E95</h2>
+          <div class="panelSub">\u5F53\u8D26\u53F7\u6C60\u548C\u672C\u5730\u94FE\u8DEF\u90FD\u4E0D\u53EF\u7528\u65F6\uFF0C\u53EF\u4EE5\u8F6C\u5411 OpenAI \u517C\u5BB9\u4E0A\u6E38\u6216 Anthropic Messages \u4E0A\u6E38\u3002Anthropic \u534F\u8BAE\u66F4\u9002\u5408 Claude Code \u8FD9\u7C7B\u539F\u751F\u5BA2\u6237\u7AEF\u3002</div>
         </div>
-        <button class="btn" id="add-fallback-target-btn">+ \u65B0\u589E\u6E20\u9053</button>
       </div>
-
+      <div class="settingsGrid">
+        <div class="field">
+          <label for="fallback-protocol">\u534F\u8BAE</label>
+          <select id="fallback-protocol">
+            <option value="openai">OpenAI compatible</option>
+            <option value="anthropic">Anthropic Messages</option>
+          </select>
+        </div>
+        <div class="field wide">
+          <label for="fallback-base-url">Base URL</label>
+          <input id="fallback-base-url" type="text" placeholder="https://your-upstream-host/v1" autocomplete="off" />
+          <div class="fieldHint">OpenAI \u534F\u8BAE\u901A\u5E38\u586B\u5230 /v1\uFF1BAnthropic \u534F\u8BAE\u586B\u5230\u63D0\u4F9B /messages \u7684\u6839\u524D\u7F00\uFF0C\u4F8B\u5982 https://api.anthropic.com/v1\u3002</div>
+        </div>
+        <div class="field wide">
+          <label for="fallback-api-key">API Key</label>
+          <div class="inputWrap">
+            <input id="fallback-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" />
+            <button class="inputToggle" id="fallback-api-key-toggle" type="button" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button>
+          </div>
+          <div class="fieldHint">\u4FDD\u5B58\u540E\u4F1A\u5199\u5165 bridge \u6839\u76EE\u5F55\u7684 .env\uFF0C\u5E76\u7ACB\u5373\u66F4\u65B0\u5F53\u524D\u8FDB\u7A0B\u5185\u7684\u5140\u5E95\u5BA2\u6237\u7AEF\u3002</div>
+        </div>
+        <div class="field">
+          <label for="fallback-model">Model</label>
+          <input id="fallback-model" type="text" placeholder="gpt-4.1-mini" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fallback-anthropic-version">Anthropic Version</label>
+          <input id="fallback-anthropic-version" type="text" placeholder="2023-06-01" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fallback-timeout-ms">Timeout (ms)</label>
+          <input id="fallback-timeout-ms" type="number" min="1000" step="1000" placeholder="60000" />
+        </div>
+      </div>
+      <div class="settingsActions">
+        <button class="btn primary" id="save-fallback-config-btn">\u4FDD\u5B58\u5140\u5E95\u914D\u7F6E</button>
+        <button class="btn" id="test-fallback-config-btn">\u6D4B\u8BD5\u8FDE\u63A5</button>
+        <button class="btn" id="reload-fallback-config-btn">\u91CD\u65B0\u8F7D\u5165</button>
+      </div>
+      <div id="config-message" class="message info"></div>
       <div class="settingsMeta">
         <div class="miniStat">
-          <span class="miniStatIcon">\uD83D\uDD17</span>
-          <div class="miniStatBody">
-            <div class="miniStatLabel">\u6E20\u9053\u6982\u89C8</div>
-            <div class="miniStatValue" id="fallback-status">\u672A\u914D\u7F6E</div>
-          </div>
+          <div class="miniStatLabel">\u5F53\u524D\u72B6\u6001</div>
+          <div class="miniStatValue" id="fallback-status">\u672A\u914D\u7F6E</div>
         </div>
         <div class="miniStat">
-          <span class="miniStatIcon">\uD83D\uDCC4</span>
-          <div class="miniStatBody">
-            <div class="miniStatLabel">\u5199\u5165\u6587\u4EF6</div>
-            <div class="miniStatValue" id="fallback-env-path">.env</div>
-          </div>
+          <div class="miniStatLabel">\u5199\u5165\u6587\u4EF6</div>
+          <div class="miniStatValue" id="fallback-env-path">.env</div>
         </div>
       </div>
-
-      <div class="fallbackTargets" id="fallback-targets"></div>
-      <div class="empty" id="fallback-empty" style="display:none"><span class="empty-icon">\uD83D\uDCE1</span>\u6682\u65E0\u5916\u90E8\u4E0A\u6E38\u6E20\u9053\u3002\u70B9\u51FB\u300C\u65B0\u589E\u6E20\u9053\u300D\u5F00\u59CB\u914D\u7F6E\u3002</div>
-
-      <div class="settingsFooter">
-        <div class="settingsActions">
-          <button class="btn primary" id="save-fallback-config-btn">\u4FDD\u5B58\u6E20\u9053\u914D\u7F6E</button>
-          <button class="btn" id="reload-fallback-config-btn">\u91CD\u65B0\u8F7D\u5165</button>
-          <div id="config-message" class="message info"></div>
-        </div>
-        <div class="settingsTips">
-          <div class="settingsTip"><span class="settingsTipIcon">\uD83D\uDCBE</span>\u4FDD\u5B58\u540E\u5199\u5165 bridge \u6839\u76EE\u5F55 .env\uFF0C\u5E76\u7ACB\u5373\u5E94\u7528\u5230\u5F53\u524D\u8FDB\u7A0B\u3002</div>
-          <div class="settingsTip"><span class="settingsTipIcon">\uD83D\uDD17</span>OpenAI \u534F\u8BAE\u586B\u5230 <code>/v1</code>\uFF1BAnthropic \u534F\u8BAE\u586B\u5230\u63D0\u4F9B <code>/messages</code> \u7684\u6839\u524D\u7F00\u3002</div>
-          <div class="settingsTip"><span class="settingsTipIcon">\uD83D\uDD3C</span>\u5217\u8868\u987A\u5E8F\u5C31\u662F\u5140\u5E95\u5C1D\u8BD5\u987A\u5E8F\uFF0C\u53EF\u7528\u300C\u4E0A\u79FB / \u4E0B\u79FB\u300D\u8C03\u6574\u3002</div>
-          <div class="settingsTip"><span class="settingsTipIcon">\u2728</span>Anthropic \u6E20\u9053\u9002\u5408 Claude Code \u7B49\u539F\u751F\u5BA2\u6237\u7AEF\u900F\u4F20\uFF0C\u8BED\u4E49\u4FDD\u7559\u66F4\u5B8C\u6574\u3002</div>
-        </div>
-        <div class="sideNotes">
-          <div class="note">\uD83D\uDEA8 \u4EC5\u5F53 direct-llm \u548C local-ws \u56E0 quota / auth / timeout / 5xx \u5931\u8D25\u65F6\uFF0Cbridge \u624D\u4F1A\u542F\u7528\u8FD9\u4E2A\u5140\u5E95\u4E0A\u6E38\u3002</div>
-          <div class="note">\uD83D\uDCA1 Anthropic \u6E20\u9053\u4F1A\u5C06 <code>/v1/messages</code> \u76F4\u63A5\u900F\u4F20\u5230\u5916\u90E8 Anthropic \u4E0A\u6E38\uFF0C\u5C3D\u91CF\u4FDD\u7559 Claude Code \u539F\u59CB\u8BF7\u6C42\u8BED\u4E49\u3002</div>
-        </div>
+      <div class="sideNotes">
+        <div class="note">\u5F53 direct-llm \u548C local-ws \u90FD\u56E0 quota/auth/timeout/5xx \u7C7B\u95EE\u9898\u5931\u8D25\u65F6\uFF0Cbridge \u624D\u4F1A\u4F7F\u7528\u8FD9\u4E2A\u5140\u5E95\u4E0A\u6E38\u3002</div>
+        <div class="note">\u5982\u679C\u8FD9\u91CC\u914D\u7F6E\u7684\u662F Anthropic \u534F\u8BAE\uFF0C<code>/v1/messages</code> \u4F1A\u76F4\u63A5\u900F\u4F20\u5230\u5916\u90E8 Anthropic \u4E0A\u6E38\uFF0C\u5C3D\u91CF\u4FDD\u7559 Claude Code \u7684\u539F\u59CB\u8BF7\u6C42\u8BED\u4E49\u3002</div>
       </div>
     </section>
   </section>
@@ -2487,11 +2665,16 @@ const els = {
   logoutBtn: document.getElementById('logout-btn'),
   accountLoginBtn: document.getElementById('account-login-btn'),
   snapshotBtn: document.getElementById('capture-current-btn'),
-  addFallbackTargetBtn: document.getElementById('add-fallback-target-btn'),
   saveFallbackConfigBtn: document.getElementById('save-fallback-config-btn'),
+  testFallbackConfigBtn: document.getElementById('test-fallback-config-btn'),
   reloadFallbackConfigBtn: document.getElementById('reload-fallback-config-btn'),
-  fallbackTargets: document.getElementById('fallback-targets'),
-  fallbackEmpty: document.getElementById('fallback-empty'),
+  fallbackProtocol: document.getElementById('fallback-protocol'),
+  fallbackBaseUrl: document.getElementById('fallback-base-url'),
+  fallbackApiKey: document.getElementById('fallback-api-key'),
+  fallbackApiKeyToggle: document.getElementById('fallback-api-key-toggle'),
+  fallbackModel: document.getElementById('fallback-model'),
+  fallbackAnthropicVersion: document.getElementById('fallback-anthropic-version'),
+  fallbackTimeoutMs: document.getElementById('fallback-timeout-ms'),
   fallbackStatus: document.getElementById('fallback-status'),
   fallbackEnvPath: document.getElementById('fallback-env-path'),
   refreshLogsBtn: document.getElementById('refresh-logs-btn'),
@@ -2511,6 +2694,7 @@ let configMessageTimer = null;
 let currentTab = 'accounts';
 let refreshInFlight = null;
 let stateStream = null;
+let currentState = null;
 let fallbackDraft = [];
 let logEntries = [];
 let logsLoaded = false;
@@ -2532,7 +2716,7 @@ function setScopedMessage(target, type, text, scope) {
   }
 
   target.className = 'message show ' + type;
-  target.innerHTML = '<span class="msg-icon">' + (MSG_ICONS[type] || '') + '</span><span class="msg-text">' + escapeInline(text) + '</span><button class="msg-close" onclick="' + (scope === 'config' ? 'clearConfigMessage()' : 'clearMessage()') + '">×</button>';
+  target.innerHTML = '<span class="msg-icon">' + (MSG_ICONS[type] || '') + '</span><span class="msg-text">' + text + '</span><button class="msg-close" onclick="' + (scope === 'config' ? 'clearConfigMessage()' : 'clearMessage()') + '">×</button>';
   if (type === 'ok') {
     const timer = setTimeout(function() { scope === 'config' ? clearConfigMessage() : clearMessage(); }, 6000);
     if (scope === 'config') {
@@ -2595,6 +2779,88 @@ async function api(path, options = {}) {
 function formatTime(value) {
   if (!value) return '—';
   try { return new Date(value).toLocaleString(); } catch { return String(value); }
+}
+function formatDurationFromSeconds(value) {
+  const totalSeconds = Number(value);
+  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '—';
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  const parts = [];
+  if (days > 0) parts.push(days + '天');
+  if (hours > 0 || parts.length > 0) parts.push(hours + '时');
+  if (minutes > 0 || parts.length > 0) parts.push(minutes + '分');
+  parts.push(seconds + '秒');
+  return parts.join(' ');
+}
+function escapeText(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatQuotaCountdown(quota) {
+  if (!quota || (!quota.ok && !quota.available)) return quota && quota.error ? '获取失败' : '—';
+  return formatDurationFromSeconds(quota.refreshCountdownSeconds);
+}
+function quotaUsagePercentNumber(quota) {
+  const usagePercent = Number(quota && quota.usagePercent);
+  if (!Number.isFinite(usagePercent)) return null;
+  return Math.max(0, Math.min(100, usagePercent));
+}
+function describeQuotaError(quota) {
+  const error = quota && quota.error ? String(quota.error) : '';
+  if (!error) return '缺少可用凭证或上游暂不可用';
+  if (error === 'missing_auth_payload') return '当前账号没有可用的完整凭证';
+  if (error === 'missing_refresh_token_for_quota_binding') return '当前账号缺少刷新凭证，无法在直连模式下精确同步额度';
+  if (/401|403|unauthorized|forbidden|invalid token/i.test(error)) return '凭证已失效或未获授权';
+  if (/upstream refresh failed|refresh/i.test(error)) return '凭证刷新失败，暂时无法同步额度';
+  if (/429|quota|rate limit/i.test(error)) return '上游返回额度限制，请稍后再试';
+  return error;
+}
+function buildQuotaCardMarkup(quota, alias) {
+  const usagePercent = quotaUsagePercentNumber(quota);
+  const hasQuota = Boolean(quota && (quota.ok || quota.available) && usagePercent != null);
+  const remainingPercent = hasQuota ? Math.max(0, 100 - usagePercent) : 0;
+  const metaParts = [];
+  const refreshButton = alias
+    ? ('<div class="quotaActions"><button class="btn-icon quotaRefreshBtn" data-refresh-quota="' + escapeText(alias) + '" title="刷新该账号额度">↻</button></div>')
+    : '';
+
+  if (hasQuota && Number.isFinite(Number(quota.refreshCountdownSeconds))) {
+    metaParts.push('约 ' + formatQuotaCountdown(quota) + ' 后重置');
+  }
+
+  if (hasQuota && (quota.refreshAtMs || quota.refreshAt)) {
+    metaParts.push(formatTime(quota.refreshAtMs || quota.refreshAt) + ' 重置');
+  }
+
+  if (quota && quota.fetchedAt) {
+    metaParts.push('同步于 ' + formatTime(quota.fetchedAt));
+  }
+
+  const title = hasQuota
+    ? ('额度已使用 ' + usagePercent.toFixed(2) + ' %')
+    : '额度信息暂不可用';
+  const metaText = hasQuota
+    ? (metaParts.join(' · ') || '额度信息已同步')
+    : describeQuotaError(quota);
+
+  return '<div class="quotaCard quotaCardInline' + (hasQuota ? '' : ' is-empty') + '">'
+    + '<div class="quotaHead">'
+    + '<div class="quotaTitleWrap">'
+    + '<span class="quotaIcon">%</span>'
+    + '<span class="quotaTitle">' + escapeText(title) + '</span>'
+    + '</div>'
+    + refreshButton
+    + '</div>'
+    + '<div class="quotaProgress" aria-hidden="true"><div class="quotaProgressFill" style="width:' + remainingPercent.toFixed(2) + '%"></div></div>'
+    + '<div class="quotaMeta">' + escapeText(metaText) + '</div>'
+    + '</div>';
 }
 function badgeState(gateway) {
   if (!gateway || !gateway.reachable) return ['bad', '网关不可达'];
@@ -2792,7 +3058,7 @@ function describeRecentAuthCompact(activity) {
   return transport;
 }
 function renderKv(target, rows) {
-  const fullWidthKeys = new Set(['账号文件', '当前快照', '运行环境']);
+  const fullWidthKeys = new Set(['账号文件', '当前快照', '运行环境', '账号池', '最近请求']);
   target.innerHTML = rows.map(([k, v]) => {
     const key = String(k || '');
     const value = String(v || '—');
@@ -3100,14 +3366,18 @@ function renderFallbackTargets() {
   }).join('');
 }
 function renderSettings(data) {
-  const targets = data && data.settings && data.settings.fallbacks && Array.isArray(data.settings.fallbacks.targets)
-    ? data.settings.fallbacks.targets
-    : [];
-  fallbackDraft = targets.map((target, index) => normalizeFallbackDraftTarget(target, index));
-  renderFallbackTargets();
-  const enabledTargets = fallbackDraft.filter((target) => target.enabled !== false && target.baseUrl && target.apiKey && target.model);
-  if (els.fallbackStatus) els.fallbackStatus.textContent = enabledTargets.length > 0
-    ? ('已配置 ' + enabledTargets.length + ' 条 · 首选 ' + (enabledTargets[0].name || enabledTargets[0].model || 'external-upstream'))
+  const settings = data && data.settings && data.settings.fallbackOpenAi ? data.settings.fallbackOpenAi : {};
+  const configured = Boolean(settings.baseUrl && settings.apiKey && settings.model);
+  const protocol = settings.protocol === 'anthropic' ? 'anthropic' : 'openai';
+
+  if (els.fallbackProtocol) els.fallbackProtocol.value = protocol;
+  if (els.fallbackBaseUrl) els.fallbackBaseUrl.value = settings.baseUrl || '';
+  if (els.fallbackApiKey) els.fallbackApiKey.value = settings.apiKey || '';
+  if (els.fallbackModel) els.fallbackModel.value = settings.model || '';
+  if (els.fallbackAnthropicVersion) els.fallbackAnthropicVersion.value = settings.anthropicVersion || '2023-06-01';
+  if (els.fallbackTimeoutMs) els.fallbackTimeoutMs.value = settings.timeoutMs ? String(settings.timeoutMs) : '60000';
+  if (els.fallbackStatus) els.fallbackStatus.textContent = configured
+    ? ('已配置 · ' + (protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') + ' · ' + (settings.model || 'external-upstream'))
     : '未配置';
   if (els.fallbackEnvPath) els.fallbackEnvPath.textContent = data && data.bridge && data.bridge.envPath ? data.bridge.envPath : '.env';
 }
@@ -3129,8 +3399,9 @@ function renderSnapshots(data) {
   }
 
   els.snapshotList.innerHTML = snapshots.map((item) => {
-    const userId = item.gatewayUser && item.gatewayUser.id ? String(item.gatewayUser.id) : '';
-    const userName = item.gatewayUser && item.gatewayUser.name ? String(item.gatewayUser.name) : '';
+    const user = item.authPayloadUser || item.gatewayUser || null;
+    const userId = user && user.id ? String(user.id) : '';
+    const userName = user && user.name ? String(user.name) : '';
     const displayName = userName || userId || item.alias;
     const subLabel = userName && userId ? userId : (userName ? '' : '');
     const avatarChar = displayName ? displayName.charAt(0).toUpperCase() : '?';
@@ -3141,19 +3412,6 @@ function renderSnapshots(data) {
       : (!item.hasFullAuthState ? '<span class="pill warn">旧快照</span>' : '<span class="pill warn">仅文件</span>');
     const canActivate = item.canActivate !== false;
     const quota = item.quota || null;
-    const quotaStatus = quota && quota.available && typeof quota.usagePercent === 'number'
-      ? ('已用 ' + Math.round(quota.usagePercent) + '%')
-      : (quota && quota.error === 'missing_auth_payload'
-        ? '未知（缺少完整凭证）'
-        : (quota && quota.error === 'quota_unverified_for_inactive_account'
-          ? '待验证'
-          : '未知'));
-    const refreshStatus = quota && quota.available && typeof quota.refreshCountdownSeconds === 'number'
-      ? formatCountdown(quota.refreshCountdownSeconds)
-      : '未知';
-    const quotaMeta = quota && quota.checkedAt
-      ? ((quota.stale ? '上次确认：' : '实时更新：') + formatTime(quota.checkedAt))
-      : (quota && quota.stale ? '未切换到该账号，未做实时查询' : '');
     const accountState = item.accountState || null;
     const cooling = accountState && typeof accountState.invalidUntil === 'number' && accountState.invalidUntil > Date.now();
     const cooldownSeconds = cooling ? Math.max(0, Math.ceil((accountState.invalidUntil - Date.now()) / 1000)) : 0;
@@ -3181,9 +3439,7 @@ function renderSnapshots(data) {
       + (subLabel ? '<div class="itemMeta">' + subLabel + '</div>' : '')
       + '<div class="itemMeta">' + item.alias + '</div>'
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
-      + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
-      + '<div class="itemMeta">刷新时间：' + refreshStatus + '</div>'
-      + (quotaMeta ? '<div class="itemMeta hint">' + quotaMeta + '</div>' : '')
+      + buildQuotaCardMarkup(item.quota, item.alias)
       + '<div class="itemMeta">等待区：' + standbyStatus + '</div>'
       + (standbyMeta ? '<div class="itemMeta hint">' + standbyMeta + '</div>' : '')
       + (cooling ? '<div class="itemMeta">恢复时间：' + formatTime(accountState.invalidUntil) + '</div>' : '')
@@ -3233,6 +3489,7 @@ function renderQuotaBar(data) {
   badge.classList.add('quota-active');
 }
 function renderState(data, options = {}) {
+  currentState = data || null;
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
   const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
   const [, gatewaySummary] = badgeState(data.gateway);
@@ -3243,8 +3500,11 @@ function renderState(data, options = {}) {
     ['最近请求', describeRecentActivityCompact(recentActivity)],
     ['等待区', describeStandbyCompact(data)],
     ['当前网关', describeGatewayCompact(data.gateway)],
-    ['快照数量', describeAccountsCompact(data)],
-    ['本地存储', describeRuntimeCompact(data)]
+    ['当前快照', describeSnapshotCompact(data.currentSnapshot)],
+    ['账号池', describeAuthPoolCompact(data)],
+    ['最近鉴权', describeRecentAuthCompact(recentActivity)],
+    ['运行环境', describeRuntimeCompact(data)],
+    ['快照数量', describeAccountsCompact(data)]
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
@@ -3252,12 +3512,58 @@ function renderState(data, options = {}) {
     renderSettings(data);
   }
 }
-async function refreshState(message) {
+function mergeRefreshedSnapshotState(payload, alias) {
+  if (!payload || !alias || !currentState || !Array.isArray(currentState.snapshots)) {
+    return payload;
+  }
+
+  const refreshedSnapshots = Array.isArray(payload.snapshots) ? payload.snapshots : [];
+  const refreshedSnapshot = refreshedSnapshots.find((item) => item && item.alias === alias);
+
+  if (!refreshedSnapshot) {
+    return payload;
+  }
+
+  const nextSnapshots = currentState.snapshots.map((item) => {
+    if (!item || item.alias !== alias) {
+      return item;
+    }
+
+    return {
+      ...item,
+      ...refreshedSnapshot,
+      quota: refreshedSnapshot.quota != null ? refreshedSnapshot.quota : item.quota,
+      authPayloadUser: refreshedSnapshot.authPayloadUser || item.authPayloadUser,
+      authPayloadCapturedAt: refreshedSnapshot.authPayloadCapturedAt || item.authPayloadCapturedAt
+    };
+  });
+
+  const nextCurrentSnapshot = currentState.currentSnapshot && currentState.currentSnapshot.alias === alias
+    ? (nextSnapshots.find((item) => item && item.alias === alias) || currentState.currentSnapshot)
+    : currentState.currentSnapshot;
+
+  return {
+    ...currentState,
+    ...payload,
+    snapshots: nextSnapshots,
+    currentSnapshot: nextCurrentSnapshot,
+    quota: nextCurrentSnapshot && nextCurrentSnapshot.quota ? nextCurrentSnapshot.quota : currentState.quota
+  };
+}
+async function refreshState(message, options = {}) {
   if (!refreshInFlight) {
     refreshInFlight = (async () => {
-      const payload = await api('/admin/api/state?fresh=1');
-      renderState(payload);
-      return payload;
+      const payload = options && options.forceQuotaRefresh
+        ? await api('/admin/api/quotas/refresh', {
+            method: 'POST',
+            body: options.alias ? { alias: options.alias } : {}
+          })
+        : await api('/admin/api/state?fresh=1');
+      const nextState = options && options.forceQuotaRefresh && options.alias
+        ? mergeRefreshedSnapshotState(payload, options.alias)
+        : payload;
+      renderState(nextState);
+      return nextState;
     })();
   }
 
@@ -3274,6 +3580,11 @@ async function withAction(button, fn) {
   button.disabled = true;
   button.classList.add('loading');
   try { await fn(); } finally { button.disabled = false; button.classList.remove('loading'); button.textContent = prev; }
+}
+async function withIconAction(button, fn) {
+  button.disabled = true;
+  button.classList.add('spinning');
+  try { await fn(); } finally { button.disabled = false; button.classList.remove('spinning'); }
 }
 
 async function sendDesktopCommand(command, params = {}) {
@@ -3423,10 +3734,14 @@ function connectStateStream() {
 }
 
 els.refreshBtn.addEventListener('click', async () => {
-  els.refreshBtn.classList.add('spinning');
   clearMessage();
-  try { await refreshState('界面状态已刷新。'); } catch (e) { setMessage('error', e.message || String(e)); }
-  els.refreshBtn.classList.remove('spinning');
+  try {
+    await withIconAction(els.refreshBtn, async () => {
+      await refreshState('已强制刷新所有账号额度。', { forceQuotaRefresh: true });
+    });
+  } catch (e) {
+    setMessage('error', e.message || String(e));
+  }
 });
 if (els.refreshLogsBtn) {
   els.refreshLogsBtn.addEventListener('click', () => withAction(els.refreshLogsBtn, async () => {
@@ -3480,6 +3795,20 @@ els.accountLoginBtn.addEventListener('click', async () => {
   }
 });
 document.addEventListener('click', async (event) => {
+  const refreshQuota = event.target.closest('[data-refresh-quota]');
+  if (refreshQuota) {
+    const alias = refreshQuota.getAttribute('data-refresh-quota');
+    try {
+      await withIconAction(refreshQuota, async () => {
+        clearMessage();
+        await refreshState('已刷新账号额度：' + alias, { forceQuotaRefresh: true, alias });
+      });
+    } catch (error) {
+      setMessage('error', error && error.message ? error.message : String(error));
+    }
+    return;
+  }
+
   const activate = event.target.closest('[data-activate-snapshot]');
   if (activate) {
     const alias = activate.getAttribute('data-activate-snapshot');
@@ -3546,28 +3875,47 @@ document.addEventListener('click', async (event) => {
     }
   }, 3000);
 });
-if (els.addFallbackTargetBtn) {
-  els.addFallbackTargetBtn.addEventListener('click', () => {
-    fallbackDraft = collectFallbackDraft();
-    fallbackDraft.push(createFallbackDraftTarget(fallbackDraft.length));
-    renderFallbackTargets();
-  });
-}
-
 if (els.saveFallbackConfigBtn) {
   els.saveFallbackConfigBtn.addEventListener('click', () => withAction(els.saveFallbackConfigBtn, async () => {
     clearConfigMessage();
-    fallbackDraft = collectFallbackDraft();
     const payload = await api('/admin/api/config', {
       method: 'POST',
       body: {
-        fallbacks: {
-          targets: fallbackDraft
+        fallbackOpenAi: {
+          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
+          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
+          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
+          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
+          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
+          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
         }
       }
     });
     renderSettings({ settings: payload.settings, bridge: payload.bridge });
-    setConfigMessage('ok', '多渠道上游配置已保存并立即生效。');
+    setConfigMessage('ok', '外部上游兜底配置已保存并立即生效。');
+  }));
+}
+
+if (els.testFallbackConfigBtn) {
+  els.testFallbackConfigBtn.addEventListener('click', () => withAction(els.testFallbackConfigBtn, async () => {
+    clearConfigMessage();
+    const payload = await api('/admin/api/config/test', {
+      method: 'POST',
+      body: {
+        fallbackOpenAi: {
+          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
+          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
+          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
+          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
+          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
+          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
+        }
+      }
+    });
+
+    const result = payload && payload.result ? payload.result : {};
+    const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
+    setConfigMessage('ok', '连接成功：' + (result.protocol || 'unknown') + ' · ' + (result.model || 'unknown') + preview);
   }));
 }
 
@@ -3576,139 +3924,17 @@ if (els.reloadFallbackConfigBtn) {
     clearConfigMessage();
     const payload = await api('/admin/api/config');
     renderSettings({ settings: payload.settings, bridge: payload.bridge });
-    setConfigMessage('info', '已重新载入当前多渠道配置。');
+    setConfigMessage('info', '已重新载入当前兜底配置。');
   }));
 }
 
-if (els.fallbackTargets) {
-  els.fallbackTargets.addEventListener('click', async (event) => {
-    // 折叠/展开（按钮或整个 header 点击）
-    const collapseBtn = event.target.closest('[data-collapse-fallback]');
-    const collapseHeader = !collapseBtn && event.target.closest('[data-toggle-collapse]');
-    if (collapseBtn || collapseHeader) {
-      // 如果是 header 点击但点到了 action 按钮区域，不触发折叠
-      if (collapseHeader && event.target.closest('.fallbackCardActions')) {
-        // fall through
-      } else {
-        const card = (collapseBtn || collapseHeader).closest('[data-fallback-item]');
-        if (card) {
-          const isCollapsed = card.getAttribute('data-collapsed') === 'true';
-          card.setAttribute('data-collapsed', isCollapsed ? 'false' : 'true');
-        }
-        if (collapseBtn) return;
-      }
-    }
-
-    const toggle = event.target.closest('[data-toggle-secret]');
-    if (toggle) {
-      const input = toggle.closest('.inputWrap') ? toggle.closest('.inputWrap').querySelector('input[data-field="apiKey"]') : null;
-      if (input) {
-        const nextVisible = input.type === 'password';
-        input.type = nextVisible ? 'text' : 'password';
-        toggle.textContent = nextVisible ? '🙈' : '👁';
-        toggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
-        toggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
-      }
-      return;
-    }
-
-    const remove = event.target.closest('[data-delete-fallback]');
-    if (remove) {
-      const targetId = remove.getAttribute('data-delete-fallback');
-      if (remove.dataset.confirmDeleteFallback) {
-        delete remove.dataset.confirmDeleteFallback;
-        fallbackDraft = collectFallbackDraft().filter((target) => target.id !== targetId);
-        renderFallbackTargets();
-        setConfigMessage('ok', '已删除上游渠道。记得保存配置以生效。');
-        return;
-      }
-
-      remove.dataset.confirmDeleteFallback = '1';
-      const prevText = remove.textContent;
-      remove.textContent = '确认删除？';
-      remove.classList.add('danger-confirm');
-      setTimeout(() => {
-        if (remove.dataset.confirmDeleteFallback) {
-          delete remove.dataset.confirmDeleteFallback;
-          remove.textContent = prevText;
-          remove.classList.remove('danger-confirm');
-        }
-      }, 3000);
-      return;
-    }
-
-    const moveUp = event.target.closest('[data-move-up-fallback]');
-    if (moveUp) {
-      const id = moveUp.getAttribute('data-move-up-fallback');
-      fallbackDraft = collectFallbackDraft();
-      const index = fallbackDraft.findIndex((target) => target.id === id);
-      if (index > 0) {
-        const temp = fallbackDraft[index - 1];
-        fallbackDraft[index - 1] = fallbackDraft[index];
-        fallbackDraft[index] = temp;
-        renderFallbackTargets();
-      }
-      return;
-    }
-
-    const moveDown = event.target.closest('[data-move-down-fallback]');
-    if (moveDown) {
-      const id = moveDown.getAttribute('data-move-down-fallback');
-      fallbackDraft = collectFallbackDraft();
-      const index = fallbackDraft.findIndex((target) => target.id === id);
-      if (index >= 0 && index < fallbackDraft.length - 1) {
-        const temp = fallbackDraft[index + 1];
-        fallbackDraft[index + 1] = fallbackDraft[index];
-        fallbackDraft[index] = temp;
-        renderFallbackTargets();
-      }
-      return;
-    }
-
-    const testBtn = event.target.closest('[data-test-fallback]');
-    if (testBtn) {
-      const id = testBtn.getAttribute('data-test-fallback');
-      fallbackDraft = collectFallbackDraft();
-      const target = fallbackDraft.find((item) => item.id === id);
-    if (!target) {
-      return;
-    }
-      await withAction(testBtn, async () => {
-        clearConfigMessage();
-        const payload = await api('/admin/api/config/test', {
-          method: 'POST',
-          body: { target }
-        });
-        const result = payload && payload.result ? payload.result : {};
-        const apiStyle = result.openaiApiStyle ? (' · ' + result.openaiApiStyle) : '';
-        const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
-        setConfigMessage('ok', '连接成功：' + (target.name || '渠道') + ' · ' + (result.protocol || 'unknown') + apiStyle + ' · ' + (result.model || 'unknown') + preview);
-      }).catch((error) => {
-        setConfigMessage('error', error && error.message ? error.message : String(error));
-      });
-    }
-  });
-
-  els.fallbackTargets.addEventListener('change', (event) => {
-    const enabledCheckbox = event.target.closest('[data-field="enabled"]');
-    if (enabledCheckbox) {
-      const card = enabledCheckbox.closest('[data-fallback-item]');
-      if (card) {
-        const checked = enabledCheckbox.checked;
-        card.setAttribute('data-enabled', checked ? 'true' : 'false');
-        // 更新 header pill
-        const pill = card.querySelector('.fallbackCardTitle .pill');
-        if (pill) {
-          pill.textContent = checked ? '启用' : '停用';
-          pill.className = 'pill ' + (checked ? 'current' : 'warn');
-        }
-        // 更新 toggleRow 文字
-        const toggleSpan = enabledCheckbox.closest('.toggleRow') && enabledCheckbox.closest('.toggleRow').querySelector('span');
-        if (toggleSpan) {
-          toggleSpan.textContent = checked ? '启用' : '停用';
-        }
-      }
-    }
+if (els.fallbackApiKeyToggle && els.fallbackApiKey) {
+  els.fallbackApiKeyToggle.addEventListener('click', () => {
+    const nextVisible = els.fallbackApiKey.type === 'password';
+    els.fallbackApiKey.type = nextVisible ? 'text' : 'password';
+    els.fallbackApiKeyToggle.textContent = nextVisible ? '🙈' : '👁';
+    els.fallbackApiKeyToggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
+    els.fallbackApiKeyToggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
   });
 }
 
@@ -3768,7 +3994,7 @@ async function getSharedAdminState(config, authProvider, directClient, recentAct
 
 async function handleAdminEvents(req, res, config, authProvider, directClient, recentActivityStore) {
   res.writeHead(200, {
-    ...ADMIN_CORS_HEADERS,
+    ...CORS_HEADERS,
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
@@ -3848,13 +4074,10 @@ async function handleAdminEvents(req, res, config, authProvider, directClient, r
 }
 
 async function handleAdminConfigGet(req, res, config) {
-  const settings = getFallbackSettings(config);
   writeJson(res, 200, {
     ok: true,
     settings: {
-      fallbacks: {
-        targets: settings.targets.map((t) => ({ ...t, apiKey: maskToken(t.apiKey) }))
-      }
+      fallbackOpenAi: getFallbackSettings(config)
     },
     bridge: {
       envPath: config.envPath || path.join(process.cwd(), ".env")
@@ -3862,33 +4085,35 @@ async function handleAdminConfigGet(req, res, config) {
   });
 }
 
-async function handleAdminConfigSave(req, res, config, fallbackPool) {
+async function handleAdminConfigSave(req, res, config, fallbackClient) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
-  const fallbacks = body && body.fallbacks && typeof body.fallbacks === "object"
-    ? body.fallbacks
+  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
+    ? body.fallbackOpenAi
     : {};
 
-  const nextSettings = applyFallbackSettings(config, fallbackPool, {
-    targets: Array.isArray(fallbacks.targets) ? fallbacks.targets : []
+  const nextSettings = applyFallbackSettings(config, fallbackClient, {
+    protocol: fallback.protocol,
+    baseUrl: fallback.baseUrl,
+    apiKey: fallback.apiKey,
+    model: fallback.model,
+    anthropicVersion: fallback.anthropicVersion,
+    timeoutMs: fallback.timeoutMs
   });
-  const primary = nextSettings.normalizedTargets[0] || null;
-
   const envPath = config.envPath || path.join(process.cwd(), ".env");
   upsertEnvValues(envPath, {
-    ACCIO_FALLBACKS_JSON: JSON.stringify(nextSettings.targets),
-    ACCIO_FALLBACK_OPENAI_BASE_URL: primary ? primary.baseUrl : "",
-    ACCIO_FALLBACK_OPENAI_API_KEY: primary ? primary.apiKey : "",
-    ACCIO_FALLBACK_OPENAI_MODEL: primary ? primary.model : "",
-    ACCIO_FALLBACK_PROTOCOL: primary ? primary.protocol : "openai",
-    ACCIO_FALLBACK_ANTHROPIC_VERSION: primary ? primary.anthropicVersion : "2023-06-01",
-    ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(primary ? primary.timeoutMs : 60000)
+    ACCIO_FALLBACK_OPENAI_BASE_URL: nextSettings.baseUrl,
+    ACCIO_FALLBACK_OPENAI_API_KEY: nextSettings.apiKey,
+    ACCIO_FALLBACK_OPENAI_MODEL: nextSettings.model,
+    ACCIO_FALLBACK_PROTOCOL: nextSettings.protocol,
+    ACCIO_FALLBACK_ANTHROPIC_VERSION: nextSettings.anthropicVersion,
+    ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(nextSettings.timeoutMs)
   });
 
   log.info("admin fallback settings updated", {
     envPath,
-    fallbackCount: nextSettings.targets.length,
-    fallbackProtocol: primary ? primary.protocol : null,
-    fallbackModel: primary ? (primary.model || null) : null
+    fallbackConfigured: Boolean(nextSettings.baseUrl && nextSettings.apiKey && nextSettings.model),
+    fallbackProtocol: nextSettings.protocol,
+    fallbackModel: nextSettings.model || null
   });
 
   invalidateSharedAdminState();
@@ -3896,7 +4121,7 @@ async function handleAdminConfigSave(req, res, config, fallbackPool) {
     ok: true,
     saved: true,
     settings: {
-      fallbacks: nextSettings
+      fallbackOpenAi: nextSettings
     },
     bridge: {
       envPath
@@ -3906,12 +4131,17 @@ async function handleAdminConfigSave(req, res, config, fallbackPool) {
 
 async function handleAdminConfigTest(req, res) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
-  const target = body && body.target && typeof body.target === "object"
-    ? normalizeFallbackTarget(body.target, 0)
-    : normalizeFallbackTarget({}, 0);
+  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
+    ? body.fallbackOpenAi
+    : {};
 
   const probeClient = new ExternalFallbackClient({
-    ...target,
+    protocol: fallback.protocol,
+    baseUrl: fallback.baseUrl,
+    apiKey: fallback.apiKey,
+    model: fallback.model,
+    anthropicVersion: fallback.anthropicVersion,
+    timeoutMs: fallback.timeoutMs,
     fetchImpl: fetch
   });
 
@@ -3929,7 +4159,6 @@ async function handleAdminConfigTest(req, res) {
   try {
     const result = await probeClient.probe();
     log.info("admin fallback settings tested", {
-      fallbackName: target.name,
       fallbackProtocol: result.protocol,
       fallbackTransport: result.transport,
       fallbackModel: result.model || null
@@ -3951,6 +4180,27 @@ async function handleAdminConfigTest(req, res) {
       details: error && error.details ? error.details : null
     });
   }
+}
+
+async function handleAdminQuotaRefresh(req, res, config, authProvider) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const alias = body && body.alias ? String(body.alias).trim() : "";
+  const state = await buildAdminState(config, authProvider, null, null, {
+    forceQuotaRefresh: true,
+    alias: alias || null
+  });
+
+  if (alias && !(state.snapshots || []).some((snapshot) => snapshot.alias === alias)) {
+    writeJson(res, 404, {
+      error: {
+        type: "not_found_error",
+        message: `Snapshot ${alias} was not found`
+      }
+    });
+    return;
+  }
+
+  writeJson(res, 200, state);
 }
 
 async function handleAdminSnapshotCreate(req, res, config) {
@@ -4567,6 +4817,7 @@ module.exports = {
   handleAdminConfigGet,
   handleAdminConfigTest,
   handleAdminConfigSave,
+  handleAdminQuotaRefresh,
   handleAdminSnapshotCreate,
   handleAdminSnapshotActivate,
   handleAdminSnapshotDelete,
@@ -4586,3 +4837,6 @@ module.exports = {
     syncSnapshotAccountState
   }
 };
+
+
+

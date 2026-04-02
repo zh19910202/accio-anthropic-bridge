@@ -57,13 +57,13 @@ test("buildChatCompletionResponse maps tool calls", () => {
   assert.equal(response.choices[0].message.tool_calls[0].function.name, "lookup_weather");
 });
 
-test("buildChatCompletionChunk and model listing stay OpenAI-compatible", () => {
+test("buildChatCompletionChunk and model listing stay OpenAI-compatible", async () => {
   const chunk = buildChatCompletionChunk(
     { model: "accio-bridge" },
     { role: "assistant", content: "OK" },
     { finishReason: null }
   );
-  const models = buildOpenAiModelsResponse();
+  const models = await buildOpenAiModelsResponse();
 
   assert.equal(chunk.object, "chat.completion.chunk");
   assert.equal(models.object, "list");

@@ -25,6 +25,7 @@ const {
   handleAdminConfigGet,
   handleAdminConfigTest,
   handleAdminConfigSave,
+  handleAdminQuotaRefresh,
   handleAdminSnapshotCreate,
   handleAdminSnapshotActivate,
   handleAdminSnapshotDelete,
@@ -160,6 +161,7 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
             "GET /admin/api/config",
             "POST /admin/api/config/test",
             "POST /admin/api/config",
+            "POST /admin/api/quotas/refresh",
             "POST /admin/api/snapshots",
             "POST /admin/api/snapshots/activate",
             "POST /admin/api/snapshots/delete",
@@ -223,6 +225,12 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
 
       if (req.method === "POST" && url.pathname === "/admin/api/config/test") {
         await handleAdminConfigTest(req, res);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/quotas/refresh") {
+        await handleAdminQuotaRefresh(req, res, config, authProvider);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }

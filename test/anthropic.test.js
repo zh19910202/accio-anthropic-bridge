@@ -75,6 +75,30 @@ test("buildMessageResponse emits tool_use blocks and stop reason", () => {
   assert.deepEqual(response.accio.tool_results, [{ tool_use_id: "call_1", content: "hi" }]);
 });
 
+test("buildMessageResponse includes thinking blocks before final text", () => {
+  const response = buildMessageResponse(
+    { model: "claude-sonnet-4-6" },
+    "最终答案",
+    {
+      inputTokens: 12,
+      outputTokens: 34,
+      thinkingBlocks: [
+        {
+          type: "thinking",
+          thinking: "先分析题意",
+          signature: "sig_123"
+        }
+      ]
+    }
+  );
+
+  assert.equal(response.content[0].type, "thinking");
+  assert.equal(response.content[0].thinking, "先分析题意");
+  assert.equal(response.content[0].signature, "sig_123");
+  assert.equal(response.content[1].type, "text");
+  assert.equal(response.accio.thinking_blocks[0].type, "thinking");
+});
+
 test("selectAnthropicTransport prefers external fallback over local-ws when thinking needs direct transport", () => {
   const decision = selectAnthropicTransport({
     body: {
