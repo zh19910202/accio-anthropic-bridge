@@ -613,6 +613,145 @@ test("ExternalFallbackClient completes through Anthropic endpoint", async () => 
   assert.equal(payload.messages[0].content[0].text, "hello");
 });
 
+test("ExternalFallbackClient retries Anthropic auth with Bearer and remembers the working mode", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example",
+    apiKey: "anthropic_key",
+    model: "claude-sonnet-4-6",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({
+        url: String(url),
+        headers: options.headers
+      });
+
+      if (options.headers["x-api-key"]) {
+        return {
+          ok: false,
+          status: 401,
+          headers: new Headers({ "content-type": "application/json" }),
+          async json() {
+            return { error: { message: "Unauthorized", type: "auth_error" } };
+          },
+          clone() {
+            return {
+              async json() {
+                return { error: { message: "Unauthorized", type: "auth_error" } };
+              }
+            };
+          }
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async json() {
+          return {
+            id: "msg_123",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "anthropic fallback ok" }],
+            usage: { input_tokens: 9, output_tokens: 5 }
+          };
+        },
+        clone() {
+          return {
+            async json() {
+              return {
+                id: "msg_123",
+                type: "message",
+                role: "assistant",
+                content: [{ type: "text", text: "anthropic fallback ok" }],
+                usage: { input_tokens: 9, output_tokens: 5 }
+              };
+            }
+          };
+        }
+      };
+    }
+  });
+
+  const first = await client.completeAnthropic({
+    messages: [{ role: "user", content: "hello" }],
+    max_tokens: 64
+  });
+  const second = await client.completeAnthropic({
+    messages: [{ role: "user", content: "hello again" }],
+    max_tokens: 64
+  });
+
+  assert.equal(first.text, "anthropic fallback ok");
+  assert.equal(second.text, "anthropic fallback ok");
+  assert.equal(seen[0].headers["x-api-key"], "anthropic_key");
+  assert.equal(seen[1].headers.authorization, "Bearer anthropic_key");
+  assert.equal(seen[2].headers.authorization, "Bearer anthropic_key");
+});
+
+test("ExternalFallbackClient skips html portal responses and continues to /v1/messages", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example",
+    apiKey: "anthropic_key",
+    model: "claude-sonnet-4-6",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), headers: options.headers });
+      if (String(url) === "https://fallback.example/messages") {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          async text() {
+            return "<html>portal</html>";
+          }
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async json() {
+          return {
+            id: "msg_456",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "ok via v1" }],
+            usage: { input_tokens: 3, output_tokens: 2 }
+          };
+        },
+        clone() {
+          return {
+            async json() {
+              return {
+                id: "msg_456",
+                type: "message",
+                role: "assistant",
+                content: [{ type: "text", text: "ok via v1" }],
+                usage: { input_tokens: 3, output_tokens: 2 }
+              };
+            }
+          };
+        }
+      };
+    }
+  });
+
+  const result = await client.completeAnthropic({
+    messages: [{ role: "user", content: "hello" }],
+    max_tokens: 32
+  });
+
+  assert.equal(result.text, "ok via v1");
+  assert.deepEqual(seen.map((entry) => entry.url), [
+    "https://fallback.example/messages",
+    "https://fallback.example/v1/messages"
+  ]);
+});
+
 test("ExternalFallbackClient requestAnthropicMessage preserves body and overrides model", async () => {
   const seen = [];
   const client = new ExternalFallbackClient({

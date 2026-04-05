@@ -45,6 +45,13 @@ const QUOTA_CACHE_TTL_MS = 15 * 1000;
 const QUOTA_CACHE_MAX = 64;
 const quotaCache = new Map();
 const SNAPSHOT_QUOTA_FILE = "quota-state.json";
+const OPENAI_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
+const OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
+const OPENAI_OAUTH_SCOPE = "openid profile email offline_access";
+const OPENAI_AUTH_CLAIM_PATH = "https://api.openai.com/auth";
+const DEFAULT_CODEX_MODEL = "gpt-5.4";
 
 function createGuiLaunchEnv() {
   const env = { ...process.env };
@@ -153,8 +160,32 @@ function getFallbackSettings(config, theme = "claude") {
   };
 }
 
+function restoreMaskedApiKeys(incomingTargets, existingTargets) {
+  const existingById = new Map();
+
+  for (const t of Array.isArray(existingTargets) ? existingTargets : []) {
+    if (t && t.id && t.apiKey) {
+      existingById.set(String(t.id), t);
+    }
+  }
+
+  return (Array.isArray(incomingTargets) ? incomingTargets : []).map((t) => {
+    if (!t || typeof t !== "object") {
+      return t;
+    }
+
+    if (typeof t.apiKey === "string" && t.apiKey.includes("***") && t.id && existingById.has(String(t.id))) {
+      return { ...t, apiKey: existingById.get(String(t.id)).apiKey };
+    }
+
+    return t;
+  });
+}
+
 function applyThemeFallbackSettings(config, fallbackPool, theme, settings) {
-  const targets = normalizeFallbackTargets(Array.isArray(settings.targets) ? settings.targets : []);
+  const existingTargets = theme === "codex" ? config.codexFallbackTargets : config.fallbackTargets;
+  const restoredInputTargets = restoreMaskedApiKeys(settings.targets, existingTargets);
+  const targets = normalizeFallbackTargets(Array.isArray(restoredInputTargets) ? restoredInputTargets : []);
   const primary = targets[0] || normalizeFallbackTarget({}, 0);
 
   if (theme === "codex") {
@@ -475,6 +506,139 @@ function buildDirectLoginUrl(callbackUrl) {
   url.searchParams.set("return_url", callbackUrl);
   url.searchParams.set("state", state);
   return { loginUrl: url.toString(), state };
+}
+
+function createPkceVerifier() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function createPkceChallenge(verifier) {
+  return crypto.createHash("sha256").update(String(verifier || "")).digest("base64url");
+}
+
+function buildCodexAuthorizeUrl(state, codeChallenge) {
+  const url = new URL(OPENAI_OAUTH_AUTHORIZE_URL);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", OPENAI_OAUTH_CLIENT_ID);
+  url.searchParams.set("redirect_uri", OPENAI_OAUTH_REDIRECT_URI);
+  url.searchParams.set("scope", OPENAI_OAUTH_SCOPE);
+  url.searchParams.set("code_challenge", String(codeChallenge || ""));
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", String(state || ""));
+  url.searchParams.set("id_token_add_organizations", "true");
+  url.searchParams.set("codex_cli_simplified_flow", "true");
+  url.searchParams.set("originator", "codex_cli_rs");
+  return url.toString();
+}
+
+function parseCodexAuthorizationInput(input) {
+  const text = String(input || "").trim();
+  if (!text) {
+    throw new Error("empty input");
+  }
+
+  if (text.includes("code=")) {
+    try {
+      const url = new URL(text);
+      return {
+        code: String(url.searchParams.get("code") || "").trim(),
+        state: String(url.searchParams.get("state") || "").trim()
+      };
+    } catch {
+      try {
+        const params = new URLSearchParams(text);
+        return {
+          code: String(params.get("code") || "").trim(),
+          state: String(params.get("state") || "").trim()
+        };
+      } catch {
+        // Fall through to raw parsing below.
+      }
+    }
+  }
+
+  if (text.includes("#")) {
+    const [code, state] = text.split("#", 2);
+    return {
+      code: String(code || "").trim(),
+      state: String(state || "").trim()
+    };
+  }
+
+  return {
+    code: text,
+    state: ""
+  };
+}
+
+function decodeJwtClaims(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) {
+      return null;
+    }
+
+    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
+    const parsed = JSON.parse(payload);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractOpenAiAccountIdFromJwt(token) {
+  const claims = decodeJwtClaims(token);
+  const auth = claims && claims[OPENAI_AUTH_CLAIM_PATH] && typeof claims[OPENAI_AUTH_CLAIM_PATH] === "object"
+    ? claims[OPENAI_AUTH_CLAIM_PATH]
+    : null;
+  const accountId = auth && auth.chatgpt_account_id ? String(auth.chatgpt_account_id).trim() : "";
+  return accountId || null;
+}
+
+function extractEmailFromJwt(token) {
+  const claims = decodeJwtClaims(token);
+  const email = claims && claims.email ? String(claims.email).trim() : "";
+  return email || null;
+}
+
+async function exchangeCodexAuthorizationCode(code, verifier) {
+  const response = await fetch(OPENAI_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json"
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: OPENAI_OAUTH_CLIENT_ID,
+      code: String(code || "").trim(),
+      code_verifier: String(verifier || "").trim(),
+      redirect_uri: OPENAI_OAUTH_REDIRECT_URI
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+
+  const text = await response.text().catch(() => "");
+  let payload = null;
+
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message = payload && payload.error && payload.error.message
+      ? String(payload.error.message)
+      : (text || `HTTP ${response.status}`);
+    const error = new Error(message);
+    error.status = response.status;
+    error.type = "authentication_error";
+    error.details = payload || text || null;
+    throw error;
+  }
+
+  return payload && typeof payload === "object" ? payload : {};
 }
 
 function buildQuotaCacheKey(alias, userId) {
@@ -987,6 +1151,8 @@ async function requestDesktopHelperLaunch(config) {
 const ACCOUNT_LOGIN_FLOW_TTL_MS = 10 * 60 * 1000;
 const PENDING_ACCOUNT_LOGIN_MAX = 32;
 const pendingAccountLogins = new Map();
+const PENDING_CODEX_OAUTH_MAX = 32;
+const pendingCodexOAuthFlows = new Map();
 
 function extractGatewayUserId(gateway) {
   return gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
@@ -1036,6 +1202,65 @@ function getPendingAccountLogin(flowId) {
 
 function deletePendingAccountLogin(flowId) {
   pendingAccountLogins.delete(flowId);
+}
+
+function prunePendingCodexOAuthFlows(now = Date.now()) {
+  for (const [flowId, flow] of pendingCodexOAuthFlows.entries()) {
+    if (now - flow.createdAtMs >= ACCOUNT_LOGIN_FLOW_TTL_MS) {
+      pendingCodexOAuthFlows.delete(flowId);
+    }
+  }
+  while (pendingCodexOAuthFlows.size > PENDING_CODEX_OAUTH_MAX) {
+    pendingCodexOAuthFlows.delete(pendingCodexOAuthFlows.keys().next().value);
+  }
+}
+
+function createPendingCodexOAuthFlow(extras = {}) {
+  prunePendingCodexOAuthFlows();
+  const state = crypto.randomBytes(16).toString("hex");
+  const verifier = createPkceVerifier();
+  const challenge = createPkceChallenge(verifier);
+  const flow = {
+    id: crypto.randomUUID(),
+    state,
+    verifier,
+    challenge,
+    authorizeUrl: buildCodexAuthorizeUrl(state, challenge),
+    createdAtMs: Date.now(),
+    account: extras && extras.account && typeof extras.account === "object"
+      ? { ...extras.account }
+      : {}
+  };
+  pendingCodexOAuthFlows.set(flow.id, flow);
+  return flow;
+}
+
+function getPendingCodexOAuthFlow(flowId) {
+  prunePendingCodexOAuthFlows();
+  return flowId ? (pendingCodexOAuthFlows.get(String(flowId)) || null) : null;
+}
+
+function findPendingCodexOAuthFlowByState(state) {
+  prunePendingCodexOAuthFlows();
+  const normalizedState = String(state || "").trim();
+  if (!normalizedState) {
+    return null;
+  }
+
+  for (const flow of pendingCodexOAuthFlows.values()) {
+    if (String(flow && flow.state ? flow.state : "") === normalizedState) {
+      return flow;
+    }
+  }
+
+  return null;
+}
+
+function deletePendingCodexOAuthFlow(flowId) {
+  if (!flowId) {
+    return;
+  }
+  pendingCodexOAuthFlows.delete(String(flowId));
 }
 
 function logPendingAccountLoginState(flow, state, meta = {}) {
@@ -1350,8 +1575,10 @@ async function buildAdminState(config, authProvider, codexAuthProvider, directCl
         id: account.id,
         name: account.name,
         source: account.source,
+        authMode: account.authMode || null,
         enabled: account.enabled,
         hasCredentialBundle: Boolean(account.credentialBundle),
+        model: account.model || account.probeModel || null,
         baseUrl: account.baseUrl || null,
         invalidUntil: codexAuthProvider.getInvalidUntil(account.id),
         lastFailure: codexAuthProvider.getLastFailure(account.id) || null
@@ -1380,12 +1607,18 @@ async function buildAdminState(config, authProvider, codexAuthProvider, directCl
       envPath: config.envPath || path.join(process.cwd(), ".env")
     },
     settings: {
-      fallbacks: getFallbackSettings(config, "claude"),
+      fallbacks: {
+        targets: getFallbackSettings(config, "claude").targets.map((t) => ({ ...t, apiKey: maskToken(t.apiKey) }))
+      },
       claude: {
-        fallbacks: getFallbackSettings(config, "claude")
+        fallbacks: {
+          targets: getFallbackSettings(config, "claude").targets.map((t) => ({ ...t, apiKey: maskToken(t.apiKey) }))
+        }
       },
       codex: {
-        fallbacks: getFallbackSettings(config, "codex")
+        fallbacks: {
+          targets: getFallbackSettings(config, "codex").targets.map((t) => ({ ...t, apiKey: maskToken(t.apiKey) }))
+        }
       }
     },
     gateway,
@@ -2419,6 +2652,7 @@ button { font: inherit; cursor: pointer; }
 .field {
   display: grid;
   gap: 8px;
+  align-content: start;
 }
 .inputWrap {
   position: relative;
@@ -2443,7 +2677,15 @@ button { font: inherit; cursor: pointer; }
   min-height: 50px;
   padding: 12px 14px;
   font: inherit;
+  font-weight: 500;
   transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.field .btn {
+  min-height: 50px;
+  border-radius: 14px;
+  justify-content: center;
+  text-align: center;
+  font-weight: 600;
 }
 .field textarea {
   resize: vertical;
@@ -2508,6 +2750,9 @@ button { font: inherit; cursor: pointer; }
   color: var(--muted);
   line-height: 1.5;
 }
+.fieldHint.tight {
+  min-height: 18px;
+}
 .settingsTips {
   display: grid;
   gap: 0;
@@ -2549,6 +2794,10 @@ button { font: inherit; cursor: pointer; }
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
+}
+.settingsActions.codexImportActions {
+  justify-content: flex-start;
+  min-height: 24px;
 }
 .settingsActions .btn {
   width: auto;
@@ -2748,25 +2997,44 @@ button { font: inherit; cursor: pointer; }
       <div class="kv" id="codex-overview-kv"></div>
       <div class="settingsGrid">
         <div class="field">
+          <label>导入方式</label>
+          <select id="codex-import-mode">
+            <option value="openai-oauth">OpenAI OAuth</option>
+            <option value="json-bundle">JSON 凭证</option>
+          </select>
+        </div>
+        <div class="field" id="codex-account-id-field">
           <label>账号 ID</label>
           <input id="codex-account-id" type="text" placeholder="codex_primary" autocomplete="off" />
         </div>
-        <div class="field">
-          <label>显示名称</label>
-          <input id="codex-account-name" type="text" placeholder="Codex Primary" autocomplete="off" />
+        <div class="field" id="codex-account-name-field">
+          <label>使用备注</label>
+          <input id="codex-account-name" type="text" placeholder="例如：主力号 / 备用号 / 团队号" autocomplete="off" />
         </div>
-        <div class="field wide">
+        <div class="field" id="codex-account-model-field">
+          <label>模型</label>
+          <select id="codex-account-model">
+            <option value="gpt-5.4">gpt-5.4</option>
+          </select>
+          <div class="fieldHint tight">官方 OpenAI OAuth 账号当前使用 <code>gpt-5.4</code>。</div>
+        </div>
+        <div class="field" id="codex-oauth-action-field">
+          <label>授权</label>
+          <button class="btn primary" id="start-codex-oauth-btn">Codex 授权</button>
+          <div class="fieldHint tight">登录完成后会自动回写并导入号池。</div>
+        </div>
+        <div class="field wide" id="codex-account-base-url-field">
           <label>Base URL</label>
           <input id="codex-account-base-url" type="text" placeholder="https://api.openai.com/v1" autocomplete="off" />
         </div>
-        <div class="field wide">
-          <label>Credential Bundle (JSON)</label>
-          <textarea id="codex-credential-bundle" rows="8" placeholder='{"headers":{"authorization":"Bearer ..."}}'></textarea>
-          <div class="fieldHint">第一版按不透明凭证包存储；如果你已经有完整请求头，直接放进 <code>headers</code> 即可。</div>
+        <div class="field wide" id="codex-credential-field">
+          <label id="codex-credential-label">OpenAI OAuth 回调 URL</label>
+          <textarea id="codex-credential-bundle" rows="8" placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=..."></textarea>
+          <div class="fieldHint" id="codex-credential-hint">先点击下方 <code>Codex 授权</code> 打开 OpenAI 登录页。完成登录后，把浏览器地址栏里的完整 callback URL 粘贴到这里，再点击“完成授权并导入”。</div>
         </div>
       </div>
-      <div class="settingsActions">
-        <button class="btn primary" id="import-codex-account-btn">导入 Codex 凭证</button>
+      <div class="settingsActions codexImportActions">
+        <button class="btn primary" id="import-codex-account-btn">完成授权并导入</button>
         <div id="codex-message" class="message info"></div>
       </div>
       <div class="list" id="codex-account-list"></div>
@@ -2776,17 +3044,34 @@ button { font: inherit; cursor: pointer; }
       <div class="sectionHeader">
         <div>
           <h2>Codex 托底渠道</h2>
-          <div class="panelSub">仅用于 Codex 主题；不会影响 Claude Code 的 fallback 顺序。</div>
+          <div class="panelSub">仅用于 Codex 主题；不会影响 Claude Code 的 fallback 顺序。支持 OpenAI compatible 和 Anthropic Messages 混用。</div>
+        </div>
+        <button class="btn" id="add-codex-fallback-target-btn">+ 新增渠道</button>
+      </div>
+
+      <div class="settingsMeta">
+        <div class="miniStat">
+          <span class="miniStatIcon">🔗</span>
+          <div class="miniStatBody">
+            <div class="miniStatLabel">渠道概览</div>
+            <div class="miniStatValue" id="codex-fallback-status">未配置</div>
+          </div>
         </div>
       </div>
-      <div class="field wide">
-        <label>Fallback Targets JSON</label>
-        <textarea id="codex-fallback-json" rows="10" placeholder='[{"name":"Codex Fallback","protocol":"openai-responses","baseUrl":"https://...","apiKey":"...","model":"gpt-5"}]'></textarea>
-      </div>
-      <div class="settingsActions">
-        <button class="btn primary" id="save-codex-fallback-btn">保存 Codex 渠道</button>
-        <button class="btn" id="reload-codex-fallback-btn">重新载入</button>
-        <div id="codex-config-message" class="message info"></div>
+
+      <div class="fallbackTargets" id="codex-fallback-targets"></div>
+      <div class="empty" id="codex-fallback-empty" style="display:none"><span class="empty-icon">📡</span>暂无 Codex 托底渠道。点击「新增渠道」开始配置。</div>
+
+      <div class="settingsFooter">
+        <div class="settingsActions">
+          <button class="btn primary" id="save-codex-fallback-config-btn">保存渠道配置</button>
+          <button class="btn" id="reload-codex-fallback-config-btn">重新载入</button>
+          <div id="codex-config-message" class="message info"></div>
+        </div>
+        <div class="settingsTips">
+          <div class="settingsTip"><span class="settingsTipIcon">💾</span>保存后写入 bridge 根目录 .env，并立即应用到当前进程。</div>
+          <div class="settingsTip"><span class="settingsTipIcon">🔼</span>列表顺序就是兜底尝试顺序，可用「上移 / 下移」调整。</div>
+        </div>
       </div>
     </section>
   </section>
@@ -2824,16 +3109,30 @@ const els = {
   actionMessage: document.getElementById('action-message'),
   configMessage: document.getElementById('config-message'),
   codexOverviewKv: document.getElementById('codex-overview-kv'),
+  codexImportMode: document.getElementById('codex-import-mode'),
+  codexAccountIdField: document.getElementById('codex-account-id-field'),
   codexAccountId: document.getElementById('codex-account-id'),
+  codexAccountNameField: document.getElementById('codex-account-name-field'),
   codexAccountName: document.getElementById('codex-account-name'),
+  codexAccountModelField: document.getElementById('codex-account-model-field'),
+  codexAccountModel: document.getElementById('codex-account-model'),
+  codexOauthActionField: document.getElementById('codex-oauth-action-field'),
+  codexAccountBaseUrlField: document.getElementById('codex-account-base-url-field'),
   codexAccountBaseUrl: document.getElementById('codex-account-base-url'),
+  codexCredentialField: document.getElementById('codex-credential-field'),
+  codexCredentialLabel: document.getElementById('codex-credential-label'),
   codexCredentialBundle: document.getElementById('codex-credential-bundle'),
+  codexCredentialHint: document.getElementById('codex-credential-hint'),
+  startCodexOauthBtn: document.getElementById('start-codex-oauth-btn'),
   importCodexAccountBtn: document.getElementById('import-codex-account-btn'),
   codexMessage: document.getElementById('codex-message'),
   codexAccountList: document.getElementById('codex-account-list'),
-  codexFallbackJson: document.getElementById('codex-fallback-json'),
-  saveCodexFallbackBtn: document.getElementById('save-codex-fallback-btn'),
-  reloadCodexFallbackBtn: document.getElementById('reload-codex-fallback-btn'),
+  codexFallbackTargets: document.getElementById('codex-fallback-targets'),
+  codexFallbackEmpty: document.getElementById('codex-fallback-empty'),
+  codexFallbackStatus: document.getElementById('codex-fallback-status'),
+  addCodexFallbackTargetBtn: document.getElementById('add-codex-fallback-target-btn'),
+  saveCodexFallbackConfigBtn: document.getElementById('save-codex-fallback-config-btn'),
+  reloadCodexFallbackConfigBtn: document.getElementById('reload-codex-fallback-config-btn'),
   codexConfigMessage: document.getElementById('codex-config-message'),
   refreshBtn: document.getElementById('refresh-btn'),
   accountLoginBtn: document.getElementById('account-login-btn'),
@@ -2865,14 +3164,92 @@ let currentTab = 'claude';
 let refreshInFlight = null;
 let stateStream = null;
 let fallbackDraft = [];
+let codexFallbackDraft = [];
 let logEntries = [];
 let logsLoaded = false;
 let refreshLogsInFlight = null;
 let logFollow = true;
 let latestLogSeq = 0;
+let activeCodexOauthFlowId = null;
 const cancelledLoginFlows = new Set();
 const MAX_RENDERED_LOGS = 300;
 const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
+const CODEX_OAUTH_FLOW_STORAGE_KEY = 'accio-codex-oauth-flow-id';
+
+function readStoredCodexOauthFlowId() {
+  try {
+    return localStorage.getItem(CODEX_OAUTH_FLOW_STORAGE_KEY) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function persistCodexOauthFlowId(flowId) {
+  activeCodexOauthFlowId = flowId ? String(flowId) : null;
+  try {
+    if (activeCodexOauthFlowId) {
+      localStorage.setItem(CODEX_OAUTH_FLOW_STORAGE_KEY, activeCodexOauthFlowId);
+    } else {
+      localStorage.removeItem(CODEX_OAUTH_FLOW_STORAGE_KEY);
+    }
+  } catch (_) {}
+}
+
+function currentCodexImportMode() {
+  return els.codexImportMode && els.codexImportMode.value === 'json-bundle'
+    ? 'json-bundle'
+    : 'openai-oauth';
+}
+
+function currentCodexAccountModel() {
+  return els.codexAccountModel && els.codexAccountModel.value
+    ? els.codexAccountModel.value.trim()
+    : 'gpt-5.4';
+}
+
+function updateCodexImportUi() {
+  const mode = currentCodexImportMode();
+  const isOauth = mode === 'openai-oauth';
+  if (els.codexAccountIdField) {
+    els.codexAccountIdField.style.display = isOauth ? 'none' : '';
+  }
+  if (els.codexAccountNameField) {
+    els.codexAccountNameField.style.display = '';
+  }
+  if (els.codexAccountBaseUrlField) {
+    els.codexAccountBaseUrlField.style.display = isOauth ? 'none' : '';
+  }
+  if (els.codexOauthActionField) {
+    els.codexOauthActionField.style.display = isOauth ? '' : 'none';
+  }
+  if (els.codexCredentialLabel) {
+    els.codexCredentialLabel.textContent = mode === 'openai-oauth'
+      ? 'OpenAI OAuth 回调 URL'
+      : 'OpenAI OAuth 凭证 JSON';
+  }
+  if (els.codexCredentialBundle) {
+    els.codexCredentialBundle.placeholder = mode === 'openai-oauth'
+      ? '粘贴 http://localhost:1455/auth/callback?code=...&state=...'
+      : '{"auth_mode":"chatgpt","tokens":{"access_token":"...","refresh_token":"...","account_id":"..."}}';
+  }
+  if (els.codexCredentialHint) {
+    els.codexCredentialHint.innerHTML = mode === 'openai-oauth'
+      ? '点击下方 <code>Codex 授权</code> 后会打开 OpenAI 登录页。完成登录后，bridge 会自动接收回调并写入号池。'
+      : '支持直接粘贴 OpenAI OAuth 返回的 auth JSON。若其中包含 <code>tokens.account_id</code>，账号 ID 可以留空自动提取。';
+  }
+  if (els.importCodexAccountBtn) {
+    els.importCodexAccountBtn.textContent = mode === 'openai-oauth'
+      ? '完成授权并导入'
+      : '添加 Codex 账号';
+    els.importCodexAccountBtn.style.display = isOauth ? 'none' : '';
+  }
+  if (els.startCodexOauthBtn) {
+    els.startCodexOauthBtn.style.display = mode === 'openai-oauth' ? '' : 'none';
+  }
+  if (els.codexCredentialField) {
+    els.codexCredentialField.style.display = isOauth ? 'none' : '';
+  }
+}
 function setScopedMessage(target, type, text, scope) {
   if (!target) {
     return;
@@ -3449,12 +3826,12 @@ function normalizeFallbackDraftTarget(target, index) {
     timeoutMs: Number(target && target.timeoutMs ? target.timeoutMs : 60000) || 60000
   };
 }
-function collectFallbackDraft() {
-  if (!els.fallbackTargets) {
+function collectFallbackDraftFrom(container) {
+  if (!container) {
     return [];
   }
 
-  return Array.from(els.fallbackTargets.querySelectorAll('[data-fallback-item]')).map((item, index) => normalizeFallbackDraftTarget({
+  return Array.from(container.querySelectorAll('[data-fallback-item]')).map((item, index) => normalizeFallbackDraftTarget({
     id: item.getAttribute('data-fallback-id') || ('draft_' + index),
     name: item.querySelector('[data-field=\"name\"]') ? item.querySelector('[data-field=\"name\"]').value.trim() : '',
     enabled: item.querySelector('[data-field=\"enabled\"]') ? item.querySelector('[data-field=\"enabled\"]').checked : true,
@@ -3468,23 +3845,27 @@ function collectFallbackDraft() {
     timeoutMs: item.querySelector('[data-field=\"timeoutMs\"]') ? Number(item.querySelector('[data-field=\"timeoutMs\"]').value || 60000) : 60000
   }, index));
 }
-function renderFallbackTargets() {
-  if (!els.fallbackTargets || !els.fallbackEmpty) {
+function collectFallbackDraft() {
+  return collectFallbackDraftFrom(els.fallbackTargets);
+}
+function collectCodexFallbackDraft() {
+  return collectFallbackDraftFrom(els.codexFallbackTargets);
+}
+function renderFallbackTargetsInto(container, emptyEl, draft) {
+  if (!container || !emptyEl) {
     return;
   }
 
   // 记录当前已展开的卡片，其余默认折叠
   const expandedIds = new Set();
-  if (els.fallbackTargets) {
-    els.fallbackTargets.querySelectorAll('[data-fallback-item]:not([data-collapsed="true"])').forEach((el) => {
-      const id = el.getAttribute('data-fallback-id');
-      if (id) expandedIds.add(id);
-    });
-  }
+  container.querySelectorAll('[data-fallback-item]:not([data-collapsed="true"])').forEach((el) => {
+    const id = el.getAttribute('data-fallback-id');
+    if (id) expandedIds.add(id);
+  });
 
-  const targets = Array.isArray(fallbackDraft) ? fallbackDraft : [];
-  els.fallbackEmpty.style.display = targets.length === 0 ? '' : 'none';
-  els.fallbackTargets.innerHTML = targets.map((target, index) => {
+  const targets = Array.isArray(draft) ? draft : [];
+  emptyEl.style.display = targets.length === 0 ? '' : 'none';
+  container.innerHTML = targets.map((target, index) => {
     const protocolLabel = target.protocol === 'anthropic'
       ? 'Anthropic Messages'
       : (target.protocol === 'openai-chat-completions'
@@ -3526,17 +3907,40 @@ function renderFallbackTargets() {
       + '</section>';
   }).join('');
 }
+function renderFallbackTargets() {
+  renderFallbackTargetsInto(els.fallbackTargets, els.fallbackEmpty, fallbackDraft);
+}
+function renderCodexFallbackTargets() {
+  renderFallbackTargetsInto(els.codexFallbackTargets, els.codexFallbackEmpty, codexFallbackDraft);
+}
+function updateFallbackStatusLabel(statusEl, draft) {
+  if (!statusEl) return;
+  const enabledTargets = (Array.isArray(draft) ? draft : []).filter((target) => target.enabled !== false && target.baseUrl && target.apiKey && target.model);
+  statusEl.textContent = enabledTargets.length > 0
+    ? ('已配置 ' + enabledTargets.length + ' 条 · 首选 ' + (enabledTargets[0].name || enabledTargets[0].model || 'external-upstream'))
+    : '未配置';
+}
 function renderSettings(data) {
   const targets = data && data.settings && data.settings.fallbacks && Array.isArray(data.settings.fallbacks.targets)
     ? data.settings.fallbacks.targets
     : [];
   fallbackDraft = targets.map((target, index) => normalizeFallbackDraftTarget(target, index));
   renderFallbackTargets();
-  const enabledTargets = fallbackDraft.filter((target) => target.enabled !== false && target.baseUrl && target.apiKey && target.model);
-  if (els.fallbackStatus) els.fallbackStatus.textContent = enabledTargets.length > 0
-    ? ('已配置 ' + enabledTargets.length + ' 条 · 首选 ' + (enabledTargets[0].name || enabledTargets[0].model || 'external-upstream'))
-    : '未配置';
+  updateFallbackStatusLabel(els.fallbackStatus, fallbackDraft);
   if (els.fallbackEnvPath) els.fallbackEnvPath.textContent = data && data.bridge && data.bridge.envPath ? data.bridge.envPath : '.env';
+}
+function renderCodexSettings(data) {
+  const targets = data && data.settings && data.settings.codex && data.settings.codex.fallbacks && Array.isArray(data.settings.codex.fallbacks.targets)
+    ? data.settings.codex.fallbacks.targets
+    : [];
+  codexFallbackDraft = targets.map((target, index) => normalizeFallbackDraftTarget(target, index));
+  renderCodexFallbackTargets();
+  updateFallbackStatusLabel(els.codexFallbackStatus, codexFallbackDraft);
+}
+async function loadFallbackConfig() {
+  const payload = await api('/admin/api/config');
+  renderSettings({ settings: payload.settings, bridge: payload.bridge });
+  renderCodexSettings({ settings: payload.settings, bridge: payload.bridge });
 }
 
 function renderCodexPanel(data) {
@@ -3565,6 +3969,10 @@ function renderCodexPanel(data) {
         const status = account.enabled
           ? (account.invalidUntil ? '冷却中' : '可用')
           : '已停用';
+        const canTest = account.hasCredentialBundle;
+        const importModeLabel = account.authMode === 'chatgpt' || account.source === 'codex-openai-oauth'
+          ? 'OpenAI OAuth'
+          : 'JSON 凭证';
         return '<div class="item">'
           + '<div class="itemAvatar">' + escapeInline(String(account.name || account.id || 'C').slice(0, 1).toUpperCase()) + '</div>'
           + '<div class="itemTitleRow">'
@@ -3572,11 +3980,16 @@ function renderCodexPanel(data) {
           + (current ? '<span class="pill current">默认</span>' : '')
           + '</div>'
           + '<div class="itemMeta">' + escapeInline(account.id || '') + '</div>'
+          + '<div class="itemMeta">导入方式：' + escapeInline(importModeLabel) + '</div>'
           + '<div class="itemMeta">状态：' + escapeInline(status) + '</div>'
-          + '<div class="itemMeta">Base URL：' + escapeInline(account.baseUrl || 'https://api.openai.com/v1') + '</div>'
+          + (account.model ? '<div class="itemMeta">模型：' + escapeInline(account.model) + '</div>' : '')
+          + ((account.authMode === 'chatgpt' || account.source === 'codex-openai-oauth')
+            ? ''
+            : '<div class="itemMeta">Base URL：' + escapeInline(account.baseUrl || 'https://api.openai.com/v1') + '</div>')
           + (account.lastFailure && account.lastFailure.reason ? '<div class="itemMeta hint">最近失败：' + escapeInline(account.lastFailure.reason) + '</div>' : '')
           + '<div class="itemSpacer"></div>'
           + '<div class="actionRow">'
+          + '<button class="btn" data-codex-account-test="' + escapeInline(account.id) + '"' + (canTest ? '' : ' disabled title="该账号缺少可测试凭证"') + '>测试</button>'
           + '<button class="btn" data-codex-account-default="' + escapeInline(account.id) + '"' + (current ? ' disabled' : '') + '>设为默认</button>'
           + '<button class="btn" data-codex-account-toggle="' + escapeInline(account.id) + '" data-codex-enabled="' + (account.enabled ? 'true' : 'false') + '">' + (account.enabled ? '停用' : '启用') + '</button>'
           + '<button class="btn warn" data-codex-account-delete="' + escapeInline(account.id) + '">删除</button>'
@@ -3586,12 +3999,6 @@ function renderCodexPanel(data) {
     }
   }
 
-  if (els.codexFallbackJson) {
-    const targets = data && data.settings && data.settings.codex && data.settings.codex.fallbacks && Array.isArray(data.settings.codex.fallbacks.targets)
-      ? data.settings.codex.fallbacks.targets
-      : [];
-    els.codexFallbackJson.value = JSON.stringify(targets, null, 2);
-  }
 }
 
 function renderSnapshots(data) {
@@ -3697,7 +4104,7 @@ function renderSnapshots(data) {
       + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
       + (!canActivate ? '<div class="itemMeta hint">该快照缺少完整登录槽位，不能直接切换。</div>' : '')
       + '<div class="itemSpacer"></div>'
-      + '<div class="actionRow"><button class="btn" data-activate-snapshot="' + item.alias + '"' + (canActivate ? '' : ' disabled title="请重新登录该账号后重新保存"') + '>' + (canActivate ? '切换' : '需补全') + '</button><button class="btn" data-delete-snapshot="' + item.alias + '">删除</button></div>'
+      + '<div class="actionRow"><button class="btn" data-test-snapshot="' + item.alias + '"' + (item.hasAuthCallback ? '' : ' disabled title="该快照缺少可用凭证"') + '>测试</button><button class="btn" data-activate-snapshot="' + item.alias + '"' + (canActivate ? '' : ' disabled title="请重新登录该账号后重新保存"') + '>' + (canActivate ? '切换' : '需补全') + '</button><button class="btn" data-delete-snapshot="' + item.alias + '">删除</button></div>'
       + '</div>';
   }).join('');
   applySnapshotFilter();
@@ -3753,9 +4160,6 @@ function renderState(data, options = {}) {
   ]);
   renderSnapshots(data);
   renderCodexPanel(data);
-  if (options.allowSettings !== false) {
-    renderSettings(data);
-  }
 }
 async function refreshState(message) {
   if (!refreshInFlight) {
@@ -3833,6 +4237,56 @@ function setAccountLoginPendingState(pending) {
     els.cancelAccountLoginBtn.style.display = pending ? '' : 'none';
     els.cancelAccountLoginBtn.disabled = false;
     els.cancelAccountLoginBtn.classList.remove('loading');
+  }
+}
+
+function setCodexOauthPendingState(pending) {
+  if (els.startCodexOauthBtn) {
+    els.startCodexOauthBtn.disabled = Boolean(pending);
+    els.startCodexOauthBtn.classList.toggle('loading', Boolean(pending));
+    els.startCodexOauthBtn.textContent = pending ? '等待授权完成...' : 'Codex 授权';
+  }
+}
+
+async function pollCodexOauth(flowId) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  let lastState = '';
+  while (Date.now() < deadline) {
+    const payload = await api('/admin/api/codex/oauth/status?flowId=' + encodeURIComponent(flowId));
+
+    if (payload.completed) {
+      return payload;
+    }
+
+    if (payload.state && payload.state !== lastState) {
+      setCodexMessage('info', payload.message || '等待 Codex 授权完成。');
+      lastState = payload.state;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  throw new Error('等待 Codex 授权超时。');
+}
+
+async function observeCodexOauth(flowId) {
+  setCodexOauthPendingState(true);
+  try {
+    const result = await pollCodexOauth(flowId);
+    persistCodexOauthFlowId(null);
+    await refreshState();
+    if (result && result.state === 'oauth_failed') {
+      setCodexMessage('error', result.note || 'Codex 授权失败。');
+    } else {
+      setCodexMessage('ok', (result && result.note) || 'Codex OAuth 已完成并写入号池。');
+    }
+  } catch (error) {
+    setCodexMessage('error', error && error.message ? error.message : String(error));
+  } finally {
+    if (activeCodexOauthFlowId === flowId) {
+      activeCodexOauthFlowId = null;
+    }
+    setCodexOauthPendingState(false);
   }
 }
 
@@ -4039,6 +4493,27 @@ if (els.cancelAccountLoginBtn) {
   }));
 }
 document.addEventListener('click', async (event) => {
+  const testSnapshot = event.target.closest('[data-test-snapshot]');
+  if (testSnapshot) {
+    const alias = testSnapshot.getAttribute('data-test-snapshot');
+    await withAction(testSnapshot, async () => {
+      clearMessage();
+      const payload = await api('/admin/api/snapshots/test', { method: 'POST', body: { alias } });
+      await refreshState();
+      const quota = payload && payload.quota ? payload.quota : null;
+      const usageText = quota && typeof quota.usagePercent === 'number'
+        ? ('已用 ' + Math.round(quota.usagePercent) + '%')
+        : '额度已刷新';
+      const refreshText = quota && typeof quota.refreshCountdownSeconds === 'number'
+        ? ('，预计 ' + formatCountdown(quota.refreshCountdownSeconds) + ' 后恢复')
+        : '';
+      setMessage('ok', '测试成功：' + (payload.alias || alias || '账号') + ' · ' + usageText + refreshText);
+    }).catch((error) => {
+      setMessage('error', error && error.message ? error.message : String(error));
+    });
+    return;
+  }
+
   const activate = event.target.closest('[data-activate-snapshot]');
   if (activate) {
     const alias = activate.getAttribute('data-activate-snapshot');
@@ -4117,7 +4592,7 @@ if (els.saveFallbackConfigBtn) {
   els.saveFallbackConfigBtn.addEventListener('click', () => withAction(els.saveFallbackConfigBtn, async () => {
     clearConfigMessage();
     fallbackDraft = collectFallbackDraft();
-    const payload = await api('/admin/api/config', {
+    await api('/admin/api/config', {
       method: 'POST',
       body: {
         fallbacks: {
@@ -4125,7 +4600,7 @@ if (els.saveFallbackConfigBtn) {
         }
       }
     });
-    renderSettings({ settings: payload.settings, bridge: payload.bridge });
+    updateFallbackStatusLabel(els.fallbackStatus, fallbackDraft);
     setConfigMessage('ok', '多渠道上游配置已保存并立即生效。');
   }));
 }
@@ -4139,12 +4614,73 @@ if (els.reloadFallbackConfigBtn) {
   }));
 }
 
+if (els.codexImportMode) {
+  els.codexImportMode.addEventListener('change', () => {
+    updateCodexImportUi();
+  });
+}
+
+if (els.startCodexOauthBtn) {
+  els.startCodexOauthBtn.addEventListener('click', () => withAction(els.startCodexOauthBtn, async () => {
+    clearCodexMessage();
+    const payload = await api('/admin/api/codex/oauth/start', {
+      method: 'POST',
+      body: {
+        account: {
+          id: els.codexAccountId && els.codexAccountId.value ? els.codexAccountId.value.trim() : null,
+          name: els.codexAccountName && els.codexAccountName.value ? els.codexAccountName.value.trim() : null,
+          model: currentCodexAccountModel()
+        }
+      }
+    });
+    if (!payload || !payload.authorizeUrl) {
+      throw new Error('未收到 OpenAI 授权地址。');
+    }
+    persistCodexOauthFlowId(payload.flowId || null);
+    window.open(payload.authorizeUrl, '_blank', 'noopener,noreferrer');
+    setCodexMessage('info', '已打开 OpenAI 登录页。完成登录后会自动写入 Codex 账号。');
+    if (payload.flowId) {
+      observeCodexOauth(String(payload.flowId));
+    }
+  }).catch((error) => {
+    setCodexMessage('error', error && error.message ? error.message : String(error));
+  }));
+}
+
 if (els.importCodexAccountBtn) {
   els.importCodexAccountBtn.addEventListener('click', () => withAction(els.importCodexAccountBtn, async () => {
     clearCodexMessage();
+    const mode = currentCodexImportMode();
     const credentialText = els.codexCredentialBundle && els.codexCredentialBundle.value ? els.codexCredentialBundle.value.trim() : '';
     if (!credentialText) {
-      throw new Error('请先粘贴 Codex credential bundle JSON。');
+      throw new Error(mode === 'openai-oauth' ? '请先粘贴 OpenAI OAuth callback URL。' : '请先粘贴 Codex credential bundle JSON。');
+    }
+
+    const accountId = els.codexAccountId && els.codexAccountId.value ? els.codexAccountId.value.trim() : '';
+    if (!accountId && mode === 'json-bundle') {
+      throw new Error('请填写 Codex 账号 ID。');
+    }
+
+    if (mode === 'openai-oauth') {
+      const payload = await api('/admin/api/codex/oauth/complete', {
+        method: 'POST',
+        body: {
+          flowId: activeCodexOauthFlowId || readStoredCodexOauthFlowId() || null,
+          input: credentialText,
+          account: {
+            id: accountId || null,
+            name: els.codexAccountName && els.codexAccountName.value ? els.codexAccountName.value.trim() : accountId,
+            model: currentCodexAccountModel()
+          }
+        }
+      });
+      persistCodexOauthFlowId(null);
+      if (els.codexCredentialBundle && payload && payload.credentialBundle) {
+        els.codexCredentialBundle.value = JSON.stringify(payload.credentialBundle, null, 2);
+      }
+      await refreshState();
+      setCodexMessage('ok', 'Codex OAuth 授权已完成并写入号池。');
+      return;
     }
 
     let credentialBundle = null;
@@ -4154,11 +4690,6 @@ if (els.importCodexAccountBtn) {
       throw new Error('Codex credential bundle 不是合法 JSON。');
     }
 
-    const accountId = els.codexAccountId && els.codexAccountId.value ? els.codexAccountId.value.trim() : '';
-    if (!accountId) {
-      throw new Error('请填写 Codex 账号 ID。');
-    }
-
     await api('/admin/api/codex/accounts/import', {
       method: 'POST',
       body: {
@@ -4166,6 +4697,7 @@ if (els.importCodexAccountBtn) {
           id: accountId,
           name: els.codexAccountName && els.codexAccountName.value ? els.codexAccountName.value.trim() : accountId,
           baseUrl: els.codexAccountBaseUrl && els.codexAccountBaseUrl.value ? els.codexAccountBaseUrl.value.trim() : 'https://api.openai.com/v1',
+          model: currentCodexAccountModel(),
           credentialBundle
         }
       }
@@ -4178,42 +4710,40 @@ if (els.importCodexAccountBtn) {
   }));
 }
 
-if (els.saveCodexFallbackBtn) {
-  els.saveCodexFallbackBtn.addEventListener('click', () => withAction(els.saveCodexFallbackBtn, async () => {
-    clearCodexConfigMessage();
-    const raw = els.codexFallbackJson && els.codexFallbackJson.value ? els.codexFallbackJson.value.trim() : '[]';
-    let targets = [];
-    try {
-      const parsed = raw ? JSON.parse(raw) : [];
-      if (!Array.isArray(parsed)) {
-        throw new Error('Codex fallback 需要是 JSON 数组。');
-      }
-      targets = parsed;
-    } catch (error) {
-      throw new Error(error && error.message ? error.message : 'Codex fallback JSON 非法。');
-    }
+if (els.addCodexFallbackTargetBtn) {
+  els.addCodexFallbackTargetBtn.addEventListener('click', () => {
+    codexFallbackDraft = collectCodexFallbackDraft();
+    codexFallbackDraft.push(createFallbackDraftTarget(codexFallbackDraft.length));
+    renderCodexFallbackTargets();
+  });
+}
 
-    const payload = await api('/admin/api/config', {
+if (els.saveCodexFallbackConfigBtn) {
+  els.saveCodexFallbackConfigBtn.addEventListener('click', () => withAction(els.saveCodexFallbackConfigBtn, async () => {
+    clearCodexConfigMessage();
+    codexFallbackDraft = collectCodexFallbackDraft();
+    await api('/admin/api/config', {
       method: 'POST',
       body: {
         codex: {
           fallbacks: {
-            targets
+            targets: codexFallbackDraft
           }
         }
       }
     });
-    await refreshState();
-    setCodexConfigMessage('ok', 'Codex 渠道配置已保存。');
+    updateFallbackStatusLabel(els.codexFallbackStatus, codexFallbackDraft);
+    setCodexConfigMessage('ok', 'Codex 渠道配置已保存并立即生效。');
   }).catch((error) => {
     setCodexConfigMessage('error', error && error.message ? error.message : String(error));
   }));
 }
 
-if (els.reloadCodexFallbackBtn) {
-  els.reloadCodexFallbackBtn.addEventListener('click', () => withAction(els.reloadCodexFallbackBtn, async () => {
+if (els.reloadCodexFallbackConfigBtn) {
+  els.reloadCodexFallbackConfigBtn.addEventListener('click', () => withAction(els.reloadCodexFallbackConfigBtn, async () => {
     clearCodexConfigMessage();
-    await refreshState();
+    const payload = await api('/admin/api/config');
+    renderCodexSettings({ settings: payload.settings, bridge: payload.bridge });
     setCodexConfigMessage('info', '已重新载入 Codex 渠道配置。');
   }).catch((error) => {
     setCodexConfigMessage('error', error && error.message ? error.message : String(error));
@@ -4352,7 +4882,157 @@ if (els.fallbackTargets) {
   });
 }
 
+if (els.codexFallbackTargets) {
+  els.codexFallbackTargets.addEventListener('click', async (event) => {
+    const collapseBtn = event.target.closest('[data-collapse-fallback]');
+    const collapseHeader = !collapseBtn && event.target.closest('[data-toggle-collapse]');
+    if (collapseBtn || collapseHeader) {
+      if (collapseHeader && event.target.closest('.fallbackCardActions')) {
+        // fall through
+      } else {
+        const card = (collapseBtn || collapseHeader).closest('[data-fallback-item]');
+        if (card) {
+          const isCollapsed = card.getAttribute('data-collapsed') === 'true';
+          card.setAttribute('data-collapsed', isCollapsed ? 'false' : 'true');
+        }
+        if (collapseBtn) return;
+      }
+    }
+
+    const toggle = event.target.closest('[data-toggle-secret]');
+    if (toggle) {
+      const input = toggle.closest('.inputWrap') ? toggle.closest('.inputWrap').querySelector('input[data-field="apiKey"]') : null;
+      if (input) {
+        const nextVisible = input.type === 'password';
+        input.type = nextVisible ? 'text' : 'password';
+        toggle.textContent = nextVisible ? '🙈' : '👁';
+        toggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
+        toggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
+      }
+      return;
+    }
+
+    const remove = event.target.closest('[data-delete-fallback]');
+    if (remove) {
+      const targetId = remove.getAttribute('data-delete-fallback');
+      if (remove.dataset.confirmDeleteFallback) {
+        delete remove.dataset.confirmDeleteFallback;
+        codexFallbackDraft = collectCodexFallbackDraft().filter((target) => target.id !== targetId);
+        renderCodexFallbackTargets();
+        setCodexConfigMessage('ok', '已删除上游渠道。记得保存配置以生效。');
+        return;
+      }
+
+      remove.dataset.confirmDeleteFallback = '1';
+      const prevText = remove.textContent;
+      remove.textContent = '确认删除？';
+      remove.classList.add('danger-confirm');
+      setTimeout(() => {
+        if (remove.dataset.confirmDeleteFallback) {
+          delete remove.dataset.confirmDeleteFallback;
+          remove.textContent = prevText;
+          remove.classList.remove('danger-confirm');
+        }
+      }, 3000);
+      return;
+    }
+
+    const moveUp = event.target.closest('[data-move-up-fallback]');
+    if (moveUp) {
+      const id = moveUp.getAttribute('data-move-up-fallback');
+      codexFallbackDraft = collectCodexFallbackDraft();
+      const index = codexFallbackDraft.findIndex((target) => target.id === id);
+      if (index > 0) {
+        const temp = codexFallbackDraft[index - 1];
+        codexFallbackDraft[index - 1] = codexFallbackDraft[index];
+        codexFallbackDraft[index] = temp;
+        renderCodexFallbackTargets();
+      }
+      return;
+    }
+
+    const moveDown = event.target.closest('[data-move-down-fallback]');
+    if (moveDown) {
+      const id = moveDown.getAttribute('data-move-down-fallback');
+      codexFallbackDraft = collectCodexFallbackDraft();
+      const index = codexFallbackDraft.findIndex((target) => target.id === id);
+      if (index >= 0 && index < codexFallbackDraft.length - 1) {
+        const temp = codexFallbackDraft[index + 1];
+        codexFallbackDraft[index + 1] = codexFallbackDraft[index];
+        codexFallbackDraft[index] = temp;
+        renderCodexFallbackTargets();
+      }
+      return;
+    }
+
+    const testBtn = event.target.closest('[data-test-fallback]');
+    if (testBtn) {
+      const id = testBtn.getAttribute('data-test-fallback');
+      codexFallbackDraft = collectCodexFallbackDraft();
+      const target = codexFallbackDraft.find((item) => item.id === id);
+      if (!target) {
+        return;
+      }
+      await withAction(testBtn, async () => {
+        clearCodexConfigMessage();
+        const payload = await api('/admin/api/config/test', {
+          method: 'POST',
+          body: { target }
+        });
+        const result = payload && payload.result ? payload.result : {};
+        const apiStyle = result.openaiApiStyle ? (' · ' + result.openaiApiStyle) : '';
+        const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
+        setCodexConfigMessage('ok', '连接成功：' + (target.name || '渠道') + ' · ' + (result.protocol || 'unknown') + apiStyle + ' · ' + (result.model || 'unknown') + preview);
+      }).catch((error) => {
+        setCodexConfigMessage('error', error && error.message ? error.message : String(error));
+      });
+    }
+  });
+
+  els.codexFallbackTargets.addEventListener('change', (event) => {
+    const enabledCheckbox = event.target.closest('[data-field="enabled"]');
+    if (enabledCheckbox) {
+      const card = enabledCheckbox.closest('[data-fallback-item]');
+      if (card) {
+        const checked = enabledCheckbox.checked;
+        card.setAttribute('data-enabled', checked ? 'true' : 'false');
+        const pill = card.querySelector('.fallbackCardTitle .pill');
+        if (pill) {
+          pill.textContent = checked ? '启用' : '停用';
+          pill.className = 'pill ' + (checked ? 'current' : 'warn');
+        }
+        const toggleSpan = enabledCheckbox.closest('.toggleRow') && enabledCheckbox.closest('.toggleRow').querySelector('span');
+        if (toggleSpan) {
+          toggleSpan.textContent = checked ? '启用' : '停用';
+        }
+      }
+    }
+  });
+}
+
 document.addEventListener('click', async (event) => {
+  const testCodex = event.target.closest('[data-codex-account-test]');
+  if (testCodex) {
+    const accountId = testCodex.getAttribute('data-codex-account-test');
+    await withAction(testCodex, async () => {
+      clearCodexMessage();
+      const payload = await api('/admin/api/codex/accounts/test', { method: 'POST', body: { accountId } });
+      await refreshState();
+      const sampleModels = payload && Array.isArray(payload.sampleModels) && payload.sampleModels.length > 0
+        ? (' · ' + payload.sampleModels.slice(0, 3).join(', '))
+        : '';
+      const transport = payload && payload.probeTransport ? (' · ' + payload.probeTransport) : '';
+      const modelCount = payload && typeof payload.modelCount === 'number'
+        ? ('模型 ' + payload.modelCount + ' 个')
+        : '连接已验证';
+      const note = payload && payload.note ? (' · ' + payload.note) : '';
+      setCodexMessage('ok', '测试成功：' + (payload.accountName || payload.accountId || accountId || 'Codex 账号') + transport + ' · ' + modelCount + sampleModels + note);
+    }).catch((error) => {
+      setCodexMessage('error', error && error.message ? error.message : String(error));
+    });
+    return;
+  }
+
   const setDefault = event.target.closest('[data-codex-account-default]');
   if (setDefault) {
     const accountId = setDefault.getAttribute('data-codex-account-default');
@@ -4409,8 +5089,15 @@ try {
   switchTab('claude');
 }
 
+persistCodexOauthFlowId(readStoredCodexOauthFlowId() || null);
+updateCodexImportUi();
+if (activeCodexOauthFlowId && currentCodexImportMode() === 'openai-oauth') {
+  observeCodexOauth(activeCodexOauthFlowId);
+}
+
 connectStateStream();
 refreshState().catch((error) => setMessage('error', error.message || String(error)));
+loadFallbackConfig().catch(() => {});
 </script>
 </body>
 </html>`;
@@ -4601,10 +5288,16 @@ async function handleAdminConfigSave(req, res, config, claudeFallbackPool, codex
   });
 
   invalidateSharedAdminState();
+
+  const maskTargets = (targets) => Array.isArray(targets) ? targets.map((t) => ({ ...t, apiKey: maskToken(t.apiKey) })) : [];
   writeJson(res, 200, {
     ok: true,
     saved: true,
-    settings: nextSettings,
+    settings: {
+      fallbacks: { targets: maskTargets(nextSettings.fallbacks.targets) },
+      claude: { fallbacks: { targets: maskTargets(nextSettings.claude.fallbacks.targets) } },
+      codex: { fallbacks: { targets: maskTargets(nextSettings.codex.fallbacks.targets) } }
+    },
     bridge: {
       envPath
     }
@@ -4660,6 +5353,396 @@ async function handleAdminConfigTest(req, res) {
   }
 }
 
+async function handleAdminCodexOAuthStart(req, res) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const account = body && body.account && typeof body.account === "object" ? body.account : {};
+  const flow = createPendingCodexOAuthFlow({
+    account: {
+      id: account.id ? String(account.id).trim() : null,
+      name: account.name ? String(account.name).trim() : null,
+      model: account.model ? String(account.model).trim() : DEFAULT_CODEX_MODEL
+    }
+  });
+
+  writeJson(res, 200, {
+    ok: true,
+    flowId: flow.id,
+    state: flow.state,
+    authorizeUrl: flow.authorizeUrl,
+    redirectUri: OPENAI_OAUTH_REDIRECT_URI
+  });
+}
+
+async function finalizeCodexOAuthFlow(flow, input, config, accountOverride = {}) {
+  if (!flow) {
+    throw new Error("OAuth 授权流程不存在或已过期。");
+  }
+
+  const code = String(input && input.code ? input.code : "").trim();
+  const state = String(input && input.state ? input.state : "").trim();
+  if (!code) {
+    const error = new Error("回调信息里缺少 code。");
+    error.status = 400;
+    error.type = "invalid_request_error";
+    throw error;
+  }
+  if (state && String(flow.state || "") !== state) {
+    const error = new Error("OAuth state 不匹配，请重新发起授权。");
+    error.status = 400;
+    error.type = "invalid_request_error";
+    throw error;
+  }
+
+  flow.callbackReceivedAtMs = Date.now();
+
+  const tokenPayload = await exchangeCodexAuthorizationCode(code, flow.verifier);
+  const accessToken = tokenPayload && (tokenPayload.access_token || tokenPayload.accessToken)
+    ? String(tokenPayload.access_token || tokenPayload.accessToken)
+    : "";
+  const refreshToken = tokenPayload && (tokenPayload.refresh_token || tokenPayload.refreshToken)
+    ? String(tokenPayload.refresh_token || tokenPayload.refreshToken)
+    : "";
+  const expiresIn = Number(tokenPayload && (tokenPayload.expires_in || tokenPayload.expiresIn || 0)) || 0;
+  const expiresAt = expiresIn > 0 ? Date.now() + expiresIn * 1000 : null;
+  const clientId = tokenPayload && tokenPayload.client_id
+    ? String(tokenPayload.client_id)
+    : OPENAI_OAUTH_CLIENT_ID;
+  const storedAccount = flow.account && typeof flow.account === "object" ? flow.account : {};
+  const mergedAccount = {
+    ...storedAccount,
+    ...(accountOverride && typeof accountOverride === "object" ? accountOverride : {})
+  };
+  const model = String(mergedAccount.model || DEFAULT_CODEX_MODEL).trim() || DEFAULT_CODEX_MODEL;
+  const accountIdFromToken = extractOpenAiAccountIdFromJwt(accessToken);
+  const email = extractEmailFromJwt(accessToken);
+  // OAuth 导入始终以 OpenAI 官方 account_id 作为稳定主键，避免改备注后生成重复记录。
+  const id = String(accountIdFromToken || "").trim();
+  const name = String(mergedAccount.name || email || accountIdFromToken || id).trim();
+
+  if (!accessToken || !refreshToken || !accountIdFromToken) {
+    const error = new Error("OpenAI OAuth 返回的凭证不完整，未能提取 access_token / refresh_token / account_id。");
+    error.status = 502;
+    error.type = "api_error";
+    throw error;
+  }
+
+  if (!id) {
+    const error = new Error("无法确定 Codex 账号 ID，OpenAI OAuth 返回里缺少 account_id。");
+    error.status = 400;
+    error.type = "invalid_request_error";
+    throw error;
+  }
+
+  const credentialBundle = {
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    defaultModel: model,
+    model,
+    tokens: {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      account_id: accountIdFromToken
+    },
+    last_refresh: new Date().toISOString()
+  };
+
+  if (tokenPayload && tokenPayload.id_token) {
+    credentialBundle.tokens.id_token = String(tokenPayload.id_token);
+  }
+
+  upsertOpaqueAccountToFile(config.codexAccountsPath, {
+    id,
+    name,
+    enabled: mergedAccount.enabled !== false,
+    priority: Number(mergedAccount.priority || 0) || undefined,
+    baseUrl: mergedAccount.baseUrl ? String(mergedAccount.baseUrl).trim() : "https://chatgpt.com",
+    model,
+    probeModel: model,
+    accessToken,
+    refreshToken,
+    expiresAt,
+    clientId,
+    account_id: accountIdFromToken,
+    chatGptAccountId: accountIdFromToken,
+    credentialBundle,
+    source: "codex-openai-oauth"
+  });
+
+  invalidateSharedAdminState();
+
+  const result = {
+    ok: true,
+    imported: true,
+    flowCompleted: true,
+    completed: true,
+    state: "completed",
+    accountId: id,
+    email: email || null,
+    note: `Codex OAuth 已完成，账号 ${name || id} 已写入号池。`,
+    credentialBundle: {
+      ...credentialBundle,
+      tokens: {
+        ...credentialBundle.tokens,
+        access_token: maskToken(accessToken),
+        refresh_token: maskToken(refreshToken),
+        ...(credentialBundle.tokens.id_token ? { id_token: maskToken(credentialBundle.tokens.id_token) } : {})
+      }
+    }
+  };
+
+  flow.finalResult = result;
+  return result;
+}
+
+async function handleAdminCodexOAuthComplete(req, res, config) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const input = String(body && body.input ? body.input : "").trim();
+  const flowId = String(body && body.flowId ? body.flowId : "").trim();
+  const account = body && body.account && typeof body.account === "object" ? body.account : {};
+
+  if (!input) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "缺少 OpenAI OAuth 回调信息。"
+      }
+    });
+    return;
+  }
+
+  let parsedInput;
+  try {
+    parsedInput = parseCodexAuthorizationInput(input);
+  } catch {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "无法解析回调信息，请粘贴完整 callback URL。"
+      }
+    });
+    return;
+  }
+
+  const code = String(parsedInput && parsedInput.code ? parsedInput.code : "").trim();
+  const state = String(parsedInput && parsedInput.state ? parsedInput.state : "").trim();
+  if (!code) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "回调信息里缺少 code。"
+      }
+    });
+    return;
+  }
+
+  let flow = getPendingCodexOAuthFlow(flowId);
+  if (!flow && state) {
+    flow = findPendingCodexOAuthFlowByState(state);
+  }
+
+  if (!flow) {
+    writeJson(res, 410, {
+      ok: false,
+      error: {
+        type: "expired_error",
+        message: "OAuth 授权流程已过期，请重新点击“Codex 授权”。"
+      }
+    });
+    return;
+  }
+  try {
+    const result = await finalizeCodexOAuthFlow(flow, { code, state }, config, account);
+    deletePendingCodexOAuthFlow(flow.id);
+    writeJson(res, 200, result);
+  } catch (error) {
+    writeJson(res, Number(error && error.status ? error.status : 502) || 502, {
+      ok: false,
+      error: {
+        type: error && error.type ? error.type : "authentication_error",
+        message: error && error.message ? error.message : String(error)
+      },
+      details: error && error.details ? error.details : null
+    });
+    return;
+  }
+}
+
+async function handleCodexOAuthCallback(req, res, config, url) {
+  const code = String(url.searchParams.get("code") || "").trim();
+  const state = String(url.searchParams.get("state") || "").trim();
+  const flow = findPendingCodexOAuthFlowByState(state);
+
+  if (!state || !flow) {
+    writeHtml(res, 404, renderAccountCallbackPage("Codex 授权流程已失效", "这个授权流程已经过期或不存在，请回到管理台重新发起。", "error"));
+    return;
+  }
+
+  if (Date.now() - flow.createdAtMs >= ACCOUNT_LOGIN_FLOW_TTL_MS) {
+    deletePendingCodexOAuthFlow(flow.id);
+    writeHtml(res, 410, renderAccountCallbackPage("Codex 授权流程已过期", "请返回管理台重新点击“Codex 授权”。", "error"));
+    return;
+  }
+
+  try {
+    const result = await finalizeCodexOAuthFlow(flow, { code, state }, config);
+    writeHtml(res, 200, renderAccountCallbackPage("Codex 授权已完成", result.note || "Codex 账号已自动写入号池。", "ok"));
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    flow.finalResult = {
+      ok: false,
+      completed: true,
+      state: "oauth_failed",
+      note: `Codex 授权回调已收到，但导入失败：${message}`
+    };
+    writeHtml(res, Number(error && error.status ? error.status : 500) || 500, renderAccountCallbackPage("Codex 授权失败", message, "error"));
+  }
+}
+
+async function handleAdminCodexOAuthStatus(req, res, url) {
+  const flowId = url.searchParams.get("flowId") ? String(url.searchParams.get("flowId")).trim() : "";
+  if (!flowId) {
+    writeJson(res, 400, { error: { type: "invalid_request_error", message: "flowId is required" } });
+    return;
+  }
+
+  const flow = getPendingCodexOAuthFlow(flowId);
+  if (!flow) {
+    writeJson(res, 404, { error: { type: "not_found_error", message: "oauth flow not found or expired" } });
+    return;
+  }
+
+  if (Date.now() - flow.createdAtMs >= ACCOUNT_LOGIN_FLOW_TTL_MS) {
+    deletePendingCodexOAuthFlow(flowId);
+    writeJson(res, 410, { error: { type: "expired_error", message: "oauth flow expired" } });
+    return;
+  }
+
+  if (flow.finalResult) {
+    const payload = flow.finalResult;
+    deletePendingCodexOAuthFlow(flowId);
+    writeJson(res, 200, payload);
+    return;
+  }
+
+  if (flow.callbackReceivedAtMs) {
+    writeJson(res, 200, {
+      ok: true,
+      completed: false,
+      state: "finalizing_oauth",
+      message: "授权回调已收到，正在写入 Codex 账号。"
+    });
+    return;
+  }
+
+  writeJson(res, 200, {
+    ok: true,
+    completed: false,
+    state: "waiting_oauth",
+    message: "OpenAI 登录页已打开，等待你完成授权。"
+  });
+}
+
+async function handleAdminSnapshotTest(req, res, config, authProvider) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const alias = String(body && body.alias ? body.alias : "").trim();
+
+  if (!alias) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "缺少要测试的账号快照 alias。"
+      }
+    });
+    return;
+  }
+
+  const snapshotEntry = getSnapshotEntry(alias);
+  if (!snapshotEntry) {
+    writeJson(res, 404, {
+      ok: false,
+      error: {
+        type: "not_found_error",
+        message: `snapshot not found for alias: ${alias}`
+      }
+    });
+    return;
+  }
+
+  const resolvedAuth = resolveSnapshotAuthPayload(alias, config.accountsPath);
+  const authPayload = resolvedAuth && resolvedAuth.payload ? resolvedAuth.payload : null;
+  if (!authPayload || !authPayload.accessToken) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "该账号快照缺少可测试的登录凭证，请重新登录后再试。"
+      }
+    });
+    return;
+  }
+
+  const gatewayUser = snapshotEntry.metadata && snapshotEntry.metadata.gatewayUser
+    ? snapshotEntry.metadata.gatewayUser
+    : null;
+  const snapshot = {
+    alias,
+    dir: snapshotEntry.dir,
+    gatewayUser,
+    authPayloadUser: authPayload && authPayload.user ? authPayload.user : null,
+    accountState: null
+  };
+
+  const configuredAccounts = authProvider && typeof authProvider.getConfiguredAccounts === "function"
+    ? authProvider.getConfiguredAccounts()
+    : [];
+  const matchedAccount = findMatchingConfiguredAccount(configuredAccounts, snapshot);
+  if (matchedAccount) {
+    snapshot.accountState = {
+      id: matchedAccount.id,
+      invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
+      lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
+    };
+  }
+
+  const userId = gatewayUser && gatewayUser.id ? String(gatewayUser.id) : "";
+  quotaCache.delete(buildQuotaCacheKey(alias, userId));
+
+  const quota = await resolveSnapshotQuota(config, snapshot, authPayload);
+  writeSnapshotQuotaState(snapshotEntry.dir, {
+    ...quota,
+    stale: false
+  });
+
+  snapshot.quota = quota;
+  syncSnapshotAccountState(authProvider, snapshot);
+  invalidateSharedAdminState();
+
+  if (!quota.available) {
+    writeJson(res, 502, {
+      ok: false,
+      alias,
+      quota,
+      error: {
+        type: "api_error",
+        message: quota.error || "账号测试失败"
+      }
+    });
+    return;
+  }
+
+  writeJson(res, 200, {
+    ok: true,
+    tested: true,
+    alias,
+    quota,
+    accountState: snapshot.accountState || null
+  });
+}
+
 function writeAccountsState(filePath, state) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(
@@ -4676,6 +5759,95 @@ function writeAccountsState(filePath, state) {
 async function handleAdminCodexAccountImport(req, res, config) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
   const account = body && body.account && typeof body.account === "object" ? body.account : {};
+
+  // Detect OpenAI token format: { tokens: { access_token, refresh_token, ... } }
+  // or flat { accessToken, refreshToken, ... }
+  const tokens = account.tokens && typeof account.tokens === "object" ? account.tokens : null;
+  const accessToken = tokens
+    ? (tokens.access_token || tokens.accessToken || null)
+    : (account.accessToken || account.access_token || null);
+  const refreshToken = tokens
+    ? (tokens.refresh_token || tokens.refreshToken || null)
+    : (account.refreshToken || account.refresh_token || null);
+  const accountId = tokens
+    ? (tokens.account_id || tokens.accountId || null)
+    : (account.account_id || account.accountId || null);
+  const model = String(account.model || DEFAULT_CODEX_MODEL).trim() || DEFAULT_CODEX_MODEL;
+
+  if (accessToken) {
+    // OpenAI structured token import
+    const id = String(account.id || account.name || accountId || "").trim();
+    const name = String(account.name || id).trim();
+
+    if (!id) {
+      writeJson(res, 400, {
+        ok: false,
+        error: {
+          type: "invalid_request_error",
+          message: "Codex 账号需要提供 id（可从 account_id 自动提取）。"
+        }
+      });
+      return;
+    }
+
+    // Parse JWT exp for expiresAt
+    let expiresAt = null;
+    try {
+      const parts = String(accessToken).split(".");
+      if (parts.length >= 2) {
+        const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+        if (payload && payload.exp) {
+          expiresAt = payload.exp * 1000;
+        }
+      }
+    } catch {
+      // Ignore JWT parse errors
+    }
+
+    // Extract clientId from JWT if present
+    let clientId = null;
+    try {
+      const parts = String(accessToken).split(".");
+      if (parts.length >= 2) {
+        const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+        if (payload && payload.client_id) {
+          clientId = String(payload.client_id);
+        }
+      }
+    } catch {
+      // Ignore JWT parse errors
+    }
+
+    upsertOpaqueAccountToFile(config.codexAccountsPath, {
+      id,
+      name,
+      enabled: account.enabled !== false,
+      priority: Number(account.priority || 0) || undefined,
+      baseUrl: account.baseUrl ? String(account.baseUrl).trim() : null,
+      model,
+      probeModel: model,
+      accessToken: String(accessToken),
+      refreshToken: refreshToken ? String(refreshToken) : null,
+      expiresAt,
+      clientId,
+      credentialBundle: {
+        accessToken: String(accessToken),
+        defaultModel: model,
+        model
+      },
+      source: "codex-openai-token-import"
+    });
+
+    invalidateSharedAdminState();
+    writeJson(res, 200, {
+      ok: true,
+      imported: true,
+      accountId: id
+    });
+    return;
+  }
+
+  // Legacy credentialBundle import
   const id = String(account.id || account.name || "").trim();
   const name = String(account.name || id).trim();
   const credentialBundle = account.credentialBundle && typeof account.credentialBundle === "object"
@@ -4687,7 +5859,7 @@ async function handleAdminCodexAccountImport(req, res, config) {
       ok: false,
       error: {
         type: "invalid_request_error",
-        message: "Codex 账号需要提供 id 和 credentialBundle。"
+        message: "Codex 账号需要提供 id 和 credentialBundle，或提供 accessToken/refreshToken。"
       }
     });
     return;
@@ -4699,7 +5871,13 @@ async function handleAdminCodexAccountImport(req, res, config) {
     enabled: account.enabled !== false,
     priority: Number(account.priority || 0) || undefined,
     baseUrl: account.baseUrl ? String(account.baseUrl).trim() : null,
-    credentialBundle,
+    model,
+    probeModel: model,
+    credentialBundle: {
+      ...credentialBundle,
+      defaultModel: model,
+      model
+    },
     source: "codex-manual-import"
   });
 
@@ -4709,6 +5887,54 @@ async function handleAdminCodexAccountImport(req, res, config) {
     imported: true,
     accountId: id
   });
+}
+
+async function handleAdminCodexAccountTest(req, res, codexClient) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const accountId = String(body && body.accountId ? body.accountId : "").trim();
+
+  if (!accountId) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "缺少要测试的 Codex 账号 ID。"
+      }
+    });
+    return;
+  }
+
+  if (!codexClient || typeof codexClient.probeAccount !== "function") {
+    writeJson(res, 503, {
+      ok: false,
+      error: {
+        type: "service_unavailable_error",
+        message: "Codex 测试执行器未启用。"
+      }
+    });
+    return;
+  }
+
+  try {
+    const result = await codexClient.probeAccount(accountId);
+    invalidateSharedAdminState();
+    writeJson(res, 200, {
+      ok: true,
+      tested: true,
+      ...result
+    });
+  } catch (error) {
+    invalidateSharedAdminState();
+    const status = Number(error && error.status ? error.status : 502) || 502;
+    writeJson(res, status, {
+      ok: false,
+      error: {
+        type: error && error.type ? error.type : "api_error",
+        message: error && error.message ? error.message : String(error)
+      },
+      details: error && error.details ? error.details : null
+    });
+  }
 }
 
 async function handleAdminCodexAccountDelete(req, res, config) {
@@ -5212,12 +6438,18 @@ module.exports = {
   handleAdminConfigTest,
   handleAdminConfigSave,
   handleAdminSnapshotCreate,
+  handleAdminSnapshotTest,
   handleAdminSnapshotActivate,
   handleAdminSnapshotDelete,
   handleAdminGatewayLogin,
   handleAdminGatewayLogout,
   handleAdminCaptureAccount,
+  handleAdminCodexOAuthStart,
+  handleAdminCodexOAuthComplete,
+  handleAdminCodexOAuthStatus,
+  handleCodexOAuthCallback,
   handleAdminCodexAccountImport,
+  handleAdminCodexAccountTest,
   handleAdminCodexAccountDelete,
   handleAdminCodexAccountSetDefault,
   handleAdminCodexAccountToggle,
@@ -5227,6 +6459,10 @@ module.exports = {
   handleAdminAccountLoginCancel,
   refreshAllSnapshotQuotas,
   __private__: {
+    buildCodexAuthorizeUrl,
+    parseCodexAuthorizationInput,
+    finalizeCodexOAuthFlow,
+    extractOpenAiAccountIdFromJwt,
     hasSnapshotArtifactState,
     isQuotaPendingFailure,
     readSnapshotQuotaState,

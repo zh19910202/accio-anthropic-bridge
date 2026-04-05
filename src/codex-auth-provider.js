@@ -9,6 +9,15 @@ const log = require("./logger");
 const INVALIDATION_MS = 5 * 60 * 1000;
 const SAVE_DEBOUNCE_MS = 500;
 
+function pickFirst(...values) {
+  for (const v of values) {
+    if (v !== null && v !== undefined && String(v).trim() !== "") {
+      return String(v);
+    }
+  }
+  return null;
+}
+
 function normalizeStrategy(strategy) {
   const value = String(strategy || "round_robin").trim().toLowerCase();
   return ["round_robin", "random", "fixed"].includes(value) ? value : "round_robin";
@@ -17,6 +26,50 @@ function normalizeStrategy(strategy) {
 function parseJsonFile(filePath) {
   const text = fs.readFileSync(filePath, "utf8");
   return JSON.parse(text);
+}
+
+function mergeCredentialBundle(existingBundle, incomingBundle) {
+  if (!incomingBundle || typeof incomingBundle !== "object") {
+    return existingBundle && typeof existingBundle === "object" ? { ...existingBundle } : {};
+  }
+
+  const existing = existingBundle && typeof existingBundle === "object" ? existingBundle : {};
+  const next = {
+    ...existing,
+    ...incomingBundle
+  };
+
+  if (
+    existing.tokens && typeof existing.tokens === "object" &&
+    incomingBundle.tokens && typeof incomingBundle.tokens === "object"
+  ) {
+    next.tokens = {
+      ...existing.tokens,
+      ...incomingBundle.tokens
+    };
+  }
+
+  if (
+    existing.headers && typeof existing.headers === "object" &&
+    incomingBundle.headers && typeof incomingBundle.headers === "object"
+  ) {
+    next.headers = {
+      ...existing.headers,
+      ...incomingBundle.headers
+    };
+  }
+
+  if (
+    existing.additionalHeaders && typeof existing.additionalHeaders === "object" &&
+    incomingBundle.additionalHeaders && typeof incomingBundle.additionalHeaders === "object"
+  ) {
+    next.additionalHeaders = {
+      ...existing.additionalHeaders,
+      ...incomingBundle.additionalHeaders
+    };
+  }
+
+  return next;
 }
 
 class CodexAuthProvider {
@@ -140,9 +193,67 @@ class CodexAuthProvider {
       return null;
     }
 
-    const credentialBundle = account.credentialBundle && typeof account.credentialBundle === "object"
+    const bundle = account.credentialBundle && typeof account.credentialBundle === "object"
       ? account.credentialBundle
-      : null;
+      : {};
+    const bundleTokens = bundle.tokens && typeof bundle.tokens === "object"
+      ? bundle.tokens
+      : {};
+
+    // 从顶层或 credentialBundle 中提取 token（兼容 camelCase 和 snake_case）
+    const accessToken = pickFirst(
+      account.accessToken,
+      account.access_token,
+      bundleTokens.access_token,
+      bundleTokens.accessToken,
+      bundle.accessToken,
+      bundle.access_token
+    );
+    const refreshToken = pickFirst(
+      account.refreshToken,
+      account.refresh_token,
+      bundleTokens.refresh_token,
+      bundleTokens.refreshToken,
+      bundle.refreshToken,
+      bundle.refresh_token
+    );
+
+    let credentialBundle = Object.keys(bundle).length > 0 ? { ...bundle } : null;
+
+    // 如果没有 credentialBundle 但有 accessToken，自动构建
+    if (!credentialBundle && accessToken) {
+      credentialBundle = { accessToken };
+    }
+
+    // 如果 credentialBundle 存在但没有 accessToken，同步进去
+    if (credentialBundle && accessToken && !credentialBundle.accessToken && !credentialBundle.access_token) {
+      credentialBundle = { ...credentialBundle, accessToken };
+    }
+
+    // 从 credentialBundle 中提取 ChatGPT account_id（用于 chatgpt-account-id 请求头）
+    const chatGptAccountId = pickFirst(
+      account.chatGptAccountId,
+      account.chatgpt_account_id,
+      account.account_id,
+      bundleTokens.account_id,
+      bundleTokens.accountId,
+      bundle.account_id,
+      bundle.accountId,
+      bundle.chatgpt_account_id
+    );
+    const probeModel = pickFirst(
+      account.probeModel,
+      account.model,
+      account.preferredModel,
+      bundle.probeModel,
+      bundle.defaultModel,
+      bundle.model
+    );
+    const authMode = pickFirst(
+      account.authMode,
+      bundle.auth_mode,
+      bundle.authMode
+    );
 
     return {
       id,
@@ -152,8 +263,15 @@ class CodexAuthProvider {
       source: account.source || "codex-file",
       baseUrl: account.baseUrl ? String(account.baseUrl) : null,
       credentialBundle,
+      accessToken,
+      refreshToken,
       expiresAt: Number(account.expiresAt || 0) || null,
-      accountId: id
+      clientId: account.clientId ? String(account.clientId) : null,
+      accountId: id,
+      chatGptAccountId,
+      probeModel,
+      model: probeModel,
+      authMode
     };
   }
 
@@ -245,7 +363,8 @@ class CodexAuthProvider {
       return false;
     }
 
-    if (account.expiresAt && account.expiresAt <= Date.now()) {
+    // 如果有 refreshToken，过期的 accessToken 仍可用（请求时刷新）
+    if (account.expiresAt && account.expiresAt <= Date.now() && !account.refreshToken) {
       return false;
     }
 
@@ -324,7 +443,15 @@ class CodexAuthProvider {
       accountName: account.name,
       source: account.source || "codex-file",
       baseUrl: account.baseUrl || null,
-      credentialBundle: account.credentialBundle || null
+      credentialBundle: account.credentialBundle || null,
+      accessToken: account.accessToken || null,
+      refreshToken: account.refreshToken || null,
+      expiresAt: account.expiresAt || null,
+      clientId: account.clientId || null,
+      chatGptAccountId: account.chatGptAccountId || null,
+      probeModel: account.probeModel || account.model || null,
+      model: account.model || account.probeModel || null,
+      authMode: account.authMode || null
     };
   }
 
@@ -406,6 +533,70 @@ class CodexAuthProvider {
 
     this._lastFailures.delete(String(accountId));
     this.save();
+  }
+
+  updateAccountToken(accountId, updates) {
+    if (!accountId || !updates || typeof updates !== "object") {
+      return;
+    }
+
+    const normalizedId = String(accountId);
+    const filePath = this._resolveAccountsPath();
+
+    try {
+      const parsed = parseJsonFile(filePath);
+      const rawAccounts = Array.isArray(parsed)
+        ? parsed
+        : parsed && Array.isArray(parsed.accounts)
+          ? parsed.accounts
+          : [];
+
+      const updated = rawAccounts.map((account) => {
+        const id = String(account.id || account.accountId || account.name || "");
+        if (id !== normalizedId) {
+          return account;
+        }
+
+        const next = { ...account };
+
+        if (updates.accessToken) {
+          next.accessToken = String(updates.accessToken);
+        }
+
+        if (updates.refreshToken) {
+          next.refreshToken = String(updates.refreshToken);
+        }
+
+        if (Object.prototype.hasOwnProperty.call(updates, "expiresAt")) {
+          next.expiresAt = Number(updates.expiresAt) || null;
+        }
+
+        if (updates.credentialBundle && typeof updates.credentialBundle === "object") {
+          next.credentialBundle = mergeCredentialBundle(next.credentialBundle, updates.credentialBundle);
+        }
+
+        if (updates.clientId) {
+          next.clientId = String(updates.clientId);
+        }
+
+        return next;
+      });
+
+      const output = Array.isArray(parsed) ? updated : { ...parsed, accounts: updated };
+      const fs = require("node:fs");
+      const fsp = require("node:fs/promises");
+      const path = require("node:path");
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(output, null, 2) + "\n", "utf8");
+
+      this._fileCache = null;
+      log.info("codex account token updated", { accountId: normalizedId });
+    } catch (error) {
+      log.warn("codex account token update failed", {
+        accountId: normalizedId,
+        error: error && error.message ? error.message : String(error)
+      });
+    }
   }
 
   getSummary() {

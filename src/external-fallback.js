@@ -205,6 +205,10 @@ function normalizeFetchError(error) {
   return normalized;
 }
 
+function isHtmlResponse(contentType) {
+  return /text\/html/i.test(String(contentType || ""));
+}
+
 function buildAnthropicMessageUrls(baseUrl, preferredPath = null) {
   const normalizedBaseUrl = stripTrailingSlash(baseUrl);
   const lower = normalizedBaseUrl.toLowerCase();
@@ -1119,6 +1123,9 @@ class ExternalFallbackClient {
     this.anthropicVersion = String(config.anthropicVersion || DEFAULT_ANTHROPIC_VERSION || "2023-06-01");
     this.reasoningEffort = normalizeReasoningEffort(config.reasoningEffort);
     this.preferredAnthropicMessagesPath = null;
+    this.preferredAnthropicAuthMode = this.protocol === "anthropic"
+      ? (this.preferredAnthropicAuthMode || null)
+      : null;
     this.preferredOpenAiEndpoint = this.protocol === "openai" && this.openaiApiStyle !== "auto"
       ? this.openaiApiStyle
       : null;
@@ -1145,56 +1152,88 @@ class ExternalFallbackClient {
     return buildAnthropicMessageUrls(this.baseUrl, this.preferredAnthropicMessagesPath);
   }
 
-  async fetchAnthropicMessageResponse(body) {
-    const requestOptions = {
-      method: "POST",
-      headers: this.buildAnthropicHeaders(),
-      body: JSON.stringify(body)
-    };
+  buildAnthropicAuthModes() {
+    const modes = ["x-api-key", "bearer"];
+    if (this.preferredAnthropicAuthMode && modes.includes(this.preferredAnthropicAuthMode)) {
+      return [this.preferredAnthropicAuthMode, ...modes.filter((mode) => mode !== this.preferredAnthropicAuthMode)];
+    }
+    return modes;
+  }
 
+  async fetchAnthropicMessageResponse(body) {
     let lastResponse = null;
     for (const url of this.buildAnthropicMessageUrls()) {
-      log.info("external fallback anthropic request begin", {
-        protocol: this.transportName(),
-        url
-      });
-      const response = body && body.stream === true
-        ? await this.fetchStreamWithRetry(url, requestOptions)
-        : await this.fetchWithRetry(url, {
-            ...requestOptions,
-            signal: AbortSignal.timeout(this.timeoutMs)
-          });
-      lastResponse = response;
+      const authModes = this.buildAnthropicAuthModes();
+      for (let authIndex = 0; authIndex < authModes.length; authIndex += 1) {
+        const authMode = authModes[authIndex];
+        const requestOptions = {
+          method: "POST",
+          headers: this.buildAnthropicHeaders(authMode),
+          body: JSON.stringify(body)
+        };
 
-      if (response.status === 404) {
-        log.warn("external fallback anthropic request got 404, trying next path", {
+        log.info("external fallback anthropic request begin", {
           protocol: this.transportName(),
-          url
+          url,
+          authMode
         });
-        continue;
-      }
-
-      const contentType = String(response.headers.get("content-type") || "");
-      if (/application\/json/i.test(contentType)) {
-        try {
-          const probe = await response.clone().json();
-          if (isAnthropicWrappedNotFoundPayload(probe)) {
-            log.warn("external fallback anthropic request got wrapped 404, trying next path", {
-              protocol: this.transportName(),
-              url
+        const response = body && body.stream === true
+          ? await this.fetchStreamWithRetry(url, requestOptions)
+          : await this.fetchWithRetry(url, {
+              ...requestOptions,
+              signal: AbortSignal.timeout(this.timeoutMs)
             });
-            continue;
-          }
-        } catch {
-          // Ignore probe parse failure and let caller handle the actual response.
+        lastResponse = response;
+
+        if ((response.status === 401 || response.status === 403) && authIndex < authModes.length - 1) {
+          log.warn("external fallback anthropic auth rejected, trying alternate auth mode", {
+            protocol: this.transportName(),
+            url,
+            authMode,
+            status: response.status
+          });
+          continue;
         }
+
+        if (response.status === 404) {
+          log.warn("external fallback anthropic request got 404, trying next path", {
+            protocol: this.transportName(),
+            url
+          });
+          break;
+        }
+
+        const contentType = String(response.headers.get("content-type") || "");
+        if (isHtmlResponse(contentType)) {
+          log.warn("external fallback anthropic request got html response, trying next path", {
+            protocol: this.transportName(),
+            url
+          });
+          break;
+        }
+
+        if (/application\/json/i.test(contentType)) {
+          try {
+            const probe = await response.clone().json();
+            if (isAnthropicWrappedNotFoundPayload(probe)) {
+              log.warn("external fallback anthropic request got wrapped 404, trying next path", {
+                protocol: this.transportName(),
+                url
+              });
+              break;
+            }
+          } catch {
+            // Ignore probe parse failure and let caller handle the actual response.
+          }
+        }
+
+        this.preferredAnthropicMessagesPath = String(url).endsWith("/v1/messages")
+          ? "/v1/messages"
+          : "/messages";
+        this.preferredAnthropicAuthMode = authMode;
+
+        return response;
       }
-
-      this.preferredAnthropicMessagesPath = String(url).endsWith("/v1/messages")
-        ? "/v1/messages"
-        : "/messages";
-
-      return response;
     }
 
     return lastResponse;
@@ -1257,9 +1296,14 @@ class ExternalFallbackClient {
     return this._fetchWithRetryCore(url, options);
   }
 
-  buildAnthropicHeaders() {
+  buildAnthropicHeaders(authMode = null) {
+    const mode = authMode || this.preferredAnthropicAuthMode || "x-api-key";
+    const authHeaders = mode === "bearer"
+      ? { authorization: "Bearer " + this.apiKey }
+      : { "x-api-key": this.apiKey };
+
     return {
-      "x-api-key": this.apiKey,
+      ...authHeaders,
       "anthropic-version": this.anthropicVersion,
       "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
       "user-agent": "AnthropicSDK/TypeScript 0.39.0",
