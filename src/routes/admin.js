@@ -3092,96 +3092,96 @@ button { font: inherit; cursor: pointer; }
     </section>
   </section>
 
-  <section class=”tabPanel” data-tab-panel=”codex”>
-    <nav class=”claudeSubTabs” id=”codex-sub-tabs”>
-      <button class=”claudeSubTabBtn active” type=”button” data-codex-section-btn=”accounts”>\u8D26\u53F7\u6C60</button>
-      <button class=”claudeSubTabBtn” type=”button” data-codex-section-btn=”fallbacks”>\u6258\u5E95\u6E20\u9053</button>
+  <section class="tabPanel" data-tab-panel="codex">
+    <nav class="claudeSubTabs" id="codex-sub-tabs">
+      <button class="claudeSubTabBtn active" type="button" data-codex-section-btn="accounts">\u8D26\u53F7\u6C60</button>
+      <button class="claudeSubTabBtn" type="button" data-codex-section-btn="fallbacks">\u6258\u5E95\u6E20\u9053</button>
     </nav>
 
-    <section class=”panel codexSection active” data-codex-section=”accounts”>
-      <div class=”sectionHeader”>
+    <section class="panel codexSection active" data-codex-section="accounts">
+      <div class="sectionHeader">
         <div>
-          <h2>Codex 账号池</h2>
-          <div class=”panelSub”>手动导入 Codex 登录凭证包，Responses 请求将优先从这组账号中选择，不会跨到 Claude 账号池。</div>
+          <h2>\u8D26\u53F7\u6C60</h2>
+          <div class="panelSub">\u624B\u52A8\u5BFC\u5165 Codex \u767B\u5F55\u51ED\u8BC1\u5305\uFF0CResponses \u8BF7\u6C42\u5C06\u4F18\u5148\u4ECE\u8FD9\u7EC4\u8D26\u53F7\u4E2D\u9009\u62E9\uFF0C\u4E0D\u4F1A\u8DE8\u5230 Claude \u8D26\u53F7\u6C60\u3002</div>
         </div>
       </div>
-      <div class=”kv” id=”codex-overview-kv”></div>
-      <div class=”settingsGrid”>
-        <div class=”field”>
-          <label>导入方式</label>
-          <select id=”codex-import-mode”>
-            <option value=”openai-oauth”>OpenAI OAuth</option>
-            <option value=”json-bundle”>JSON 凭证</option>
+      <div class="kv" id="codex-overview-kv"></div>
+      <div class="settingsGrid">
+        <div class="field">
+          <label>\u5BFC\u5165\u65B9\u5F0F</label>
+          <select id="codex-import-mode">
+            <option value="openai-oauth">OpenAI OAuth</option>
+            <option value="json-bundle">JSON \u51ED\u8BC1</option>
           </select>
         </div>
-        <div class=”field” id=”codex-account-id-field”>
-          <label>账号 ID</label>
-          <input id=”codex-account-id” type=”text” placeholder=”codex_primary” autocomplete=”off” />
+        <div class="field" id="codex-account-id-field">
+          <label>\u8D26\u53F7 ID</label>
+          <input id="codex-account-id" type="text" placeholder="codex_primary" autocomplete="off" />
         </div>
-        <div class=”field” id=”codex-account-name-field”>
-          <label>使用备注</label>
-          <input id=”codex-account-name” type=”text” placeholder=”例如：主力号 / 备用号 / 团队号” autocomplete=”off” />
+        <div class="field" id="codex-account-name-field">
+          <label>\u4F7F\u7528\u5907\u6CE8</label>
+          <input id="codex-account-name" type="text" placeholder="\u4F8B\u5982\uFF1A\u4E3B\u529B\u53F7 / \u5907\u7528\u53F7 / \u56E2\u961F\u53F7" autocomplete="off" />
         </div>
-        <div class=”field” id=”codex-account-model-field”>
-          <label>模型</label>
-          <select id=”codex-account-model”>
-            <option value=”gpt-5.4”>gpt-5.4</option>
+        <div class="field" id="codex-account-model-field">
+          <label>\u6A21\u578B</label>
+          <select id="codex-account-model">
+            <option value="gpt-5.4">gpt-5.4</option>
           </select>
-          <div class=”fieldHint tight”>官方 OpenAI OAuth 账号当前使用 <code>gpt-5.4</code>。</div>
+          <div class="fieldHint tight">\u5B98\u65B9 OpenAI OAuth \u8D26\u53F7\u5F53\u524D\u4F7F\u7528 <code>gpt-5.4</code>\u3002</div>
         </div>
-        <div class=”field” id=”codex-oauth-action-field”>
-          <label>授权</label>
-          <button class=”btn primary” id=”start-codex-oauth-btn”>Codex 授权</button>
-          <div class=”fieldHint tight”>登录完成后会自动回写并导入号池。</div>
+        <div class="field" id="codex-oauth-action-field">
+          <label>\u6388\u6743</label>
+          <button class="btn primary" id="start-codex-oauth-btn">Codex \u6388\u6743</button>
+          <div class="fieldHint tight">\u767B\u5F55\u5B8C\u6210\u540E\u4F1A\u81EA\u52A8\u56DE\u5199\u5E76\u5BFC\u5165\u53F7\u6C60\u3002</div>
         </div>
-        <div class=”field wide” id=”codex-account-base-url-field”>
+        <div class="field wide" id="codex-account-base-url-field">
           <label>Base URL</label>
-          <input id=”codex-account-base-url” type=”text” placeholder=”https://api.openai.com/v1” autocomplete=”off” />
+          <input id="codex-account-base-url" type="text" placeholder="https://api.openai.com/v1" autocomplete="off" />
         </div>
-        <div class=”field wide” id=”codex-credential-field”>
-          <label id=”codex-credential-label”>OpenAI OAuth 回调 URL</label>
-          <textarea id=”codex-credential-bundle” rows=”8” placeholder=”粘贴 http://localhost:1455/auth/callback?code=...&state=...”></textarea>
-          <div class=”fieldHint” id=”codex-credential-hint”>先点击下方 <code>Codex 授权</code> 打开 OpenAI 登录页。完成登录后，把浏览器地址栏里的完整 callback URL 粘贴到这里，再点击”完成授权并导入”。</div>
+        <div class="field wide" id="codex-credential-field">
+          <label id="codex-credential-label">OpenAI OAuth \u56DE\u8C03 URL</label>
+          <textarea id="codex-credential-bundle" rows="8" placeholder="\u7C98\u8D34 http://localhost:1455/auth/callback?code=...&state=..."></textarea>
+          <div class="fieldHint" id="codex-credential-hint">\u5148\u70B9\u51FB\u4E0B\u65B9 <code>Codex \u6388\u6743</code> \u6253\u5F00 OpenAI \u767B\u5F55\u9875\u3002\u5B8C\u6210\u767B\u5F55\u540E\uFF0C\u628A\u6D4F\u89C8\u5668\u5730\u5740\u680F\u91CC\u7684\u5B8C\u6574 callback URL \u7C98\u8D34\u5230\u8FD9\u91CC\uFF0C\u518D\u70B9\u51FB\u201C\u5B8C\u6210\u6388\u6743\u5E76\u5BFC\u5165\u201D\u3002</div>
         </div>
       </div>
-      <div class=”settingsActions codexImportActions”>
-        <button class=”btn primary” id=”import-codex-account-btn”>完成授权并导入</button>
-        <div id=”codex-message” class=”message info”></div>
+      <div class="settingsActions codexImportActions">
+        <button class="btn primary" id="import-codex-account-btn">\u5B8C\u6210\u6388\u6743\u5E76\u5BFC\u5165</button>
+        <div id="codex-message" class="message info"></div>
       </div>
-      <div class=”list” id=”codex-account-list”></div>
+      <div class="list" id="codex-account-list"></div>
     </section>
 
-    <section class=”panel settingsPanel codexSection” data-codex-section=”fallbacks”>
-      <div class=”sectionHeader”>
+    <section class="panel settingsPanel codexSection" data-codex-section="fallbacks">
+      <div class="sectionHeader">
         <div>
-          <h2>Codex 托底渠道</h2>
-          <div class=”panelSub”>仅用于 Codex 主题；不会影响 Claude Code 的 fallback 顺序。支持 OpenAI compatible 和 Anthropic Messages 混用。</div>
+          <h2>\u6258\u5E95\u6E20\u9053</h2>
+          <div class="panelSub">\u4EC5\u7528\u4E8E Codex \u4E3B\u9898\uFF1B\u4E0D\u4F1A\u5F71\u54CD Claude Code \u7684 fallback \u987A\u5E8F\u3002\u652F\u6301 OpenAI compatible \u548C Anthropic Messages \u6DF7\u7528\u3002</div>
         </div>
-        <button class=”btn” id=”add-codex-fallback-target-btn”>+ 新增渠道</button>
+        <button class="btn" id="add-codex-fallback-target-btn">+ \u65B0\u589E\u6E20\u9053</button>
       </div>
 
-      <div class=”settingsMeta”>
-        <div class=”miniStat”>
-          <span class=”miniStatIcon”>🔗</span>
-          <div class=”miniStatBody”>
-            <div class=”miniStatLabel”>渠道概览</div>
-            <div class=”miniStatValue” id=”codex-fallback-status”>未配置</div>
+      <div class="settingsMeta">
+        <div class="miniStat">
+          <span class="miniStatIcon">\uD83D\uDD17</span>
+          <div class="miniStatBody">
+            <div class="miniStatLabel">\u6E20\u9053\u6982\u89C8</div>
+            <div class="miniStatValue" id="codex-fallback-status">\u672A\u914D\u7F6E</div>
           </div>
         </div>
       </div>
 
-      <div class=”fallbackTargets” id=”codex-fallback-targets”></div>
-      <div class=”empty” id=”codex-fallback-empty” style=”display:none”><span class=”empty-icon”>📡</span>暂无 Codex 托底渠道。点击「新增渠道」开始配置。</div>
+      <div class="fallbackTargets" id="codex-fallback-targets"></div>
+      <div class="empty" id="codex-fallback-empty" style="display:none"><span class="empty-icon">\uD83D\uDCE1</span>\u6682\u65E0 Codex \u6258\u5E95\u6E20\u9053\u3002\u70B9\u51FB\u300C\u65B0\u589E\u6E20\u9053\u300D\u5F00\u59CB\u914D\u7F6E\u3002</div>
 
-      <div class=”settingsFooter”>
-        <div class=”settingsActions”>
-          <button class=”btn primary” id=”save-codex-fallback-config-btn”>保存渠道配置</button>
-          <button class=”btn” id=”reload-codex-fallback-config-btn”>重新载入</button>
-          <div id=”codex-config-message” class=”message info”></div>
+      <div class="settingsFooter">
+        <div class="settingsActions">
+          <button class="btn primary" id="save-codex-fallback-config-btn">\u4FDD\u5B58\u6E20\u9053\u914D\u7F6E</button>
+          <button class="btn" id="reload-codex-fallback-config-btn">\u91CD\u65B0\u8F7D\u5165</button>
+          <div id="codex-config-message" class="message info"></div>
         </div>
-        <div class=”settingsTips”>
-          <div class=”settingsTip”><span class=”settingsTipIcon”>💾</span>保存后写入 bridge 根目录 .env，并立即应用到当前进程。</div>
-          <div class=”settingsTip”><span class=”settingsTipIcon”>🔼</span>列表顺序就是兜底尝试顺序，可用「上移 / 下移」调整。</div>
+        <div class="settingsTips">
+          <div class="settingsTip"><span class="settingsTipIcon">\uD83D\uDCBE</span>\u4FDD\u5B58\u540E\u5199\u5165 bridge \u6839\u76EE\u5F55 .env\uFF0C\u5E76\u7ACB\u5373\u5E94\u7528\u5230\u5F53\u524D\u8FDB\u7A0B\u3002</div>
+          <div class="settingsTip"><span class="settingsTipIcon">\uD83D\uDD3C</span>\u5217\u8868\u987A\u5E8F\u5C31\u662F\u5140\u5E95\u5C1D\u8BD5\u987A\u5E8F\uFF0C\u53EF\u7528\u300C\u4E0A\u79FB / \u4E0B\u79FB\u300D\u8C03\u6574\u3002</div>
         </div>
       </div>
     </section>
