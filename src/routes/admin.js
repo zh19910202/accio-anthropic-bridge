@@ -5541,7 +5541,7 @@ async function handleAdminConfigSave(req, res, config, claudeFallbackPool, codex
     ACCIO_FALLBACK_PROTOCOL: primaryClaude ? primaryClaude.protocol : "openai",
     ACCIO_FALLBACK_ANTHROPIC_VERSION: primaryClaude ? primaryClaude.anthropicVersion : "2023-06-01",
     ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(primaryClaude ? primaryClaude.timeoutMs : 60000),
-    ACCIO_CODEX_FALLBACKS_JSON: JSON.stringify(codexTargetsTargets),
+    ACCIO_CODEX_FALLBACKS_JSON: JSON.stringify(codexTargetsToWrite),
     ACCIO_CODEX_FALLBACK_BASE_URL: primaryCodex ? primaryCodex.baseUrl : "",
     ACCIO_CODEX_FALLBACK_API_KEY: primaryCodex ? primaryCodex.apiKey : "",
     ACCIO_CODEX_FALLBACK_MODEL: primaryCodex ? primaryCodex.model : "",
