@@ -997,6 +997,10 @@ async function refreshAllSnapshotQuotas(config, authProvider) {
         accountState: matchedAccount
           ? {
               id: matchedAccount.id,
+              enabled: matchedAccount.enabled !== false,
+              hasToken: Boolean(matchedAccount.accessToken),
+              expiresAt: matchedAccount.expiresAt || null,
+              source: matchedAccount.source || null,
               invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
               lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
             }
@@ -1617,6 +1621,10 @@ async function buildAdminState(config, authProvider, codexAuthProvider, directCl
         accountState: matchedAccount
           ? {
               id: matchedAccount.id,
+              enabled: matchedAccount.enabled !== false,
+              hasToken: Boolean(matchedAccount.accessToken),
+              expiresAt: matchedAccount.expiresAt || null,
+              source: matchedAccount.source || null,
               invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
               lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
             }
@@ -3111,10 +3119,10 @@ button { font: inherit; cursor: pointer; }
               <div class="panelSub">\u672C\u5730\u5DF2\u4FDD\u5B58\u7684 Accio \u767B\u5F55\u8EAB\u4EFD\u3002\u201C\u5207\u6362\u201D\u4F1A\u5C1D\u8BD5\u5C06\u5B83\u8BBE\u4E3A\u5F53\u524D\u6FC0\u6D3B\u8D26\u53F7\u3002</div>
             </div>
           </div>
-          <div class="snapshotFilter" id="snapshot-filter">
-            <button class="filterBtn active" data-snapshot-filter="all">\u5168\u90E8</button>
-            <button class="filterBtn" data-snapshot-filter="available">\u6709\u989D\u5EA6</button>
-            <button class="filterBtn" data-snapshot-filter="exhausted">\u65E0\u989D\u5EA6</button>
+      <div class="snapshotFilter" id="snapshot-filter">
+        <button class="filterBtn active" data-snapshot-filter="all">\u5168\u90E8</button>
+            <button class="filterBtn" data-snapshot-filter="usable">\u53EF\u7528</button>
+            <button class="filterBtn" data-snapshot-filter="unusable">\u4E0D\u53EF\u7528</button>
           </div>
           <div class="list" id="snapshot-list"></div>
         </section>
@@ -4374,8 +4382,61 @@ function renderSnapshots(data) {
             : ('预检于 ' + formatTime(standbyEntry.quotaCheckedAt))
         )
       : '';
-    const hasQuota = quotaHasValue && !quotaIsCached && quota.usagePercent < 100;
-    return '<div class="' + itemClass + '" data-has-quota="' + (hasQuota ? 'yes' : 'no') + '">'
+    const availability = (() => {
+      if (!accountState) {
+        return { usable: false, status: '不可用', reason: '未关联到 bridge 账号池，当前不会参与调度。' };
+      }
+
+      if (accountState.enabled === false) {
+        return { usable: false, status: '不可用', reason: '账号已停用。' };
+      }
+
+      if (!accountState.hasToken) {
+        return { usable: false, status: '不可用', reason: '缺少 access token。' };
+      }
+
+      if (accountState.expiresAt && Number(accountState.expiresAt) <= Date.now()) {
+        return { usable: false, status: '不可用', reason: 'access token 已过期。' };
+      }
+
+      if (cooling) {
+        return {
+          usable: false,
+          status: '不可用',
+          reason: standbyEntry && standbyEntry.nextCheckAt
+            ? ('账号冷却中，预计 ' + formatTime(standbyEntry.nextCheckAt) + ' 后恢复。')
+            : ('账号冷却中，约 ' + formatCountdown(cooldownSeconds) + ' 后恢复。')
+        };
+      }
+
+      if (!quotaHasValue) {
+        if (quota && quota.error === 'missing_auth_payload') {
+          return { usable: false, status: '不可用', reason: '缺少完整凭证，无法确认额度。' };
+        }
+
+        if (quota && quota.error === 'quota_unverified_for_inactive_account') {
+          return { usable: false, status: '不可用', reason: '额度尚未验证，未进入可用队列。' };
+        }
+
+        if (quota && quota.error) {
+          return { usable: false, status: '不可用', reason: '额度查询失败：' + escapeInline(String(quota.error)) };
+        }
+
+        return { usable: false, status: '不可用', reason: '额度状态未知。' };
+      }
+
+      if (quota.usagePercent >= 100) {
+        return { usable: false, status: '不可用', reason: '额度已满，等待恢复。' };
+      }
+
+      if (quotaIsCached) {
+        return { usable: false, status: '不可用', reason: '只有缓存额度，尚未完成实时确认。' };
+      }
+
+      return { usable: true, status: '可用', reason: '账号启用、token 有效且实时额度可用。' };
+    })();
+
+    return '<div class="' + itemClass + '" data-usable="' + (availability.usable ? 'yes' : 'no') + '">'
       + '<div class="itemAvatar">' + avatarChar + '</div>'
       + '<div class="itemTitleRow">'
       + '<h3 class="itemTitle">' + displayName + '</h3>'
@@ -4387,6 +4448,8 @@ function renderSnapshots(data) {
       + (!redundantAlias ? '<div class="itemMeta">' + item.alias + '</div>' : '')
       + (active ? '<div class="itemMeta">Bridge 默认账号：后续额度请求将优先使用该账号</div>' : '')
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
+      + '<div class="itemMeta">调度状态：' + availability.status + '</div>'
+      + (availability.reason ? '<div class="itemMeta hint">' + availability.reason + '</div>' : '')
       + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
       + (quotaMeta ? '<div class="itemMeta hint">' + quotaMeta + '</div>' : '')
       + (quotaHint ? '<div class="itemMeta hint">' + quotaHint + '</div>' : '')
@@ -4680,13 +4743,13 @@ document.getElementById('snapshot-filter').addEventListener('click', (event) => 
 function applySnapshotFilter() {
   const items = els.snapshotList.querySelectorAll('.item');
   items.forEach((item) => {
-    const hasQuota = item.getAttribute('data-has-quota');
+    const usable = item.getAttribute('data-usable');
     if (snapshotFilterMode === 'all') {
       item.style.display = '';
-    } else if (snapshotFilterMode === 'available') {
-      item.style.display = hasQuota === 'yes' ? '' : 'none';
+    } else if (snapshotFilterMode === 'usable') {
+      item.style.display = usable === 'yes' ? '' : 'none';
     } else {
-      item.style.display = hasQuota === 'no' ? '' : 'none';
+      item.style.display = usable === 'no' ? '' : 'none';
     }
   });
 }
