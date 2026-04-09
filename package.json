@@ -2,7 +2,7 @@
   "name": "accio-anthropic-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Anthropic-compatible proxy that bridges requests into Accio's local gateway",
+  "description": "Local bridge for Claude Code, Codex, and Anthropic/OpenAI-compatible clients",
   "main": "src/server.js",
   "scripts": {
     "init-env": "node scripts/init-env.js",

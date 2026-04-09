@@ -1,22 +1,33 @@
 # Accio Anthropic Bridge
 
-把 Anthropic / OpenAI 风格请求桥接到 Accio 本地登录态与本地网关。
+一个面向 `Claude Code` / `Codex` / 通用 Anthropic / OpenAI 客户端的本地桥接器。
+
+它现在的核心价值已经不只是“复用 Accio”，而是：
+
+- 用一个本地入口统一承接 `Anthropic Messages`、`OpenAI Chat Completions`、`OpenAI Responses`
+- 把 `Claude Code` 和 `Codex` 这两类请求分流到不同账号池和不同执行链路
+- 在本地直连、账号池 failover、外部 fallback、多渠道管理之间做统一调度
+- 提供可观测的 Web 管理台和 Electron 桌面壳，方便排查实际出口与账号状态
+
+`Accio` 现在更像是其中一种可选的“本地直连来源”，不是这个项目唯一的存在意义。
 
 当前定位：
 
 - 对外暴露 `Anthropic Messages`、`OpenAI Chat Completions`、`OpenAI Responses` 最小可用子集
 - 同一个 bridge 同时服务 `Claude Code` 与 `Codex` 两个主题
-- `Claude Code` 走 Accio / Claude 账号池，`Codex` 走独立 Codex 凭证池
+- `Claude Code` 可走本地 Claude / Accio 账号池，也可切到外部 Anthropic / OpenAI fallback
+- `Codex` 走独立 Codex 凭证池，并支持单独配置外部上游
 - 优先走主题内主号池，失败后只在同主题内尝试外部上游
 - 支持多账号、额度预检、账号冷却、快照切换、外部兜底渠道
 - 提供 Web 管理台和 Electron 桌面壳
 
 ## 风险说明
 
-- 这是非官方、基于本地行为分析实现的桥接方案
-- Accio 本地接口、认证字段、模型映射、网关行为都可能随版本变化而失效
-- 本项目会复用你机器上的 Accio 登录态，日志、trace、调试输出可能包含敏感信息
-- 是否允许这样使用登录态、是否会触发风控或封禁，需要你自己判断并承担风险
+- 这是非官方、本地优先的桥接方案，不保证与任何上游官方协议完全一致
+- 外部 fallback 的兼容性、模型可用性、工具语义、thinking 能力取决于具体渠道
+- 如果启用本地直连能力，Accio 本地接口、认证字段、模型映射、网关行为都可能随版本变化而失效
+- 如果启用本地账号池或本地登录态复用，日志、trace、调试输出可能包含敏感信息
+- 是否允许这样复用登录态、是否会触发风控或封禁，需要你自己判断并承担风险
 - 只建议用于本地研究、个人实验和协议验证
 
 ## 快速开始
@@ -24,7 +35,7 @@
 要求：
 
 - Node.js >= 22
-- 本机已安装并可正常启动 Accio 桌面端
+- 如需启用本地直连 / 账号快照 / Accio 自动发现，本机需已安装并可正常启动 Accio 桌面端
 
 启动 bridge：
 
@@ -34,7 +45,10 @@ cd accio-anthropic-bridge
 npm start
 ```
 
-首次启动如果没有 `.env`，会自动执行 `npm run setup` 扫描本机 `~/.accio` 并生成配置。
+首次启动如果没有 `.env`，会自动执行 `npm run setup` 生成配置。
+
+- 如果本机存在 `~/.accio`，会自动补齐本地直连相关字段
+- 如果你只打算走外部 fallback，也可以后续直接在管理台里补渠道配置，不必强依赖 Accio
 
 默认地址：
 
@@ -288,11 +302,19 @@ config/
 
 ## 当前状态
 
-这个仓库现在更像一个“可用的本地桥 + 管理台 + 桌面应用”，不是一个追求完整官方协议覆盖的通用网关。
+这个仓库现在更像一个“本地桥接器 + 调度层 + 管理台 + 桌面应用”。
+
+它的重点是：
+
+1. 给 `Claude Code` / `Codex` 提供一个稳定的本地入口
+2. 管理多账号、本地直连与外部渠道之间的实际调度
+3. 把“请求最终走了哪条链路”尽量做成可观测、可配置、可排障
+
+它不是一个追求完整官方协议覆盖的标准网关，也不是一个只为 Accio 服务的薄包装。
 
 如果你只关心使用，优先记住这几件事：
 
-1. 先让 Accio 本机可正常登录
+1. 先决定你要走“本地直连”还是“外部 fallback 为主”
 2. 启动 bridge 后先看 `/admin`
 3. 外部渠道优先用管理台配置，不要手改多份散落配置
 4. 已知支持 `Responses` 的 OpenAI 渠道就直接指定，不要留给 `Auto`
