@@ -99,6 +99,8 @@ npm run manager:open
 - 通过 `Claude Code` / `Codex` 两个主标签管理两套主题
 - 为 `Codex` 手动导入登录凭证包并管理独立账号池
 - 分主题配置多个外部兜底渠道并调整优先级
+- 外部兜底渠道保存后会持久化写入 `.env`，重启后仍会自动加载
+- 外部渠道 `API Key` 在表单里默认隐藏，可通过右侧“眼睛”按钮切换显示或隐藏
 - 测试外部渠道是否可用
 - 通过 SSE 实时同步状态，常见操作不需要手动刷新
 
@@ -124,6 +126,7 @@ npm run desktop:dist
 - 可打包为 macOS 应用
 - 打包后 bridge 从应用资源启动，不依赖仓库源码目录
 - 运行时配置、账号池、session、trace 写入 Electron `userData`
+- 桌面壳启动阶段优先用 `/healthz` 做 bridge 存活探测，避免用管理台重接口阻塞启动
 - 已修复打包态下的路径、图标、Accio 自动拉起、账号快照写入等问题
 
 ## 当前支持
@@ -244,6 +247,11 @@ ACCIO_CODEX_FALLBACK_TIMEOUT_MS=60000
 curl http://127.0.0.1:8082/healthz
 curl http://127.0.0.1:8082/admin/api/state
 ```
+
+说明：
+
+- `/healthz` 用于轻量判活，适合桌面壳启动探测和外部监控
+- `/admin/api/state` 会构建完整管理台状态，信息更全，但开销明显更高
 
 语法检查与测试：
 
