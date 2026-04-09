@@ -17,7 +17,7 @@ const {
   createBridgeError,
   resolveResultError
 } = require("../errors");
-const { shouldFallbackToExternalProvider } = require("../external-fallback");
+const { shouldFallbackToExternalProvider, STREAMING_REQUIRED_RE } = require("../external-fallback");
 const { CORS_HEADERS, writeJson, writeSse } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
 const { applyAnthropicDefaults, canCacheAnthropicRequest } = require("../request-defaults");
@@ -33,32 +33,14 @@ const {
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
 const { generateId } = require("../id");
-const { cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
+const { applyBridgeRequestIdToDirectRequest, cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
 const { resolveSessionBinding } = require("../session-store");
 
 function logRequest(req, message, meta = {}) {
   return logRequestShared(req, message, "anthropic", meta);
 }
 
-function applyBridgeRequestIdToDirectRequest(req, directRequest) {
-  const bridgeRequestId = req && req.bridgeContext && req.bridgeContext.requestId
-    ? String(req.bridgeContext.requestId).trim()
-    : "";
-
-  if (!bridgeRequestId || !directRequest || !directRequest.requestBody || typeof directRequest.requestBody !== "object") {
-    return directRequest;
-  }
-
-  if (!directRequest.requestBody.requestId) {
-    directRequest.requestBody.requestId = bridgeRequestId;
-  }
-
-  if (!directRequest.requestBody.messageId) {
-    directRequest.requestBody.messageId = bridgeRequestId;
-  }
-
-  return directRequest;
-}
+const CRLF_RE = /\r\n?/g;
 
 function fallbackCandidatesForAnthropic(fallbackPool, body) {
   if (!fallbackPool || typeof fallbackPool.getEligibleAnthropic !== "function") {
@@ -172,6 +154,53 @@ function extractAnthropicPayloadText(payload) {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function isAnthropicLongRequestStreamingError(payload) {
+  const error = payload && payload.error;
+  const message = typeof (error && error.message) === "string"
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : "";
+  const type = String(error && error.type ? error.type : payload && payload.type ? payload.type : "").toLowerCase();
+
+  return type === "proxy_error" && STREAMING_REQUIRED_RE.test(message);
+}
+
+function writeAnthropicFallbackCompletionResult({ req, res, body, binding, cacheState, transport, result }) {
+  const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
+  const inputTokens = estimateTokens(flattenAnthropicRequest(body));
+  const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    : estimateTokens(result.text);
+  const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    : inputTokens;
+  const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
+
+  const responseBody = buildMessageResponse(body, result.text || "", {
+    id: result.id || (result.raw && result.raw.id) || generateId("msg"),
+    inputTokens: promptTokens,
+    outputTokens,
+    sessionId: binding.sessionId || null,
+    toolCalls
+  });
+
+  if (cacheState.cacheKey && cacheState.responseCache) {
+    cacheState.responseCache.set(cacheState.cacheKey, {
+      statusCode: 200,
+      body: responseBody,
+      headers: baseHeaders
+    });
+  }
+
+  setTraceResponse(req, res, 200, responseBody, {
+    cacheState: cacheState.cacheKey ? "miss" : null,
+    fallbackTransport: transport
+  });
+  writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
+  return true;
 }
 
 function shouldHideAnthropicThinkingBlock(block) {
@@ -305,14 +334,10 @@ async function relayAnthropicStream(upstreamBody, res, includeThinking) {
       break;
     }
 
-    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    buffer += decoder.decode(chunk, { stream: true }).replace(CRLF_RE, "\n");
 
-    while (true) {
-      const boundaryIndex = buffer.indexOf("\n\n");
-      if (boundaryIndex < 0) {
-        break;
-      }
-
+    let boundaryIndex;
+    while ((boundaryIndex = buffer.indexOf("\n\n")) >= 0) {
       const rawEvent = buffer.slice(0, boundaryIndex);
       buffer = buffer.slice(boundaryIndex + 2);
 
@@ -325,7 +350,7 @@ async function relayAnthropicStream(upstreamBody, res, includeThinking) {
   }
 
   buffer += decoder.decode();
-  buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  buffer = buffer.replace(CRLF_RE, "\n");
 
   if (buffer.trim()) {
     flushEvent(buffer);
@@ -350,7 +375,9 @@ async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient,
     }
   });
 
-  const upstream = await fallbackClient.requestAnthropicMessage(body);
+  const upstream = await fallbackClient.requestAnthropicMessage(body, {
+    requestHeaders: req.headers || null
+  });
   const status = Number(upstream.status || 200);
   const contentType = String(upstream.headers.get("content-type") || "application/json; charset=utf-8");
   const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
@@ -450,6 +477,21 @@ async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient,
   });
 
   if (payload && typeof payload === "object") {
+    if (!upstream.ok && body.stream !== true && isAnthropicLongRequestStreamingError(payload)) {
+      const result = await fallbackClient.completeAnthropic(body, {
+        requestHeaders: req.headers || null
+      });
+      return writeAnthropicFallbackCompletionResult({
+        req,
+        res,
+        body,
+        binding,
+        cacheState,
+        transport,
+        result
+      });
+    }
+
     writeJson(res, status, payload, {
       ...baseHeaders,
       ...(upstream.ok ? cacheHeaders("miss") : {})
@@ -715,7 +757,9 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         }
       });
 
-      const result = await fallbackClient.completeAnthropic(body);
+      const result = await fallbackClient.completeAnthropic(body, {
+        requestHeaders: req.headers || null
+      });
       const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
       const inputTokens = estimateTokens(flattenAnthropicRequest(body));
       const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
@@ -756,28 +800,23 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         return true;
       }
 
-      const responseBody = buildMessageResponse(body, result.text || "", {
-        id: generateId("msg"),
-        inputTokens: promptTokens,
-        outputTokens,
-        sessionId: binding.sessionId || null,
-        toolCalls
+      return writeAnthropicFallbackCompletionResult({
+        req,
+        res,
+        body,
+        binding,
+        cacheState,
+        transport,
+        result: {
+          ...result,
+          usage: {
+            ...(result.usage || {}),
+            input_tokens: promptTokens,
+            output_tokens: outputTokens
+          },
+          toolCalls
+        }
       });
-
-      if (cacheState.cacheKey && cacheState.responseCache) {
-        cacheState.responseCache.set(cacheState.cacheKey, {
-          statusCode: 200,
-          body: responseBody,
-          headers: baseHeaders
-        });
-      }
-
-      setTraceResponse(req, res, 200, responseBody, {
-        cacheState: cacheState.cacheKey ? "miss" : null,
-        fallbackTransport: transport
-      });
-      writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
-      return true;
     } catch (candidateError) {
       logRequest(req, "anthropic fallback candidate failed", {
         transportSelected: fallbackTransportName(fallbackClient),

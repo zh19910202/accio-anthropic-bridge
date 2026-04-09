@@ -14,45 +14,60 @@ function createBridgeError(status, message, type = "api_error", details = null) 
   return error;
 }
 
+const STATUS_ERROR_TYPES = new Map([
+  [400, "invalid_request_error"],
+  [401, "authentication_error"],
+  [403, "authentication_error"],
+  [404, "not_found_error"],
+  [408, "timeout_error"],
+  [413, "invalid_request_error"],
+  [422, "invalid_request_error"],
+  [429, "rate_limit_error"],
+  [501, "unsupported_error"],
+  [502, "overloaded_error"],
+  [503, "overloaded_error"],
+  [504, "overloaded_error"],
+  [529, "overloaded_error"]
+]);
+
+const CONNECTION_ERROR_RE = /timed out|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed/i;
+const TIMEOUT_RE = /timed out|timeout|aborted due to timeout/i;
+const FALLBACK_LOCAL_RE = /timed out|timeout|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed|gateway is unavailable|Unable to resolve Accio access token/i;
+const FAILOVER_MESSAGE_RE = /quota|unauthorized|provider unavailable|rate limit|overloaded|user not activated|not activated|user blocked|auth not pass|blocked by sentinel rate limit|content risk rejected/;
+const FAILOVER_TYPES = new Set(["authentication_error", "rate_limit_error", "overloaded_error"]);
+const FAILOVER_STATUSES = new Set([401, 403, 408, 429, 503, 504, 529]);
+
 function classifyErrorType(statusCode, error) {
-  if (statusCode === 400 || statusCode === 413 || statusCode === 422) {
-    return "invalid_request_error";
+  const mapped = STATUS_ERROR_TYPES.get(statusCode);
+  if (mapped) {
+    return mapped;
   }
 
-  if (statusCode === 401 || statusCode === 403) {
-    return "authentication_error";
-  }
-
-  if (statusCode === 404) {
-    return "not_found_error";
-  }
-
-  if (statusCode === 408) {
-    return "timeout_error";
-  }
-
-  if (statusCode === 429) {
-    return "rate_limit_error";
-  }
-
-  if (statusCode === 501) {
-    return "unsupported_error";
-  }
-
-  if (statusCode === 502 || statusCode === 503 || statusCode === 504 || statusCode === 529) {
-    return "overloaded_error";
-  }
-
-  if (
-    error &&
-    /timed out|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed/i.test(
-      String(error.message || error)
-    )
-  ) {
+  if (error && CONNECTION_ERROR_RE.test(String(error.message || error))) {
     return "api_connection_error";
   }
 
   return "api_error";
+}
+
+function isTimeoutLikeError(error) {
+  if (!error) {
+    return false;
+  }
+
+  const status = Number(error.status || 0);
+  const type = String(error.type || "").toLowerCase();
+  const message = String(error.message || error).toLowerCase();
+
+  if (status === 408 || status === 504) {
+    return true;
+  }
+
+  return (
+    type === "timeout_error" ||
+    type === "api_timeout_error" ||
+    TIMEOUT_RE.test(message)
+  );
 }
 
 function extractStructuredErrorMessage(value) {
@@ -104,9 +119,7 @@ function shouldFallbackToLocalTransport(error) {
   }
 
   const message = String(error.message || error);
-  return /timed out|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed|gateway is unavailable|Unable to resolve Accio access token/i.test(
-    message
-  );
+  return FALLBACK_LOCAL_RE.test(message);
 }
 
 function shouldFailoverAccount(error) {
@@ -118,16 +131,15 @@ function shouldFailoverAccount(error) {
   const type = String(error.type || "").toLowerCase();
   const message = String(error.message || "").toLowerCase();
 
-  if (status === 401 || status === 403 || status === 429 || status === 503 || status === 529) {
+  if (FAILOVER_STATUSES.has(status)) {
     return true;
   }
 
-  return (
-    type === "authentication_error" ||
-    type === "rate_limit_error" ||
-    type === "overloaded_error" ||
-    /quota|unauthorized|provider unavailable|rate limit|overloaded|user not activated|not activated|user blocked|auth not pass|blocked by sentinel rate limit|content risk rejected/.test(message)
-  );
+  if (isTimeoutLikeError(error)) {
+    return true;
+  }
+
+  return FAILOVER_TYPES.has(type) || FAILOVER_MESSAGE_RE.test(message);
 }
 
 function resolveResultError(result) {
@@ -147,6 +159,7 @@ function resolveResultError(result) {
 module.exports = {
   classifyErrorType,
   createBridgeError,
+  isTimeoutLikeError,
   resolveResultError,
   shouldFailoverAccount,
   shouldFallbackToLocalTransport

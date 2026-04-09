@@ -26,7 +26,28 @@ function fallbackTransportName(fallbackClient) {
     : "external-openai";
 }
 
+function applyBridgeRequestIdToDirectRequest(req, directRequest) {
+  const bridgeRequestId = req && req.bridgeContext && req.bridgeContext.requestId
+    ? String(req.bridgeContext.requestId).trim()
+    : "";
+
+  if (!bridgeRequestId || !directRequest || !directRequest.requestBody || typeof directRequest.requestBody !== "object") {
+    return directRequest;
+  }
+
+  if (!directRequest.requestBody.requestId) {
+    directRequest.requestBody.requestId = bridgeRequestId;
+  }
+
+  if (!directRequest.requestBody.messageId) {
+    directRequest.requestBody.messageId = bridgeRequestId;
+  }
+
+  return directRequest;
+}
+
 module.exports = {
+  applyBridgeRequestIdToDirectRequest,
   cacheHeaders,
   fallbackTransportName,
   logRequest,

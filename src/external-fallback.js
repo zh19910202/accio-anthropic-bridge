@@ -7,7 +7,17 @@ const { normalizeRequestedModel } = require("./model");
 const { flattenOpenAiRequest } = require("./openai");
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
-const { classifyErrorType } = require("./errors");
+const DEFAULT_ANTHROPIC_BETAS = [
+  "interleaved-thinking-2025-05-14",
+  "fine-grained-tool-streaming-2025-05-14"
+];
+const HTML_CONTENT_RE = /text\/html/i;
+const SSE_CONTENT_RE = /text\/event-stream/i;
+const JSON_CONTENT_RE = /application\/json/i;
+const STREAMING_REQUIRED_RE = /streaming is required for operations that may take longer than 10 minutes/i;
+const UNSUPPORTED_ENDPOINT_RE = /chat\/completions endpoint not supported|endpoint not supported/i;
+const NOT_FOUND_RE = /404|not[_\s-]?found/;
+const { classifyErrorType, isTimeoutLikeError } = require("./errors");
 const { delay } = require("./utils");
 
 function createFallbackId() {
@@ -77,6 +87,40 @@ function normalizeSupportedModelId(value) {
   }
 
   return String(modelAliases[requested] || requested).trim();
+}
+
+function parseHeaderTokenList(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => parseHeaderTokenList(entry));
+  }
+
+  if (value == null) {
+    return [];
+  }
+
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function mergeHeaderTokenLists(...values) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    for (const token of parseHeaderTokenList(value)) {
+      const key = token.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      merged.push(token);
+    }
+  }
+
+  return merged;
 }
 
 function normalizeSupportedModels(value, fallbackModel = "") {
@@ -191,7 +235,7 @@ function isRetryableFetchError(error) {
 function isOpenAiChatCompletionsUnsupported(error) {
   const status = Number(error && error.status ? error.status : 0);
   const message = String(error && error.message ? error.message : "").toLowerCase();
-  return status === 404 || /chat\/completions endpoint not supported|endpoint not supported/.test(message);
+  return status === 404 || UNSUPPORTED_ENDPOINT_RE.test(message);
 }
 
 function normalizeFetchError(error) {
@@ -206,7 +250,7 @@ function normalizeFetchError(error) {
 }
 
 function isHtmlResponse(contentType) {
-  return /text\/html/i.test(String(contentType || ""));
+  return HTML_CONTENT_RE.test(String(contentType || ""));
 }
 
 function buildAnthropicMessageUrls(baseUrl, preferredPath = null) {
@@ -270,7 +314,7 @@ function isAnthropicWrappedNotFoundPayload(payload) {
   }
 
   const message = String(payload.msg || payload.message || "").toLowerCase();
-  return payload.success === false && /404|not[_\s-]?found/.test(message);
+  return payload.success === false && NOT_FOUND_RE.test(message);
 }
 
 function hasAnthropicImages(messages) {
@@ -918,6 +962,18 @@ function extractToolCallsFromAnthropicMessage(payload) {
     .filter(Boolean);
 }
 
+function isAnthropicStreamingRequiredErrorPayload(payload) {
+  const error = payload && payload.error;
+  const message = typeof (error && error.message) === "string"
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : "";
+  const type = String(error && error.type ? error.type : payload && payload.type ? payload.type : "").toLowerCase();
+
+  return type === "proxy_error" && STREAMING_REQUIRED_RE.test(message);
+}
+
 function normalizeAnthropicThinking(thinking) {
   if (!thinking || thinking === false) {
     return null;
@@ -975,6 +1031,22 @@ function buildError(status, message, details = null) {
   return error;
 }
 
+function _parseSseRawEvent(rawEvent) {
+  const lines = rawEvent.split(/\r?\n/);
+  let event = "message";
+  const data = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+  return data.length > 0 ? { event, data: data.join("\n") } : null;
+}
+
 function createSseReader(stream) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -987,28 +1059,11 @@ function createSseReader(stream) {
         if (boundaryIndex >= 0) {
           const rawEvent = buffer.slice(0, boundaryIndex);
           buffer = buffer.slice(boundaryIndex + 2);
-          const lines = rawEvent.split(/\r?\n/);
-          let event = "message";
-          const data = [];
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              event = line.slice(6).trim();
-              continue;
-            }
-            if (line.startsWith("data:")) {
-              data.push(line.slice(5).trimStart());
-            }
+          const parsed = _parseSseRawEvent(rawEvent);
+          if (parsed) {
+            return { done: false, value: parsed };
           }
-          if (data.length === 0) {
-            continue;
-          }
-          return {
-            done: false,
-            value: {
-              event,
-              data: data.join("\n")
-            }
-          };
+          continue;
         }
 
         const chunk = await reader.read();
@@ -1017,27 +1072,11 @@ function createSseReader(stream) {
             return { done: true, value: null };
           }
 
-          const rawEvent = buffer;
+          const parsed = _parseSseRawEvent(buffer);
           buffer = "";
-          const lines = rawEvent.split(/\r?\n/);
-          let event = "message";
-          const data = [];
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              event = line.slice(6).trim();
-              continue;
-            }
-            if (line.startsWith("data:")) {
-              data.push(line.slice(5).trimStart());
-            }
-          }
-          return {
-            done: false,
-            value: {
-              event,
-              data: data.join("\n")
-            }
-          };
+          return parsed
+            ? { done: false, value: parsed }
+            : { done: true, value: null };
         }
 
         buffer += decoder.decode(chunk.value, { stream: true });
@@ -1082,6 +1121,10 @@ function shouldFallbackToExternalProvider(error) {
     return false;
   }
 
+  if (isTimeoutLikeError(error)) {
+    return true;
+  }
+
   const status = Number(error.status || 0);
   const type = String(error.type || "").toLowerCase();
   const message = String(error.message || "").toLowerCase();
@@ -1098,8 +1141,9 @@ function shouldFallbackToExternalProvider(error) {
     type === "rate_limit_error" ||
     type === "overloaded_error" ||
     type === "timeout_error" ||
+    type === "api_timeout_error" ||
     type === "api_connection_error" ||
-    /quota|unauthorized|rate limit|overloaded|timed out|fetch failed|terminated|provider unavailable/.test(message)
+    /quota|unauthorized|rate limit|overloaded|timed out|timeout|fetch failed|terminated|provider unavailable/.test(message)
   );
 }
 
@@ -1160,15 +1204,16 @@ class ExternalFallbackClient {
     return modes;
   }
 
-  async fetchAnthropicMessageResponse(body) {
+  async fetchAnthropicMessageResponse(body, options = {}) {
     let lastResponse = null;
+    const requestHeaders = options && options.requestHeaders ? options.requestHeaders : null;
     for (const url of this.buildAnthropicMessageUrls()) {
       const authModes = this.buildAnthropicAuthModes();
       for (let authIndex = 0; authIndex < authModes.length; authIndex += 1) {
         const authMode = authModes[authIndex];
         const requestOptions = {
           method: "POST",
-          headers: this.buildAnthropicHeaders(authMode),
+          headers: this.buildAnthropicHeaders(authMode, requestHeaders),
           body: JSON.stringify(body)
         };
 
@@ -1212,7 +1257,7 @@ class ExternalFallbackClient {
           break;
         }
 
-        if (/application\/json/i.test(contentType)) {
+        if (JSON_CONTENT_RE.test(contentType)) {
           try {
             const probe = await response.clone().json();
             if (isAnthropicWrappedNotFoundPayload(probe)) {
@@ -1296,16 +1341,20 @@ class ExternalFallbackClient {
     return this._fetchWithRetryCore(url, options);
   }
 
-  buildAnthropicHeaders(authMode = null) {
+  buildAnthropicHeaders(authMode = null, requestHeaders = null) {
     const mode = authMode || this.preferredAnthropicAuthMode || "x-api-key";
     const authHeaders = mode === "bearer"
       ? { authorization: "Bearer " + this.apiKey }
       : { "x-api-key": this.apiKey };
+    const mergedBetas = mergeHeaderTokenLists(
+      requestHeaders && (requestHeaders["anthropic-beta"] || requestHeaders["Anthropic-Beta"]),
+      DEFAULT_ANTHROPIC_BETAS
+    );
 
     return {
       ...authHeaders,
       "anthropic-version": this.anthropicVersion,
-      "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+      "anthropic-beta": mergedBetas.join(","),
       "user-agent": "AnthropicSDK/TypeScript 0.39.0",
       "x-stainless-lang": "js",
       "x-stainless-os": "MacOS",
@@ -1401,7 +1450,7 @@ class ExternalFallbackClient {
     }
 
     const contentType = String(response.headers.get("content-type") || "");
-    if (!/text\/event-stream/i.test(contentType) || !response.body) {
+    if (!SSE_CONTENT_RE.test(contentType) || !response.body) {
       const payload = await response.json().catch(() => ({}));
       const message =
         (payload && payload.error && payload.error.message) ||
@@ -1484,7 +1533,207 @@ class ExternalFallbackClient {
     };
   }
 
-  async requestAnthropicMessage(body) {
+  async collectAnthropicMessageStream(response) {
+    if (!response.ok) {
+      const rawText = await response.text().catch(() => "");
+      let payload = null;
+
+      try {
+        payload = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        payload = null;
+      }
+
+      const message =
+        (payload && payload.error && payload.error.message) ||
+        (payload && payload.message) ||
+        rawText ||
+        "External fallback anthropic stream request failed: " + (response.status || 502);
+      throw buildError(response.status || 502, message, {
+        upstream: {
+          provider: this.transportName(),
+          status: response.status || 502,
+          body: payload || rawText || null
+        }
+      });
+    }
+
+    const contentType = String(response.headers.get("content-type") || "");
+    if (!SSE_CONTENT_RE.test(contentType) || !response.body) {
+      const payload = await response.json().catch(() => ({}));
+      const message =
+        (payload && payload.error && payload.error.message) ||
+        (payload && payload.message) ||
+        "External fallback anthropic stream request failed: " + (response.status || 502);
+      throw buildError(response.status || 502, message, {
+        upstream: {
+          provider: this.transportName(),
+          status: response.status || 502,
+          body: payload || null
+        }
+      });
+    }
+
+    const reader = createSseReader(response.body);
+    const blocks = new Map();
+    let id = null;
+    let model = this.model;
+    let role = "assistant";
+    let usage = null;
+    let stopReason = null;
+    let stopSequence = null;
+
+    try {
+      while (true) {
+        const next = await reader.next();
+        if (next.done) {
+          break;
+        }
+
+        const entry = next.value;
+        if (!entry || !entry.data) {
+          continue;
+        }
+
+        let payload;
+        try {
+          payload = JSON.parse(entry.data);
+        } catch {
+          continue;
+        }
+
+        if (!payload || typeof payload !== "object") {
+          continue;
+        }
+
+        if (payload.type === "message_start" && payload.message) {
+          id = payload.message.id || id;
+          model = payload.message.model || model;
+          role = payload.message.role || role;
+          usage = payload.message.usage || usage;
+          continue;
+        }
+
+        if (payload.type === "content_block_start" && payload.content_block) {
+          const index = Number(payload.index);
+          if (!Number.isFinite(index)) {
+            continue;
+          }
+
+          const block = payload.content_block;
+          if (block.type === "tool_use") {
+            blocks.set(index, {
+              type: "tool_use",
+              id: block.id || createFallbackId(),
+              name: block.name || "tool",
+              inputJson: block.input && Object.keys(block.input).length > 0
+                ? JSON.stringify(block.input)
+                : ""
+            });
+            continue;
+          }
+
+          if (block.type === "text" || block.type === "thinking" || block.type === "redacted_thinking") {
+            blocks.set(index, {
+              ...block
+            });
+          }
+          continue;
+        }
+
+        if (payload.type === "content_block_delta" && payload.delta) {
+          const index = Number(payload.index);
+          const block = blocks.get(index);
+          if (!block) {
+            continue;
+          }
+
+          if (payload.delta.type === "text_delta" && typeof payload.delta.text === "string") {
+            block.text = String(block.text || "") + payload.delta.text;
+            continue;
+          }
+
+          if (payload.delta.type === "thinking_delta" && typeof payload.delta.thinking === "string") {
+            block.thinking = String(block.thinking || "") + payload.delta.thinking;
+            continue;
+          }
+
+          if (payload.delta.type === "input_json_delta" && block.type === "tool_use") {
+            block.inputJson = String(block.inputJson || "") + String(payload.delta.partial_json || "");
+          }
+          continue;
+        }
+
+        if (payload.type === "message_delta") {
+          stopReason = payload.delta && payload.delta.stop_reason
+            ? payload.delta.stop_reason
+            : stopReason;
+          stopSequence = payload.delta && Object.prototype.hasOwnProperty.call(payload.delta, "stop_sequence")
+            ? payload.delta.stop_sequence
+            : stopSequence;
+          usage = {
+            ...(usage || {}),
+            ...(payload.usage || {})
+          };
+          continue;
+        }
+      }
+    } finally {
+      await reader.cancel();
+    }
+
+    const content = [...blocks.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map(([, block]) => {
+        if (!block || typeof block !== "object") {
+          return null;
+        }
+
+        if (block.type === "tool_use") {
+          return {
+            type: "tool_use",
+            id: block.id || createFallbackId(),
+            name: block.name || "tool",
+            input: normalizeJsonStringObject(block.inputJson)
+          };
+        }
+
+        if (block.type === "thinking" || block.type === "redacted_thinking") {
+          return {
+            type: block.type,
+            thinking: block.thinking || "",
+            ...(block.signature ? { signature: block.signature } : {})
+          };
+        }
+
+        return {
+          type: "text",
+          text: block.text || ""
+        };
+      })
+      .filter(Boolean);
+
+    const raw = {
+      id: id || createFallbackId(),
+      type: "message",
+      role,
+      model,
+      content,
+      stop_reason: stopReason || (content.some((block) => block.type === "tool_use") ? "tool_use" : "end_turn"),
+      stop_sequence: stopSequence || null,
+      usage: usage || null
+    };
+
+    return {
+      model,
+      text: extractTextFromAnthropicMessage(raw),
+      toolCalls: extractToolCallsFromAnthropicMessage(raw),
+      usage: raw.usage,
+      raw
+    };
+  }
+
+  async requestAnthropicMessage(body, options = {}) {
     if (!this.isConfigured()) {
       throw new Error("External fallback provider is not configured");
     }
@@ -1495,7 +1744,7 @@ class ExternalFallbackClient {
       stream: body && body.stream === true
     };
 
-    return this.fetchAnthropicMessageResponse(payload);
+    return this.fetchAnthropicMessageResponse(payload, options);
   }
 
   isEligibleAnthropic(body) {
@@ -1530,12 +1779,13 @@ class ExternalFallbackClient {
     return true;
   }
 
-  async complete({ messages, system, maxTokens, temperature, metadata, reasoning, tools, toolChoice }) {
+  async complete({ messages, system, maxTokens, temperature, metadata, reasoning, tools, toolChoice, requestHeaders }) {
     if (!this.isConfigured()) {
       throw new Error("External fallback provider is not configured");
     }
 
     const isAnthropic = this.protocol === "anthropic";
+    let usedAnthropicStreamingCollection = false;
 
     let response;
     if (isAnthropic) {
@@ -1548,7 +1798,19 @@ class ExternalFallbackClient {
         metadata: metadata || undefined,
         stream: false
       };
-      response = await this.fetchAnthropicMessageResponse(requestBody);
+      response = await this.fetchAnthropicMessageResponse(requestBody, { requestHeaders });
+
+      const contentType = String(response.headers.get("content-type") || "");
+      if (!requestBody.stream && /application\/json/i.test(contentType)) {
+        const payload = await response.clone().json().catch(() => null);
+        if (!response.ok && isAnthropicStreamingRequiredErrorPayload(payload)) {
+          response = await this.fetchAnthropicMessageResponse({
+            ...requestBody,
+            stream: true
+          }, { requestHeaders });
+          usedAnthropicStreamingCollection = true;
+        }
+      }
     } else {
       const requestBody = {
         model: this.model,
@@ -1632,6 +1894,10 @@ class ExternalFallbackClient {
       }
     }
 
+    if (isAnthropic && usedAnthropicStreamingCollection) {
+      return this.collectAnthropicMessageStream(response);
+    }
+
     const payload = await response.json().catch(() => ({}));
 
     if (!response.ok) {
@@ -1657,16 +1923,58 @@ class ExternalFallbackClient {
     };
   }
 
-  async completeAnthropic(body) {
+  async completeNativeAnthropicBody(body, options = {}) {
+    const requestHeaders = options && options.requestHeaders ? options.requestHeaders : null;
+    const payload = {
+      ...sanitizeAnthropicRequestBody(body),
+      model: this.model,
+      stream: body && body.stream === true
+    };
+
+    let response = await this.fetchAnthropicMessageResponse(payload, { requestHeaders });
+    const contentType = String(response.headers.get("content-type") || "");
+
+    if (!payload.stream && /application\/json/i.test(contentType)) {
+      const errorPayload = await response.clone().json().catch(() => null);
+      if (!response.ok && isAnthropicStreamingRequiredErrorPayload(errorPayload)) {
+        response = await this.fetchAnthropicMessageResponse({
+          ...payload,
+          stream: true
+        }, { requestHeaders });
+        return this.collectAnthropicMessageStream(response);
+      }
+    }
+
+    const responsePayload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw buildError(
+        response.status || 502,
+        (responsePayload && responsePayload.error && responsePayload.error.message) ||
+          (responsePayload && responsePayload.message) ||
+          `External fallback request failed: ${response.status || 502}`,
+        {
+          upstream: {
+            provider: this.transportName(),
+            status: response.status || 502,
+            body: responsePayload || null
+          }
+        }
+      );
+    }
+
+    return {
+      model: this.model,
+      text: extractTextFromAnthropicMessage(responsePayload),
+      toolCalls: extractToolCallsFromAnthropicMessage(responsePayload),
+      usage: responsePayload && responsePayload.usage ? responsePayload.usage : null,
+      raw: responsePayload
+    };
+  }
+
+  async completeAnthropic(body, options = {}) {
     if (this.protocol === "anthropic") {
-      const payload = anthropicToAnthropicPayload(body);
-      return this.complete({
-        system: payload.system,
-        messages: payload.messages,
-        maxTokens: Number(body && body.max_tokens) || undefined,
-        temperature: typeof (body && body.temperature) === "number" ? body.temperature : undefined,
-        metadata: { source: "accio-bridge-anthropic-fallback" }
-      });
+      return this.completeNativeAnthropicBody(body, options);
     }
 
     return this.complete({
@@ -1814,6 +2122,7 @@ module.exports = {
   DEFAULT_ANTHROPIC_VERSION,
   ExternalFallbackClient,
   ExternalFallbackPool,
+  STREAMING_REQUIRED_RE,
   anthropicToAnthropicPayload,
   anthropicToFallbackMessages,
   normalizeFallbackTarget,

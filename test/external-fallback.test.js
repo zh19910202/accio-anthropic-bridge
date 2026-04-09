@@ -62,6 +62,17 @@ test("ExternalFallbackClient eligibility allows anthropic tools for openai-compa
   assert.equal(client.isEligibleOpenAi({ messages: [{ role: "user", content: "ok" }] }), true);
 });
 
+test("shouldFallbackToExternalProvider treats timeout-style aborts as retryable", () => {
+  assert.equal(
+    shouldFallbackToExternalProvider({ message: "The operation was aborted due to timeout" }),
+    true
+  );
+  assert.equal(
+    shouldFallbackToExternalProvider({ type: "api_timeout_error", message: "SSE stream idle timeout" }),
+    true
+  );
+});
+
 test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   const targets = normalizeFallbackTargets([
     {
@@ -610,7 +621,184 @@ test("ExternalFallbackClient completes through Anthropic endpoint", async () => 
 
   const payload = JSON.parse(seen[0].options.body);
   assert.equal(payload.model, "claude-opus-4-1");
-  assert.equal(payload.messages[0].content[0].text, "hello");
+  assert.equal(payload.messages[0].content, "hello");
+});
+
+test("ExternalFallbackClient retries native anthropic completion with streaming when upstream requires it for long requests", async () => {
+  const seen = [];
+  let attempt = 0;
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-6",
+    protocol: "anthropic",
+    anthropicVersion: "2023-06-01",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      attempt += 1;
+
+      if (attempt === 1) {
+        return {
+          ok: false,
+          status: 500,
+          headers: new Headers({ "content-type": "application/json" }),
+          async json() {
+            return {
+              error: {
+                message: "Streaming is required for operations that may take longer than 10 minutes. See https://github.com/anthropics/anthropic-sdk-typescript#long-requests for more details",
+                type: "proxy_error"
+              }
+            };
+          },
+          clone() {
+            return {
+              async json() {
+                return {
+                  error: {
+                    message: "Streaming is required for operations that may take longer than 10 minutes. See https://github.com/anthropics/anthropic-sdk-typescript#long-requests for more details",
+                    type: "proxy_error"
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(encoder.encode('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_streamed","type":"message","role":"assistant","model":"claude-opus-4-6","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":0}}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"streamed ok"}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'));
+            controller.enqueue(encoder.encode('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}\n\n'));
+            controller.enqueue(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+  });
+
+  const result = await client.completeAnthropic({
+    messages: [{ role: "user", content: "hello" }],
+    thinking: { type: "adaptive" },
+    max_tokens: 64000
+  });
+
+  assert.equal(result.text, "streamed ok");
+  assert.equal(result.raw.id, "msg_streamed");
+  assert.equal(seen.length, 2);
+  assert.equal(JSON.parse(seen[0].options.body).stream, false);
+  assert.equal(JSON.parse(seen[1].options.body).stream, true);
+});
+
+test("ExternalFallbackClient preserves structured anthropic payload when retrying native streaming-required requests", async () => {
+  const seen = [];
+  let attempt = 0;
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-6",
+    protocol: "anthropic",
+    anthropicVersion: "2023-06-01",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      attempt += 1;
+
+      if (attempt === 1) {
+        return {
+          ok: false,
+          status: 500,
+          headers: new Headers({ "content-type": "application/json" }),
+          async json() {
+            return {
+              error: {
+                message: "Streaming is required for operations that may take longer than 10 minutes. See https://github.com/anthropics/anthropic-sdk-typescript#long-requests for more details",
+                type: "proxy_error"
+              }
+            };
+          },
+          clone() {
+            return {
+              async json() {
+                return {
+                  error: {
+                    message: "Streaming is required for operations that may take longer than 10 minutes. See https://github.com/anthropics/anthropic-sdk-typescript#long-requests for more details",
+                    type: "proxy_error"
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(encoder.encode('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_streamed_tool","type":"message","role":"assistant","model":"claude-opus-4-6","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":0}}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n'));
+            controller.enqueue(encoder.encode('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'));
+            controller.enqueue(encoder.encode('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'));
+            controller.enqueue(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+  });
+
+  await client.completeAnthropic({
+    system: [{ type: "text", text: "system prompt" }],
+    tools: [{ name: "lookup", input_schema: { type: "object", properties: {} } }],
+    tool_choice: { type: "tool", name: "lookup" },
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hidden" },
+          { type: "tool_use", id: "toolu_1", name: "lookup", input: { keyword: "张三" } },
+          { type: "text", text: "我先查一下" }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "结果：张三" }] },
+          { type: "text", text: "继续" }
+        ]
+      }
+    ],
+    max_tokens: 64000
+  });
+
+  assert.equal(seen.length, 2);
+
+  const firstPayload = JSON.parse(seen[0].options.body);
+  const secondPayload = JSON.parse(seen[1].options.body);
+
+  assert.equal(firstPayload.stream, false);
+  assert.equal(secondPayload.stream, true);
+  assert.equal(firstPayload.messages[0].content[0].type, "tool_use");
+  assert.equal(firstPayload.messages[0].content[0].name, "lookup");
+  assert.equal(firstPayload.messages[1].content[0].type, "tool_result");
+  assert.equal(firstPayload.tools[0].name, "lookup");
+  assert.equal(firstPayload.tool_choice.name, "lookup");
+  assert.equal(secondPayload.messages[0].content[0].type, "tool_use");
+  assert.equal(secondPayload.messages[1].content[0].type, "tool_result");
+  assert.equal(secondPayload.tools[0].name, "lookup");
+  assert.equal(secondPayload.tool_choice.name, "lookup");
 });
 
 test("ExternalFallbackClient retries Anthropic auth with Bearer and remembers the working mode", async () => {
@@ -787,6 +975,46 @@ test("ExternalFallbackClient requestAnthropicMessage preserves body and override
   assert.deepEqual(payload.thinking, { type: "enabled", budget_tokens: 2048 });
 });
 
+test("ExternalFallbackClient requestAnthropicMessage preserves incoming anthropic beta headers like context-1m", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-1",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async text() {
+          return JSON.stringify({ ok: true });
+        }
+      };
+    }
+  });
+
+  await client.requestAnthropicMessage(
+    {
+      model: "should-be-overridden",
+      stream: false,
+      messages: [{ role: "user", content: [{ type: "text", text: "keep 1m" }] }]
+    },
+    {
+      requestHeaders: {
+        "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07"
+      }
+    }
+  );
+
+  assert.equal(seen.length, 1);
+  assert.equal(
+    seen[0].options.headers["anthropic-beta"],
+    "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+  );
+});
+
 test("sanitizeAnthropicRequestBody strips thinking blocks and normalizes tool_reference tool results", () => {
   const sanitized = sanitizeAnthropicRequestBody({
     model: "claude-sonnet-4-6",
@@ -938,6 +1166,61 @@ test("ExternalFallbackClient accepts anthropic baseUrl ending with /v1", async (
 
   assert.equal(result.text, "ok");
   assert.equal(seen[0].url, "https://fallback.example/v1/messages");
+});
+
+test("ExternalFallbackClient completeAnthropic preserves incoming anthropic beta headers for native anthropic fallback", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-1",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async json() {
+          return {
+            id: "msg_v1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }]
+          };
+        },
+        clone() {
+          return {
+            async json() {
+              return {
+                id: "msg_v1",
+                type: "message",
+                role: "assistant",
+                content: [{ type: "text", text: "ok" }]
+              };
+            }
+          };
+        }
+      };
+    }
+  });
+
+  await client.completeAnthropic(
+    {
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      max_tokens: 32
+    },
+    {
+      requestHeaders: {
+        "anthropic-beta": "context-1m-2025-08-07,claude-code-20250219"
+      }
+    }
+  );
+
+  assert.equal(
+    seen[0].options.headers["anthropic-beta"],
+    "context-1m-2025-08-07,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+  );
 });
 
 test("ExternalFallbackClient accepts anthropic baseUrl ending with full /messages endpoint", async () => {

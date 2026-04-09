@@ -53,8 +53,10 @@ test("createBridgeError includes details when provided", () => {
 test("shouldFailoverAccount returns true for auth and rate limit errors", () => {
   assert.equal(shouldFailoverAccount({ status: 401 }), true);
   assert.equal(shouldFailoverAccount({ status: 403 }), true);
+  assert.equal(shouldFailoverAccount({ status: 408 }), true);
   assert.equal(shouldFailoverAccount({ status: 429 }), true);
   assert.equal(shouldFailoverAccount({ status: 503 }), true);
+  assert.equal(shouldFailoverAccount({ status: 504 }), true);
   assert.equal(shouldFailoverAccount({ status: 529 }), true);
   assert.equal(shouldFailoverAccount({ status: 200 }), false);
   assert.equal(shouldFailoverAccount({ status: 400 }), false);
@@ -65,11 +67,13 @@ test("shouldFailoverAccount detects error types and messages", () => {
   assert.equal(shouldFailoverAccount({ type: "authentication_error" }), true);
   assert.equal(shouldFailoverAccount({ type: "rate_limit_error" }), true);
   assert.equal(shouldFailoverAccount({ type: "overloaded_error" }), true);
+  assert.equal(shouldFailoverAccount({ type: "api_timeout_error" }), true);
   assert.equal(shouldFailoverAccount({ type: "invalid_request_error" }), false);
   assert.equal(shouldFailoverAccount({ message: "quota exceeded" }), true);
   assert.equal(shouldFailoverAccount({ message: "unauthorized access" }), true);
   assert.equal(shouldFailoverAccount({ message: "rate limit hit" }), true);
   assert.equal(shouldFailoverAccount({ message: "provider unavailable" }), true);
+  assert.equal(shouldFailoverAccount({ message: "The operation was aborted due to timeout" }), true);
   assert.equal(shouldFailoverAccount({ message: "content risk rejected" }), true);
   assert.equal(shouldFailoverAccount({ message: "blocked by sentinel rate limit" }), true);
   assert.equal(shouldFailoverAccount({ message: "user blocked" }), true);

@@ -36,31 +36,11 @@ const {
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
 const { generateId } = require("../id");
-const { cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
+const { applyBridgeRequestIdToDirectRequest, cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
 const { resolveSessionBinding } = require("../session-store");
 
 function logRequest(req, message, meta = {}) {
   return logRequestShared(req, message, "openai", meta);
-}
-
-function applyBridgeRequestIdToDirectRequest(req, directRequest) {
-  const bridgeRequestId = req && req.bridgeContext && req.bridgeContext.requestId
-    ? String(req.bridgeContext.requestId).trim()
-    : "";
-
-  if (!bridgeRequestId || !directRequest || !directRequest.requestBody || typeof directRequest.requestBody !== "object") {
-    return directRequest;
-  }
-
-  if (!directRequest.requestBody.requestId) {
-    directRequest.requestBody.requestId = bridgeRequestId;
-  }
-
-  if (!directRequest.requestBody.messageId) {
-    directRequest.requestBody.messageId = bridgeRequestId;
-  }
-
-  return directRequest;
 }
 
 function fallbackCandidatesForOpenAi(fallbackPool, body) {

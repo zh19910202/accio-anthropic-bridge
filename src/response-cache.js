@@ -7,8 +7,14 @@ function stableSerialize(value) {
     return "null";
   }
 
-  if (typeof value !== "object") {
-    return JSON.stringify(value);
+  switch (typeof value) {
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+    case "boolean":
+      return String(value);
+    default:
+      break;
   }
 
   if (Array.isArray(value)) {
@@ -66,6 +72,19 @@ class ResponseCache {
     }
   }
 
+  _evictIfNeeded() {
+    if (this.store.size <= this.maxEntries) {
+      return;
+    }
+
+    this._purgeExpired();
+
+    while (this.store.size > this.maxEntries) {
+      const oldestKey = this.store.keys().next().value;
+      this.store.delete(oldestKey);
+    }
+  }
+
   set(key, value) {
     if (!this.isEnabled() || !key || value == null) {
       return;
@@ -76,20 +95,7 @@ class ResponseCache {
       value
     });
 
-    // Evict all expired entries first, then oldest if still over limit
-    const now = Date.now();
-    if (this.store.size > this.maxEntries) {
-      for (const [k, entry] of this.store) {
-        if (now - entry.createdAt > this.ttlMs) {
-          this.store.delete(k);
-        }
-      }
-    }
-
-    while (this.store.size > this.maxEntries) {
-      const oldestKey = this.store.keys().next().value;
-      this.store.delete(oldestKey);
-    }
+    this._evictIfNeeded();
   }
 
   getSummary() {

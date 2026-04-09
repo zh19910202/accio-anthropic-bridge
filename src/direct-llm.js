@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const modelAliases = require("../config/model-aliases.json");
 
 const { writeAccountToFile } = require("./accounts-file");
-const { shouldFailoverAccount } = require("./errors");
+const { isTimeoutLikeError, shouldFailoverAccount } = require("./errors");
 const {
   buildGatewayAuthCallbackQuery,
   refreshAuthPayloadViaUpstream,
@@ -28,6 +28,10 @@ const { delay } = require("./utils");
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
 const CURRENT_DIRECT_MAX_OUTPUT_TOKENS = 16384;
 const UUID_V4ISH_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const THINKING_MODEL_RE = /claude-(opus|sonnet)/i;
+const TOKEN_ESCAPE_RE = /[.*+?^${}()|[\]\\]/g;
+const GATEWAY_CONN_ERROR_RE = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up/i;
+const SENSITIVE_KEY_RE = /^(token|accesstoken|authorization)$/i;
 
 function mapRequestedModel(model) {
   const requested = normalizeRequestedModel(model);
@@ -41,7 +45,7 @@ function mapRequestedModel(model) {
 
 function supportsThinkingForModel(model) {
   const resolved = mapRequestedModel(model);
-  return /claude-(opus|sonnet)/i.test(String(resolved || ""));
+  return THINKING_MODEL_RE.test(String(resolved || ""));
 }
 
 function extractThinkingConfigFromAnthropic(body) {
@@ -685,7 +689,7 @@ function sanitizeErrorText(text, token) {
     return text || "";
   }
 
-  return text.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), maskToken(token));
+  return text.replace(new RegExp(token.replace(TOKEN_ESCAPE_RE, "\\$&"), "g"), maskToken(token));
 }
 
 function sanitizeErrorBody(value, token) {
@@ -706,7 +710,7 @@ function sanitizeErrorBody(value, token) {
       Object.entries(value).map(([key, item]) => {
         const normalizedKey = String(key || "").toLowerCase();
 
-        if ((normalizedKey === "token" || normalizedKey === "accesstoken" || normalizedKey === "authorization") && typeof item === "string") {
+        if (SENSITIVE_KEY_RE.test(normalizedKey) && typeof item === "string") {
           return [key, maskToken(item)];
         }
 
@@ -760,34 +764,24 @@ function extractErrorType(parsed) {
   return null;
 }
 
+const UPSTREAM_STATUS_MAP = new Map([
+  [400, 400],
+  [401, 401],
+  [402, 401],
+  [403, 401],
+  [404, 404],
+  [408, 408],
+  [429, 429]
+]);
+
 function mapUpstreamErrorStatus(errorCode) {
   const code = Number(errorCode) || 0;
-
-  if (code === 400) {
-    return 400;
+  const mapped = UPSTREAM_STATUS_MAP.get(code);
+  if (mapped) {
+    return mapped;
   }
 
-  if (code === 401 || code === 402 || code === 403) {
-    return 401;
-  }
-
-  if (code === 404) {
-    return 404;
-  }
-
-  if (code === 408) {
-    return 408;
-  }
-
-  if (code === 429) {
-    return 429;
-  }
-
-  if (code >= 500) {
-    return code;
-  }
-
-  return 502;
+  return code >= 500 ? code : 502;
 }
 
 function classifyUpstreamSseErrorType(code, message) {
@@ -1082,6 +1076,41 @@ class DirectLlmClient {
     );
   }
 
+  _syncStandbyCooldownToAuthProvider(accountId, error, untilMs) {
+    if (!accountId || !this.authProvider) {
+      return;
+    }
+
+    const reason = error && error.message ? String(error.message) : String(error);
+
+    if (typeof this.authProvider.recordFailure === "function") {
+      this.authProvider.recordFailure(accountId, error);
+    }
+
+    if (typeof this.authProvider.invalidateAccountUntil === "function") {
+      this.authProvider.invalidateAccountUntil(accountId, untilMs, reason);
+      return;
+    }
+
+    if (typeof this.authProvider.invalidateAccount === "function") {
+      this.authProvider.invalidateAccount(accountId, reason, untilMs);
+    }
+  }
+
+  _clearStandbyAuthState(accountId) {
+    if (!accountId || !this.authProvider) {
+      return;
+    }
+
+    if (typeof this.authProvider.clearFailure === "function") {
+      this.authProvider.clearFailure(accountId);
+    }
+
+    if (typeof this.authProvider.clearInvalidation === "function") {
+      this.authProvider.clearInvalidation(accountId);
+    }
+  }
+
   _sortCooldownCredentials(records) {
     return [...records].sort((left, right) => {
       const leftAt = left && left.nextCheckAt ? new Date(left.nextCheckAt).getTime() : Number.POSITIVE_INFINITY;
@@ -1206,6 +1235,7 @@ class DirectLlmClient {
         reason: "standby_cooldown_probe"
       });
       credential = quota && quota.resolvedAuth ? quota.resolvedAuth : credential;
+      this._clearStandbyAuthState(credential.accountId);
       const usagePercent = Number(quota && quota.usagePercent);
 
       if (Number.isFinite(usagePercent) && usagePercent >= 100) {
@@ -1238,10 +1268,12 @@ class DirectLlmClient {
       this._emitStandbyState();
       return preparedCredential;
     } catch (error) {
+      const nextCheckAt = Date.now() + Math.min(15000, Math.max(3000, this._accountStandbyRefreshMs));
+      this._syncStandbyCooldownToAuthProvider(credential.accountId, error, nextCheckAt);
       this._upsertCooldownCredential(this._buildStandbyRecord(credential, {
         state: "rechecking",
         quotaCheckedAt: matched.record && matched.record.quotaCheckedAt ? matched.record.quotaCheckedAt : checkedAt,
-        nextCheckAt: Date.now() + Math.min(15000, Math.max(3000, this._accountStandbyRefreshMs)),
+        nextCheckAt,
         reason: error && error.message ? error.message : String(error)
       }));
       this._emitStandbyState();
@@ -1345,7 +1377,7 @@ class DirectLlmClient {
 
   _isGatewayConnectionError(error) {
     const message = error && error.message ? String(error.message) : String(error || "");
-    return /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up/i.test(message);
+    return GATEWAY_CONN_ERROR_RE.test(message);
   }
 
   async _waitForGatewayReachable(waitMs = 20000, pollMs = 500) {
@@ -2110,14 +2142,17 @@ class DirectLlmClient {
           });
           credential = quota && quota.resolvedAuth ? quota.resolvedAuth : credential;
         } catch (error) {
+          const nextCheckAt = now + Math.min(30000, Math.max(5000, this._accountStandbyRefreshMs));
+          this._syncStandbyCooldownToAuthProvider(credential.accountId, error, nextCheckAt);
           cooling.push(this._mergeCooldownRecord(previousCooldown, credential, {
             state: "rechecking",
-            nextCheckAt: now + Math.min(30000, Math.max(5000, this._accountStandbyRefreshMs)),
+            nextCheckAt,
             reason: error && error.message ? error.message : String(error)
           }));
           return false;
         }
 
+        this._clearStandbyAuthState(credential.accountId);
         const usagePercent = Number(quota && quota.usagePercent);
         if (Number.isFinite(usagePercent) && usagePercent >= 100) {
           const refreshUntilMs = this._getQuotaRefreshUntilMs(quota);
@@ -2534,13 +2569,13 @@ class DirectLlmClient {
     }
 
     // Transient server errors → short cooldown (30s) instead of default 5min
-    if (status === 503 || status === 529 || status === 408) {
+    if (status === 503 || status === 504 || status === 529 || status === 408) {
       return Date.now() + 30 * 1000;
     }
 
     // Connection errors (no status code) → short cooldown (20s) — usually transient
     if (!status && error && (error.code === "ECONNREFUSED" || error.code === "ECONNRESET" ||
-        error.code === "ETIMEDOUT" || /fetch failed|network/i.test(error.message || ""))) {
+        error.code === "ETIMEDOUT" || /fetch failed|network|timeout|aborted due to timeout/i.test(error.message || ""))) {
       return Date.now() + 20 * 1000;
     }
 
@@ -2697,13 +2732,75 @@ class DirectLlmClient {
     return false;
   }
 
+  _buildAttemptBudget() {
+    if (!this.authProvider || typeof this.authProvider.listCredentials !== "function") {
+      return 10;
+    }
+
+    const credentials = this.authProvider.listCredentials({});
+    const count = Array.isArray(credentials) ? credentials.length : 0;
+    return Math.max(10, (count * 2) + 2);
+  }
+
+  _buildRetryKey(auth) {
+    if (!auth || typeof auth !== "object") {
+      return null;
+    }
+
+    if (auth.accountId) {
+      return `account:${auth.accountId}`;
+    }
+
+    if (auth.source) {
+      return `source:${auth.source}`;
+    }
+
+    return null;
+  }
+
+  _maybeRetryTimeoutOnSameAccount({ auth, error, phase, responseStarted, retryCounts, onDecision }) {
+    if (responseStarted || !isTimeoutLikeError(error)) {
+      return false;
+    }
+
+    const retryKey = this._buildRetryKey(auth);
+    if (!retryKey) {
+      return false;
+    }
+
+    const retries = Number(retryCounts.get(retryKey) || 0);
+    if (retries >= 1) {
+      return false;
+    }
+
+    retryCounts.set(retryKey, retries + 1);
+
+    if (typeof onDecision === "function") {
+      onDecision({
+        type: "same_account_retry",
+        accountId: auth.accountId || null,
+        accountName: auth.accountName || null,
+        authSource: auth.source || null,
+        reason: error && error.message ? error.message : String(error),
+        status: error && error.status ? error.status : null,
+        phase: phase || null,
+        responseStarted: false,
+        retryAttempt: retries + 1
+      });
+    }
+
+    return true;
+  }
+
   async run(request, options = {}) {
     const explicitAccountId = options.accountId || request.accountId || null;
     const stickyAccountId = options.stickyAccountId || null;
-    const MAX_FAILOVER_ATTEMPTS = 10;
+    const MAX_FAILOVER_ATTEMPTS = this._buildAttemptBudget();
     const triedAccounts = new Set();
+    const timeoutRetryCounts = new Map();
     let lastError = null;
     let attempts = 0;
+    let pinnedRetryAuth = null;
     const modelInfo = await this.resolveProviderModel(request.model);
 
     if (typeof options.onDecision === "function") {
@@ -2718,12 +2815,17 @@ class DirectLlmClient {
 
     while (attempts < MAX_FAILOVER_ATTEMPTS) {
       attempts++;
-      let auth = await this.getAuthToken({
-        allowAutostart: false,
-        accountId: explicitAccountId,
-        stickyAccountId,
-        excludeIds: [...triedAccounts]
-      });
+      let auth = pinnedRetryAuth;
+      pinnedRetryAuth = null;
+
+      if (!auth) {
+        auth = await this.getAuthToken({
+          allowAutostart: false,
+          accountId: explicitAccountId,
+          stickyAccountId,
+          excludeIds: [...triedAccounts]
+        });
+      }
       const token = auth && auth.token;
 
       if (!token) {
@@ -2835,6 +2937,20 @@ class DirectLlmClient {
           this.clearTokenCache();
         }
 
+        if (this._maybeRetryTimeoutOnSameAccount({
+          auth: activeAuth,
+          error,
+          phase: "fetch",
+          responseStarted: false,
+          retryCounts: timeoutRetryCounts,
+          onDecision: options.onDecision
+        })) {
+          lastError = error;
+          pinnedRetryAuth = activeAuth;
+          await delay(250);
+          continue;
+        }
+
         const shouldContinue = this._handleRunError({
           auth: activeAuth, error, explicitAccountId, stickyAccountId,
           triedAccounts, onDecision: options.onDecision, responseStarted: false, phase: "fetch"
@@ -2861,6 +2977,20 @@ class DirectLlmClient {
 
         if (activeAuth.source === "gateway" && (res.status === 401 || res.status === 403)) {
           this.clearTokenCache();
+        }
+
+        if (this._maybeRetryTimeoutOnSameAccount({
+          auth: activeAuth,
+          error: upstreamError,
+          phase: "http",
+          responseStarted: false,
+          retryCounts: timeoutRetryCounts,
+          onDecision: options.onDecision
+        })) {
+          lastError = upstreamError;
+          pinnedRetryAuth = activeAuth;
+          await delay(250);
+          continue;
         }
 
         const shouldContinue = this._handleRunError({
@@ -2900,6 +3030,20 @@ class DirectLlmClient {
 
       if (state.error) {
         attachUpstreamRequestSummary(state.error, normalizedRequestSummary);
+
+        if (this._maybeRetryTimeoutOnSameAccount({
+          auth: activeAuth,
+          error: state.error,
+          phase: "stream",
+          responseStarted: state.hasVisibleOutput(),
+          retryCounts: timeoutRetryCounts,
+          onDecision: options.onDecision
+        })) {
+          lastError = state.error;
+          pinnedRetryAuth = activeAuth;
+          await delay(250);
+          continue;
+        }
 
         const shouldContinue = this._handleRunError({
           auth: activeAuth, error: state.error, explicitAccountId, stickyAccountId,

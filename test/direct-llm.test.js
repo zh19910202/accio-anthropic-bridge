@@ -694,6 +694,171 @@ test("DirectLlmClient cools down a saturated account until refresh time instead 
   assert.ok((invalidUntilById.get('acct_full') || 0) > Date.now());
 });
 
+test("DirectLlmClient standby refresh syncs quota probe failures back to auth provider", async () => {
+  const failures = [];
+  const invalidations = [];
+  const authProvider = {
+    listCredentials() {
+      return [
+        {
+          accountId: 'acct_blocked',
+          accountName: 'Blocked',
+          token: 'token_blocked',
+          cookie: 'cna=blocked-cna',
+          source: 'accounts-file'
+        }
+      ];
+    },
+    getConfiguredAccounts() {
+      return [
+        {
+          id: 'acct_blocked',
+          name: 'Blocked',
+          accessToken: 'token_blocked',
+          cookie: 'cna=blocked-cna',
+          source: 'accounts-file',
+          enabled: true
+        }
+      ];
+    },
+    isAccountUsable() {
+      return true;
+    },
+    getInvalidUntil() {
+      return null;
+    },
+    getLastFailure() {
+      return null;
+    },
+    recordFailure(accountId, error) {
+      failures.push({ accountId, reason: error.message || String(error) });
+    },
+    invalidateAccountUntil(accountId, untilMs, reason) {
+      invalidations.push({ accountId, untilMs, reason });
+    },
+    clearFailure() {},
+    clearInvalidation() {}
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    accountStandbyRefreshMs: 10000,
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl: async (url) => {
+      const value = String(url);
+      if (value.includes('/api/entitlement/quota')) {
+        throw new Error('Quota request failed: user blocked');
+      }
+
+      throw new Error('Unexpected URL: ' + value);
+    }
+  });
+
+  const prepared = await client.refreshPreparedCredentials();
+
+  assert.deepEqual(prepared, []);
+  assert.deepEqual(failures, [
+    {
+      accountId: 'acct_blocked',
+      reason: 'Quota request failed: user blocked'
+    }
+  ]);
+  assert.equal(invalidations.length, 1);
+  assert.equal(invalidations[0].accountId, 'acct_blocked');
+  assert.match(String(invalidations[0].reason || ''), /user blocked/);
+  assert.ok(Number(invalidations[0].untilMs) > Date.now());
+  assert.equal(client._standbyCooldownCredentials.length, 1);
+  assert.match(String(client._standbyCooldownCredentials[0].reason || ''), /user blocked/);
+});
+
+test("DirectLlmClient standby refresh clears stale auth-provider failures after a successful quota probe", async () => {
+  const clearedFailures = [];
+  const clearedInvalidations = [];
+  const authProvider = {
+    listCredentials() {
+      return [
+        {
+          accountId: 'acct_recovered',
+          accountName: 'Recovered',
+          token: 'token_recovered',
+          cookie: 'cna=recovered-cna',
+          source: 'accounts-file'
+        }
+      ];
+    },
+    getConfiguredAccounts() {
+      return [
+        {
+          id: 'acct_recovered',
+          name: 'Recovered',
+          accessToken: 'token_recovered',
+          cookie: 'cna=recovered-cna',
+          source: 'accounts-file',
+          enabled: true
+        }
+      ];
+    },
+    isAccountUsable() {
+      return true;
+    },
+    getInvalidUntil() {
+      return null;
+    },
+    getLastFailure() {
+      return {
+        at: '2026-04-09T10:00:00.000Z',
+        reason: 'blocked by sentinel rate limit'
+      };
+    },
+    recordFailure() {},
+    invalidateAccountUntil() {},
+    clearFailure(accountId) {
+      clearedFailures.push(accountId);
+    },
+    clearInvalidation(accountId) {
+      clearedInvalidations.push(accountId);
+    }
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl: async (url) => {
+      const value = String(url);
+      if (value.includes('/api/entitlement/quota')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              success: true,
+              data: {
+                usagePercent: 12,
+                refreshCountdownSeconds: 1800
+              }
+            };
+          }
+        };
+      }
+
+      throw new Error('Unexpected URL: ' + value);
+    }
+  });
+
+  const prepared = await client.refreshPreparedCredentials();
+
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0].accountId, 'acct_recovered');
+  assert.deepEqual(clearedFailures, ['acct_recovered']);
+  assert.deepEqual(clearedInvalidations, ['acct_recovered']);
+});
+
 test("DirectLlmClient replays auth callback before using the next file account after quota failover", async () => {
   const seenTokens = [];
   let currentGatewayUserId = 'user_full';
@@ -1446,6 +1611,142 @@ test("DirectLlmClient transparently retries a stream failure before any output i
   assert.deepEqual(seenTokens, ['token_first', 'token_second']);
   assert.deepEqual(events, [{ type: 'text_delta', text: 'ok from retry' }]);
   assert.ok(decisions.some((event) => event.type === 'account_failover' && event.accountId === 'acct_first' && event.phase === 'stream' && event.responseStarted === false));
+});
+
+test("DirectLlmClient retries one timeout on the same account before failing over", async () => {
+  const decisions = [];
+  const seenTokens = [];
+  const invalidations = [];
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      if (!excluded.has('acct_first')) {
+        return {
+          accountId: 'acct_first',
+          accountName: 'First',
+          token: 'token_first',
+          cookie: 'cna=first-cna',
+          source: 'accounts-file'
+        };
+      }
+      if (!excluded.has('acct_second')) {
+        return {
+          accountId: 'acct_second',
+          accountName: 'Second',
+          token: 'token_second',
+          cookie: 'cna=second-cna',
+          source: 'accounts-file'
+        };
+      }
+      return null;
+    },
+    listCredentials() {
+      return [
+        {
+          accountId: 'acct_first',
+          accountName: 'First',
+          token: 'token_first',
+          cookie: 'cna=first-cna',
+          source: 'accounts-file'
+        },
+        {
+          accountId: 'acct_second',
+          accountName: 'Second',
+          token: 'token_second',
+          cookie: 'cna=second-cna',
+          source: 'accounts-file'
+        }
+      ];
+    },
+    isAccountUsable() {
+      return true;
+    },
+    recordFailure() {},
+    invalidateAccount(accountId, reason) {
+      invalidations.push({ accountId, reason });
+    },
+    clearFailure() {},
+    clearInvalidation() {}
+  };
+
+  const fetchAttempts = new Map();
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return { data: [{ provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }] };
+        }
+      };
+    }
+
+    if (value.includes('/api/entitlement/quota')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { success: true, data: { usagePercent: 20, refreshCountdownSeconds: 3600 } };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      const token = body.token;
+      seenTokens.push(token);
+      const attempt = Number(fetchAttempts.get(token) || 0) + 1;
+      fetchAttempts.set(token, attempt);
+
+      if (token === 'token_first') {
+        throw new Error('The operation was aborted due to timeout');
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok after timeout failover"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  const result = await client.run(
+    { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
+    {
+      onDecision(event) {
+        decisions.push(event);
+      }
+    }
+  );
+
+  assert.equal(result.accountId, 'acct_second');
+  assert.equal(result.finalText, 'ok after timeout failover');
+  assert.deepEqual(seenTokens, ['token_first', 'token_first', 'token_second']);
+  assert.ok(decisions.some((event) => event.type === 'same_account_retry' && event.accountId === 'acct_first' && event.phase === 'fetch' && event.retryAttempt === 1));
+  assert.ok(decisions.some((event) => event.type === 'account_failover' && event.accountId === 'acct_first' && event.phase === 'fetch' && event.responseStarted === false));
+  assert.ok(invalidations.some((entry) => entry.accountId === 'acct_first' && /timeout/i.test(entry.reason)));
 });
 
 test("DirectLlmClient does not transparently retry once stream output has started", async () => {
