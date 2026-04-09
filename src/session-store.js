@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 
+const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
 
 const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -97,8 +98,7 @@ class SessionStore {
 
   _saveSync() {
     try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
+      atomicWriteFileSync(this.filePath, JSON.stringify(this.state, null, 2));
     } catch (error) {
       log.warn("session store sync flush failed", {
         path: this.filePath,

@@ -491,6 +491,7 @@ async function main() {
     log.info("shutdown requested", { signal });
     directClient.stopAccountStandbyLoop();
     authProvider.flushSync();
+    codexAuthProvider.flushSync();
     sessionStore.flushSync();
 
     server.close(() => {

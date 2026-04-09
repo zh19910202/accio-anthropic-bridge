@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 
+const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
 
 const INVALIDATION_MS = 5 * 60 * 1000;
@@ -127,8 +128,7 @@ class AuthProvider {
     const statePath = this._resolveStatePath();
 
     try {
-      fs.mkdirSync(path.dirname(statePath), { recursive: true });
-      fs.writeFileSync(statePath, JSON.stringify(this._serializeState(), null, 2));
+      atomicWriteFileSync(statePath, JSON.stringify(this._serializeState(), null, 2));
     } catch (error) {
       log.warn("auth provider sync flush failed", {
         path: statePath,

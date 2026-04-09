@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 
+const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
 
 const INVALIDATION_MS = 5 * 60 * 1000;
@@ -182,11 +183,7 @@ class CodexAuthProvider {
   _saveSync() {
     try {
       const statePath = this._resolveStatePath();
-      const dir = path.dirname(statePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(statePath, JSON.stringify(this._serializeState(), null, 2));
+      atomicWriteFileSync(statePath, JSON.stringify(this._serializeState(), null, 2));
     } catch (error) {
       log.warn("codex auth provider sync save failed", {
         path: this._resolveStatePath(),
@@ -617,11 +614,7 @@ class CodexAuthProvider {
       });
 
       const output = Array.isArray(parsed) ? updated : { ...parsed, accounts: updated };
-      const fs = require("node:fs");
-      const fsp = require("node:fs/promises");
-      const path = require("node:path");
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, JSON.stringify(output, null, 2) + "\n", "utf8");
+      atomicWriteFileSync(filePath, JSON.stringify(output, null, 2) + "\n", "utf8");
 
       this._fileCache = null;
       log.info("codex account token updated", { accountId: normalizedId });

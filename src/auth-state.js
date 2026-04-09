@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { atomicWriteFileSync } = require("./accounts-file");
 
 const AUTH_CALLBACK_FILE = "auth-callback.json";
 
@@ -199,8 +200,7 @@ function writeSnapshotAuthPayload(alias, payload) {
   const safeAlias = sanitizeAlias(alias);
   const normalized = normalizeAuthCallbackPayload(payload);
   const targetPath = getSnapshotAuthPayloadPath(safeAlias);
-  ensureDirSync(path.dirname(targetPath));
-  fs.writeFileSync(targetPath, JSON.stringify(normalized, null, 2) + "\n", {
+  atomicWriteFileSync(targetPath, JSON.stringify(normalized, null, 2) + "\n", {
     mode: 0o600
   });
   return normalized;
@@ -356,7 +356,7 @@ function snapshotActiveCredentials(alias, extras = {}) {
     artifacts
   };
 
-  fs.writeFileSync(path.join(targetDir, "metadata.json"), JSON.stringify(metadata, null, 2) + "\n", {
+  atomicWriteFileSync(path.join(targetDir, "metadata.json"), JSON.stringify(metadata, null, 2) + "\n", {
     mode: 0o600
   });
 

@@ -2,6 +2,24 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
+
+/**
+ * Write a file atomically: write to a temp file first, then rename.
+ * This prevents partial/corrupt files if the process crashes mid-write.
+ */
+function atomicWriteFileSync(filePath, data, options) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.tmp-${path.basename(filePath)}-${crypto.randomBytes(6).toString("hex")}`);
+  try {
+    fs.writeFileSync(tmpPath, data, options);
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore cleanup error */ }
+    throw err;
+  }
+}
 
 function loadAccountsFile(filePath) {
   try {
@@ -144,8 +162,8 @@ function writeAccountToFile(filePath, accountId, accessToken, extras = {}) {
 
   accounts.push(nextAccount);
 
-  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  fs.writeFileSync(
+  // NOTE: entire read-modify-write is synchronous — no yield point
+  atomicWriteFileSync(
     resolvedPath,
     JSON.stringify({ strategy: state.strategy, activeAccount: state.activeAccount, accounts }, null, 2) + "\n",
     "utf8"
@@ -192,8 +210,8 @@ function upsertOpaqueAccountToFile(filePath, account, extras = {}) {
 
   accounts.push(nextAccount);
 
-  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  fs.writeFileSync(
+  // NOTE: entire read-modify-write is synchronous — no yield point
+  atomicWriteFileSync(
     resolvedPath,
     JSON.stringify({ strategy: state.strategy, activeAccount: state.activeAccount, accounts }, null, 2) + "\n",
     "utf8"
@@ -218,8 +236,8 @@ function setActiveAccountInFile(filePath, accountId) {
     }
   }
 
-  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  fs.writeFileSync(
+  // NOTE: entire read-modify-write is synchronous — no yield point
+  atomicWriteFileSync(
     resolvedPath,
     JSON.stringify({ strategy: state.strategy, activeAccount: normalizedId, accounts: state.accounts }, null, 2) + "\n",
     "utf8"
@@ -261,8 +279,8 @@ function removeAccountFromFile(filePath, lookup = {}) {
     ? null
     : state.activeAccount;
 
-  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-  fs.writeFileSync(
+  // NOTE: entire read-modify-write is synchronous — no yield point
+  atomicWriteFileSync(
     resolvedPath,
     JSON.stringify({ strategy: state.strategy, activeAccount: nextActiveAccount, accounts: nextAccounts }, null, 2) + "\n",
     "utf8"
@@ -285,5 +303,6 @@ module.exports = {
   writeAccountToFile,
   upsertOpaqueAccountToFile,
   setActiveAccountInFile,
-  removeAccountFromFile
+  removeAccountFromFile,
+  atomicWriteFileSync
 };

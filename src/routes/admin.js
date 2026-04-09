@@ -33,7 +33,8 @@ const {
   upsertOpaqueAccountToFile,
   findStoredAccountAuthPayload,
   setActiveAccountInFile,
-  removeAccountFromFile
+  removeAccountFromFile,
+  atomicWriteFileSync
 } = require("../accounts-file");
 const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets, serializeFallbackTarget } = require("../external-fallback");
 const { maskToken } = require("../redaction");
@@ -100,8 +101,7 @@ function writeSnapshotQuotaState(snapshotDir, quota) {
   }
 
   const targetPath = getSnapshotQuotaStatePath(snapshotDir);
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(targetPath, JSON.stringify(quota, null, 2) + "\n", "utf8");
+  atomicWriteFileSync(targetPath, JSON.stringify(quota, null, 2) + "\n", "utf8");
 }
 
 function quoteEnvValue(value) {
@@ -147,7 +147,7 @@ function upsertEnvValues(filePath, values) {
     nextLines.push(key + '=' + quoteEnvValue(values[key]));
   }
 
-  fs.writeFileSync(filePath, nextLines.join("\n").replace(/\n{3,}/g, "\n\n") + "\n");
+  atomicWriteFileSync(filePath, nextLines.join("\n").replace(/\n{3,}/g, "\n\n") + "\n");
 }
 
 function getFallbackSettings(config, theme = "claude") {
@@ -6077,8 +6077,7 @@ async function handleAdminSnapshotTest(req, res, config, authProvider) {
 }
 
 function writeAccountsState(filePath, state) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(
+  atomicWriteFileSync(
     filePath,
     JSON.stringify({
       strategy: state.strategy || "round_robin",
