@@ -5,7 +5,13 @@ const crypto = require("node:crypto");
 const modelAliases = require("../config/model-aliases.json");
 
 const { writeAccountToFile } = require("./accounts-file");
-const { isTimeoutLikeError, shouldFailoverAccount } = require("./errors");
+const {
+  isRequestScopedRejection,
+  isTimeoutLikeError,
+  normalizeHttpStatusCode,
+  shouldFailoverAccount,
+  shouldRecordAccountFailure
+} = require("./errors");
 const {
   buildGatewayAuthCallbackQuery,
   refreshAuthPayloadViaUpstream,
@@ -32,6 +38,8 @@ const THINKING_MODEL_RE = /claude-(opus|sonnet)/i;
 const TOKEN_ESCAPE_RE = /[.*+?^${}()|[\]\\]/g;
 const GATEWAY_CONN_ERROR_RE = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up/i;
 const SENSITIVE_KEY_RE = /^(token|accesstoken|authorization)$/i;
+const CLAUDE_CODE_SYSTEM_IDENTITY_RE = /^You are Claude Code, Anthropic's official CLI for Claude\.\s*$/;
+const DIRECT_COMPAT_SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 function mapRequestedModel(model) {
   const requested = normalizeRequestedModel(model);
@@ -73,6 +81,15 @@ function toDirectUpstreamThinkingFields(thinking, model) {
   void thinking;
   void model;
   return {};
+}
+
+function normalizeDirectSystemInstructionText(text) {
+  const normalized = String(text || "");
+  if (CLAUDE_CODE_SYSTEM_IDENTITY_RE.test(normalized)) {
+    return DIRECT_COMPAT_SYSTEM_IDENTITY;
+  }
+
+  return normalized;
 }
 
 function normalizeDirectMaxOutputTokens(value) {
@@ -291,11 +308,11 @@ function buildDirectRequestFromAnthropic(body) {
       iaiTag: DIRECT_GATEWAY_DEFAULT_IAI_TAG,
       contents,
       systemInstruction: typeof body.system === "string"
-        ? body.system
+        ? normalizeDirectSystemInstructionText(body.system)
         : Array.isArray(body.system)
           ? body.system
             .filter((block) => block && block.type === "text" && block.text)
-            .map((block) => block.text)
+            .map((block) => normalizeDirectSystemInstructionText(block.text))
             .join("\n\n")
           : "",
       tools: toToolDeclarations(body.tools, (tool) => tool.input_schema),
@@ -774,14 +791,18 @@ const UPSTREAM_STATUS_MAP = new Map([
   [429, 429]
 ]);
 
-function mapUpstreamErrorStatus(errorCode) {
+function mapUpstreamErrorStatus(errorCode, message = "") {
   const code = Number(errorCode) || 0;
   const mapped = UPSTREAM_STATUS_MAP.get(code);
   if (mapped) {
     return mapped;
   }
 
-  return code >= 500 ? code : 502;
+  if (isRequestScopedRejection({ message })) {
+    return 400;
+  }
+
+  return normalizeHttpStatusCode(code, 502);
 }
 
 function classifyUpstreamSseErrorType(code, message) {
@@ -893,7 +914,7 @@ class UpstreamSseError extends Error {
 
     super(message);
     this.name = "UpstreamSseError";
-    this.status = mapUpstreamErrorStatus(code);
+    this.status = mapUpstreamErrorStatus(code, message);
     this.statusText = "OK";
     this.type = classifyUpstreamSseErrorType(code, message);
     this.code = code;
@@ -951,6 +972,7 @@ class DirectLlmClient {
     this._gatewayQuotaInvalidUntil = 0;
     this._gatewayQuotaReason = null;
     this._gatewayQuota = null;
+    this._appVersion = config && config.appVersion ? String(config.appVersion).trim() : "";
     this._utdid = readAccioUtdid(config.accioHome);
     this._accountStandbyEnabled = config.accountStandbyEnabled !== false;
     this._accountStandbyRefreshMs = Number(config.accountStandbyRefreshMs || 30000);
@@ -965,6 +987,10 @@ class DirectLlmClient {
     this._standbyTimer = null;
     this._standbyRunRefresh = null;
     this._standbyListeners = new Set();
+  }
+
+  _getAppVersion() {
+    return this._appVersion || "0.0.0";
   }
 
   _mapConfiguredAccountToCredential(account) {
@@ -1991,14 +2017,14 @@ class DirectLlmClient {
       !this._accountStandbyEnabled ||
       !this.authProvider ||
       options.accountId ||
-      options.stickyAccountId ||
-      !Array.isArray(options.excludeIds) ||
-      options.excludeIds.length === 0
+      options.stickyAccountId
     ) {
       return null;
     }
 
-    const excluded = new Set(options.excludeIds.map(String));
+    const excluded = new Set(
+      Array.isArray(options.excludeIds) ? options.excludeIds.map(String) : []
+    );
     const matched = this._preparedCredentials.find((credential) => {
       return credential &&
         credential.accountId &&
@@ -2374,14 +2400,14 @@ class DirectLlmClient {
     const url = new URL("/api/entitlement/quota", this.config.upstreamBaseUrl);
     url.searchParams.set("accessToken", String(preparedAuth.token));
     url.searchParams.set("utdid", this._utdid || "");
-    url.searchParams.set("version", "0.0.0");
+    url.searchParams.set("version", this._getAppVersion());
 
     const response = await this.fetchImpl(url, {
       method: "GET",
       headers: {
         "x-language": this.config.language ? String(this.config.language) : "zh",
         "x-utdid": this._utdid || "",
-        "x-app-version": "0.0.0",
+        "x-app-version": this._getAppVersion(),
         "x-os": process.platform,
         "x-cna": extractCnaFromCookie(preparedAuth.cookie),
         cookie: normalizeCookieHeader(preparedAuth.cookie),
@@ -2588,7 +2614,12 @@ class DirectLlmClient {
       this._rememberGatewayQuotaFailure(error);
     }
 
-    if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+    if (
+      shouldRecordAccountFailure(error) &&
+      auth.accountId &&
+      this.authProvider &&
+      typeof this.authProvider.recordFailure === "function"
+    ) {
       this.authProvider.recordFailure(auth.accountId, error);
     }
 
@@ -2718,6 +2749,18 @@ class DirectLlmClient {
 
     if (this._preparedCredentials.length > 0) {
       return true;
+    }
+
+    // Once the standby loop has produced a runtime view of the account pool,
+    // do not fall back to static file usability. Static usability only means
+    // "has token / not expired / not cooling down", while prepared credentials
+    // represent accounts that passed live refresh/quota checks.
+    if (
+      this._accountStandbyEnabled &&
+      this._preparedCredentialsAt > 0 &&
+      (this._preparedCredentials.length > 0 || this._standbyCooldownCredentials.length > 0)
+    ) {
+      return false;
     }
 
     // Fall back to checking auth provider for any usable account
@@ -2920,14 +2963,22 @@ class DirectLlmClient {
         modelInfo.resolvedProviderModel,
         activeAuth
       );
+      const upstreamUrl = new URL(`${String(this.config.upstreamBaseUrl || "").replace(/\/$/, "")}/generateContent`);
+      upstreamUrl.searchParams.set("version", this._getAppVersion());
       let res;
 
       try {
-        res = await this.fetchImpl(`${this.config.upstreamBaseUrl}/generateContent`, {
+        res = await this.fetchImpl(upstreamUrl, {
           method: "POST",
           headers: {
             "content-type": "application/json",
-            accept: "text/event-stream"
+            accept: "text/event-stream",
+            "x-language": this.config.language ? String(this.config.language) : "zh",
+            "x-utdid": this._utdid || "",
+            "x-app-version": this._getAppVersion(),
+            "x-os": process.platform,
+            "x-cna": extractCnaFromCookie(activeAuth.cookie),
+            cookie: normalizeCookieHeader(activeAuth.cookie)
           },
           body: JSON.stringify(upstreamBody),
           signal: AbortSignal.timeout(this.config.requestTimeoutMs)

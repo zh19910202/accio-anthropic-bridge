@@ -252,6 +252,52 @@ function discoverAccioAppPath(preferredPath) {
   return preferredPath || process.env.ACCIO_APP_PATH || "Accio";
 }
 
+function extractMacBundleVersionFromPlist(infoPlistPath) {
+  try {
+    const text = fs.readFileSync(infoPlistPath, "utf8");
+    const match = text.match(
+      /<key>\s*CFBundleShortVersionString\s*<\/key>\s*<string>\s*([^<]+?)\s*<\/string>/i
+    );
+    return match && match[1] ? String(match[1]).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function discoverAccioAppVersion(appPath) {
+  const explicit = String(process.env.ACCIO_APP_VERSION || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const resolvedAppPath = discoverAccioAppPath(appPath);
+  if (!resolvedAppPath) {
+    return "";
+  }
+
+  if (process.platform === "darwin") {
+    const candidates = [];
+    const trimmed = String(resolvedAppPath).trim();
+
+    if (trimmed.endsWith(".plist")) {
+      candidates.push(trimmed);
+    } else if (trimmed.endsWith(".app")) {
+      candidates.push(path.join(trimmed, "Contents", "Info.plist"));
+    }
+
+    for (const candidate of candidates) {
+      if (exists(candidate)) {
+        const version = extractMacBundleVersionFromPlist(candidate);
+        if (version) {
+          return version;
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
 function discoverAccountId(accioHome, preferredAccountId) {
   if (preferredAccountId) {
     return preferredAccountId;
@@ -506,6 +552,7 @@ function normalizeCookieHeader(rawCookie) {
 module.exports = {
   discoverAccioConfig,
   discoverAccioAppPath,
+  discoverAccioAppVersion,
   discoverSessionCandidates,
   discoverSessionSource,
   exists,

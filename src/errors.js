@@ -33,9 +33,10 @@ const STATUS_ERROR_TYPES = new Map([
 const CONNECTION_ERROR_RE = /timed out|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed/i;
 const TIMEOUT_RE = /timed out|timeout|aborted due to timeout/i;
 const FALLBACK_LOCAL_RE = /timed out|timeout|ECONNREFUSED|ECONNRESET|fetch failed|WebSocket closed|gateway is unavailable|Unable to resolve Accio access token/i;
-const FAILOVER_MESSAGE_RE = /quota|unauthorized|provider unavailable|rate limit|overloaded|user not activated|not activated|user blocked|auth not pass|blocked by sentinel rate limit|content risk rejected/;
+const FAILOVER_MESSAGE_RE = /quota|unauthorized|provider unavailable|rate limit|overloaded|user not activated|not activated|user blocked|auth not pass|blocked by sentinel rate limit/;
 const FAILOVER_TYPES = new Set(["authentication_error", "rate_limit_error", "overloaded_error"]);
 const FAILOVER_STATUSES = new Set([401, 403, 408, 429, 503, 504, 529]);
+const REQUEST_SCOPED_REJECTION_MESSAGE_RE = /content risk rejected/;
 
 function classifyErrorType(statusCode, error) {
   const mapped = STATUS_ERROR_TYPES.get(statusCode);
@@ -48,6 +49,15 @@ function classifyErrorType(statusCode, error) {
   }
 
   return "api_error";
+}
+
+function normalizeHttpStatusCode(statusCode, fallback = 500) {
+  const normalized = Number(statusCode) || 0;
+  if (normalized >= 100 && normalized <= 999) {
+    return Math.trunc(normalized);
+  }
+
+  return Number(fallback) || 500;
 }
 
 function isTimeoutLikeError(error) {
@@ -122,8 +132,21 @@ function shouldFallbackToLocalTransport(error) {
   return FALLBACK_LOCAL_RE.test(message);
 }
 
+function isRequestScopedRejection(error) {
+  if (!error) {
+    return false;
+  }
+
+  const message = String(error.message || "").toLowerCase();
+  return REQUEST_SCOPED_REJECTION_MESSAGE_RE.test(message);
+}
+
 function shouldFailoverAccount(error) {
   if (!error) {
+    return false;
+  }
+
+  if (isRequestScopedRejection(error)) {
     return false;
   }
 
@@ -140,6 +163,10 @@ function shouldFailoverAccount(error) {
   }
 
   return FAILOVER_TYPES.has(type) || FAILOVER_MESSAGE_RE.test(message);
+}
+
+function shouldRecordAccountFailure(error) {
+  return !isRequestScopedRejection(error);
 }
 
 function resolveResultError(result) {
@@ -159,8 +186,11 @@ function resolveResultError(result) {
 module.exports = {
   classifyErrorType,
   createBridgeError,
+  isRequestScopedRejection,
   isTimeoutLikeError,
+  normalizeHttpStatusCode,
   resolveResultError,
+  shouldRecordAccountFailure,
   shouldFailoverAccount,
   shouldFallbackToLocalTransport
 };

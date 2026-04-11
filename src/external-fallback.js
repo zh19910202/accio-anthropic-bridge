@@ -17,7 +17,7 @@ const JSON_CONTENT_RE = /application\/json/i;
 const STREAMING_REQUIRED_RE = /streaming is required for operations that may take longer than 10 minutes/i;
 const UNSUPPORTED_ENDPOINT_RE = /chat\/completions endpoint not supported|endpoint not supported/i;
 const NOT_FOUND_RE = /404|not[_\s-]?found/;
-const { classifyErrorType, isTimeoutLikeError } = require("./errors");
+const { classifyErrorType, isRequestScopedRejection, isTimeoutLikeError } = require("./errors");
 const { delay } = require("./utils");
 
 function createFallbackId() {
@@ -1118,6 +1118,10 @@ function upsertResponseOutputItem(items, item) {
 
 function shouldFallbackToExternalProvider(error) {
   if (!error) {
+    return false;
+  }
+
+  if (isRequestScopedRejection(error)) {
     return false;
   }
 

@@ -1474,4 +1474,9 @@ test("shouldFallbackToExternalProvider matches quota and connection failures", (
   invalid.status = 400;
   invalid.type = "invalid_request_error";
   assert.equal(shouldFallbackToExternalProvider(invalid), false);
+
+  const requestScoped = new Error("content risk rejected");
+  requestScoped.status = 5022;
+  requestScoped.type = "api_error";
+  assert.equal(shouldFallbackToExternalProvider(requestScoped), false);
 });

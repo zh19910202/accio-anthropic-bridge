@@ -728,17 +728,18 @@ async function requestQuotaViaUpstream(config, authPayload) {
   const upstreamBaseUrl = deriveUpstreamGatewayBaseUrl(config);
   const utdid = readAccioUtdid(config.accioHome);
   const cna = extractCnaFromCookie(authPayload.cookie);
+  const appVersion = config && config.appVersion ? String(config.appVersion).trim() || "0.0.0" : "0.0.0";
   const url = new URL("/api/entitlement/quota", upstreamBaseUrl);
   url.searchParams.set("accessToken", String(authPayload.accessToken));
   url.searchParams.set("utdid", utdid);
-  url.searchParams.set("version", "0.0.0");
+  url.searchParams.set("version", appVersion);
 
   const response = await fetch(url, {
     method: "GET",
     headers: {
       "x-language": config && config.language ? String(config.language) : "zh",
       "x-utdid": utdid,
-      "x-app-version": "0.0.0",
+      "x-app-version": appVersion,
       "x-os": process.platform,
       "x-cna": cna,
       cookie: normalizeCookieHeader(authPayload.cookie),
@@ -3692,7 +3693,6 @@ function getSnapshotUiAvailability(snapshot, standbyByAccountId, nowMs = Date.no
   const rawLastFailure = getSnapshotFailureReason(snapshot, standbyByAccountId);
   const normalizedLastFailure = rawLastFailure.trim().toLowerCase();
   const blockedByBusinessReason = normalizedLastFailure && (
-    /content risk rejected/.test(normalizedLastFailure) ||
     /blocked by sentinel rate limit/.test(normalizedLastFailure) ||
     /user blocked/.test(normalizedLastFailure) ||
     /user not activated|not activated/.test(normalizedLastFailure) ||

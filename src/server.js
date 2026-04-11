@@ -11,7 +11,7 @@ const { CodexResponsesClient } = require("./codex-responses");
 const { DebugTraceStore, setTraceError, updateTrace } = require("./debug-traces");
 const { DirectLlmClient } = require("./direct-llm");
 const { ExternalFallbackPool } = require("./external-fallback");
-const { classifyErrorType } = require("./errors");
+const { classifyErrorType, normalizeHttpStatusCode } = require("./errors");
 const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
 const { generateId } = require("./id");
@@ -302,7 +302,8 @@ function createServer(config, client, directClient, claudeFallbackPool, codexCli
       writeJson(res, 404, buildErrorResponse(`No route for ${url.pathname}`));
       finishLog("warn", "request completed", { status: 404 });
     } catch (error) {
-      const statusCode = error instanceof HttpError ? error.status : Number(error && error.status) || 500;
+      const rawStatusCode = error instanceof HttpError ? error.status : Number(error && error.status) || 500;
+      const statusCode = normalizeHttpStatusCode(rawStatusCode, 500);
       const message =
         error instanceof HttpError
           ? error.body && error.body.error
@@ -375,6 +376,7 @@ async function main() {
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,
     upstreamBaseUrl: config.directLlmBaseUrl,
+    appVersion: config.appVersion,
     authCacheTtlMs: config.authCacheTtlMs,
     quotaPreflightEnabled: config.quotaPreflightEnabled,
     quotaCacheTtlMs: config.quotaCacheTtlMs,

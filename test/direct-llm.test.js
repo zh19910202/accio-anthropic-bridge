@@ -47,6 +47,22 @@ test("buildDirectRequestFromAnthropic maps tool_result and aliased model", () =>
   assert.equal(request.requestBody.contents[1].parts[0].functionResponse.name, "shell_echo");
 });
 
+test("buildDirectRequestFromAnthropic rewrites Claude Code CLI system identity for direct upstream compatibility", () => {
+  const request = buildDirectRequestFromAnthropic({
+    model: "claude-opus-4-6",
+    system: [
+      { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.85.351; cc_entrypoint=cli; cch=32200;" },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: "You are an interactive agent that helps users with software engineering tasks." }
+    ],
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }]
+  });
+
+  assert.match(request.requestBody.systemInstruction, /You are a Claude agent, built on Anthropic's Claude Agent SDK\./);
+  assert.doesNotMatch(request.requestBody.systemInstruction, /official CLI for Claude/);
+  assert.match(request.requestBody.systemInstruction, /software engineering tasks/);
+});
+
 test("buildDirectRequestFromOpenAi maps tools into declarations", () => {
   const request = buildDirectRequestFromOpenAi({
     model: "claude-opus-4-6",
@@ -185,6 +201,50 @@ test("DirectLlmClient converts SSE logical errors into structured upstream error
   );
 
   global.fetch = originalFetch;
+});
+
+test("DirectLlmClient sends app version metadata on generateContent requests", async () => {
+  const calls = [];
+  const client = new DirectLlmClient({
+    authMode: "env",
+    appVersion: "0.4.6",
+    language: "zh",
+    authProvider: {
+      resolveCredential() {
+        return {
+          accountId: "acct_primary",
+          token: "token_primary",
+          cookie: "cna%3Dcookie-cna",
+          source: "env"
+        };
+      }
+    },
+    requestTimeoutMs: 1000,
+    upstreamBaseUrl: "https://example.test/api/adk/llm",
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      return {
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        async text() {
+          return JSON.stringify({ message: "forced test failure" });
+        }
+      };
+    }
+  });
+
+  await assert.rejects(
+    () => client.run({ model: "claude-opus-4-6", requestBody: { model: "claude-opus-4-6" } }),
+    UpstreamHttpError
+  );
+
+  const generateCall = calls.find((entry) => entry.url.includes("/generateContent"));
+  assert.ok(generateCall);
+  assert.match(generateCall.url, /version=0\.4\.6/);
+  assert.equal(generateCall.options.headers["x-app-version"], "0.4.6");
+  assert.equal(generateCall.options.headers["x-cna"], "cookie-cna");
+  assert.equal(generateCall.options.headers.cookie, "cna=cookie-cna");
 });
 
 
@@ -1109,6 +1169,48 @@ test("DirectLlmClient uses prepared standby queue during failover instead of re-
   assert.equal(resolveCalls, 0);
 });
 
+test("DirectLlmClient prefers prepared standby credential on normal path before resolving file accounts", async () => {
+  let resolveCalls = 0;
+  const authProvider = {
+    resolveCredential() {
+      resolveCalls++;
+      return {
+        accountId: "acct_active",
+        accountName: "Active",
+        token: "token_active",
+        source: "accounts-file"
+      };
+    },
+    isAccountUsable(accountId) {
+      return accountId === "acct_ready" || accountId === "acct_active";
+    }
+  };
+
+  const client = new DirectLlmClient({
+    authMode: "file",
+    authProvider,
+    quotaPreflightEnabled: true,
+    accountStandbyEnabled: true
+  });
+
+  client._preparedCredentials = [
+    {
+      accountId: "acct_ready",
+      accountName: "Ready",
+      token: "token_ready",
+      refreshToken: "refresh_ready",
+      cookie: "cna=ready-cna",
+      user: { id: "user_ready", name: "Ready" },
+      source: "accounts-file"
+    }
+  ];
+
+  const credential = await client.getAuthToken();
+
+  assert.equal(credential.accountId, "acct_ready");
+  assert.equal(resolveCalls, 0);
+});
+
 test("DirectLlmClient keeps using the current serving account across requests when it remains healthy", async () => {
   let resolveCalls = 0;
   const seenTokens = [];
@@ -1875,10 +1977,11 @@ test("DirectLlmClient does not transparently retry once stream output has starte
   assert.ok(decisions.some((event) => event.type === 'account_failover_blocked' && event.accountId === 'acct_first' && event.phase === 'stream' && event.responseStarted === true));
 });
 
-test("DirectLlmClient fails over to another usable account on content risk rejection before fallback", async () => {
+test("DirectLlmClient surfaces content risk rejection without poisoning the account pool", async () => {
   const decisions = [];
   const seenTokens = [];
   const invalidations = [];
+  const failures = [];
   const authProvider = {
     resolveCredential(options = {}) {
       const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
@@ -1902,7 +2005,9 @@ test("DirectLlmClient fails over to another usable account on content risk rejec
       }
       return null;
     },
-    recordFailure() {},
+    recordFailure(accountId, error) {
+      failures.push({ accountId, reason: error && error.message ? error.message : String(error) });
+    },
     invalidateAccount(accountId, reason) {
       invalidations.push({ accountId, reason });
     },
@@ -1950,17 +2055,7 @@ test("DirectLlmClient fails over to another usable account on content risk rejec
         };
       }
 
-      return {
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok after content-risk failover"}]}}\n\n'));
-            controller.close();
-          }
-        })
-      };
+      throw new Error('Second account should not be attempted for request-scoped rejection');
     }
 
     throw new Error('Unexpected URL: ' + value);
@@ -1978,20 +2073,28 @@ test("DirectLlmClient fails over to another usable account on content risk rejec
     fetchImpl
   });
 
-  const result = await client.run(
-    { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
-    {
-      onDecision(event) {
-        decisions.push(event);
+  await assert.rejects(
+    () => client.run(
+      { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
+      {
+        onDecision(event) {
+          decisions.push(event);
+        }
       }
+    ),
+    (error) => {
+      assert.ok(error instanceof UpstreamSseError);
+      assert.equal(error.status, 400);
+      assert.equal(error.type, 'invalid_request_error');
+      assert.equal(error.message, 'content risk rejected');
+      return true;
     }
   );
 
-  assert.equal(result.accountId, 'acct_second');
-  assert.equal(result.finalText, 'ok after content-risk failover');
-  assert.deepEqual(seenTokens, ['token_first', 'token_second']);
-  assert.ok(decisions.some((event) => event.type === 'account_failover' && event.accountId === 'acct_first' && event.phase === 'stream' && event.responseStarted === false && event.reason === 'content risk rejected'));
-  assert.ok(invalidations.some((entry) => entry.accountId === 'acct_first' && /content risk rejected/.test(entry.reason)));
+  assert.deepEqual(seenTokens, ['token_first']);
+  assert.equal(decisions.some((event) => event.type === 'account_failover'), false);
+  assert.deepEqual(invalidations, []);
+  assert.deepEqual(failures, []);
 });
 
 
@@ -2102,6 +2205,32 @@ test("hasReadyAccounts falls back to auth provider usability check", () => {
   });
 
   assert.equal(client.hasReadyAccounts(), true);
+});
+
+test("hasReadyAccounts does not fall back to static usability after standby runtime state is known", () => {
+  const client = new DirectLlmClient({
+    authMode: "env",
+    authProvider: {
+      resolveCredential() { return null; },
+      listCredentials() {
+        return [
+          { accountId: "acct-1" },
+          { accountId: "acct-2" }
+        ];
+      },
+      isAccountUsable() { return true; }
+    },
+    accountStandbyEnabled: true,
+    upstreamBaseUrl: "https://example.test"
+  });
+
+  client._preparedCredentialsAt = Date.now();
+  client._preparedCredentials = [];
+  client._standbyCooldownCredentials = [
+    { accountId: "acct-1", nextCheckAt: new Date(Date.now() + 30_000).toISOString() }
+  ];
+
+  assert.equal(client.hasReadyAccounts(), false);
 });
 
 

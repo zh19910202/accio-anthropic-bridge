@@ -1,6 +1,11 @@
 "use strict";
 
-const { classifyErrorType, createBridgeError, shouldFailoverAccount } = require("./errors");
+const {
+  classifyErrorType,
+  createBridgeError,
+  shouldFailoverAccount,
+  shouldRecordAccountFailure
+} = require("./errors");
 const log = require("./logger");
 
 const OPENAI_AUTH_URL = "https://auth.openai.com/oauth/token";
@@ -955,7 +960,11 @@ class CodexResponsesClient {
           }
         }
 
-        if (credential.accountId && typeof this.authProvider.recordFailure === "function") {
+        if (
+          shouldRecordAccountFailure(error) &&
+          credential.accountId &&
+          typeof this.authProvider.recordFailure === "function"
+        ) {
           this.authProvider.recordFailure(credential.accountId, error);
         }
 
@@ -1033,7 +1042,11 @@ class CodexResponsesClient {
         }
       }
 
-      if (credential.accountId && typeof this.authProvider.recordFailure === "function") {
+      if (
+        shouldRecordAccountFailure(error) &&
+        credential.accountId &&
+        typeof this.authProvider.recordFailure === "function"
+      ) {
         this.authProvider.recordFailure(credential.accountId, error);
       }
 

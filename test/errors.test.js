@@ -6,6 +6,9 @@ const assert = require("node:assert/strict");
 const {
   classifyErrorType,
   createBridgeError,
+  isRequestScopedRejection,
+  normalizeHttpStatusCode,
+  shouldRecordAccountFailure,
   shouldFailoverAccount,
   shouldFallbackToLocalTransport
 } = require("../src/errors");
@@ -50,6 +53,13 @@ test("createBridgeError includes details when provided", () => {
   assert.deepEqual(error.details, details);
 });
 
+test("normalizeHttpStatusCode clamps invalid upstream business codes", () => {
+  assert.equal(normalizeHttpStatusCode(400), 400);
+  assert.equal(normalizeHttpStatusCode(529), 529);
+  assert.equal(normalizeHttpStatusCode(5022), 500);
+  assert.equal(normalizeHttpStatusCode("bad", 502), 502);
+});
+
 test("shouldFailoverAccount returns true for auth and rate limit errors", () => {
   assert.equal(shouldFailoverAccount({ status: 401 }), true);
   assert.equal(shouldFailoverAccount({ status: 403 }), true);
@@ -74,11 +84,19 @@ test("shouldFailoverAccount detects error types and messages", () => {
   assert.equal(shouldFailoverAccount({ message: "rate limit hit" }), true);
   assert.equal(shouldFailoverAccount({ message: "provider unavailable" }), true);
   assert.equal(shouldFailoverAccount({ message: "The operation was aborted due to timeout" }), true);
-  assert.equal(shouldFailoverAccount({ message: "content risk rejected" }), true);
+  assert.equal(shouldFailoverAccount({ message: "content risk rejected" }), false);
   assert.equal(shouldFailoverAccount({ message: "blocked by sentinel rate limit" }), true);
   assert.equal(shouldFailoverAccount({ message: "user blocked" }), true);
   assert.equal(shouldFailoverAccount({ message: "auth not pass" }), true);
   assert.equal(shouldFailoverAccount({ message: "normal response" }), false);
+});
+
+test("request-scoped rejections do not poison account state", () => {
+  const error = { type: "invalid_request_error", message: "content risk rejected" };
+
+  assert.equal(isRequestScopedRejection(error), true);
+  assert.equal(shouldRecordAccountFailure(error), false);
+  assert.equal(shouldFailoverAccount(error), false);
 });
 
 test("shouldFallbackToLocalTransport returns true for connection errors", () => {

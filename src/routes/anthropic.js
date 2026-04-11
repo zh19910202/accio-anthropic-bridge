@@ -944,14 +944,6 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
         transportSelected: "direct-llm",
         error: error && error.message ? error.message : String(error)
       });
-
-      if (await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
-        cacheKey,
-        responseCache
-      }, error, "direct-llm")) {
-        return;
-      }
-
       throw error;
     }
   }

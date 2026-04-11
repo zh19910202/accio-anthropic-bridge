@@ -2,7 +2,7 @@
 
 const path = require("node:path");
 
-const { discoverAccioAppPath, discoverAccioConfig } = require("./discovery");
+const { discoverAccioAppPath, discoverAccioAppVersion, discoverAccioConfig } = require("./discovery");
 const { normalizeFallbackTarget } = require("./external-fallback");
 const { parseFlag } = require("./gateway-manager");
 
@@ -52,6 +52,7 @@ function parseFallbackTargetsFromEnv(options = {}) {
 }
 
 function createConfig() {
+  const appPath = discoverAccioAppPath(env("ACCIO_APP_PATH", ""));
   const discovered = discoverAccioConfig({
     accountId: env("ACCIO_ACCOUNT_ID", ""),
     accioHome: env("ACCIO_HOME", ""),
@@ -103,7 +104,8 @@ function createConfig() {
     envAccountId: env("ACCIO_AUTH_ACCOUNT_ID", "env-default"),
     accessTokenExpiresAt: env("ACCIO_ACCESS_TOKEN_EXPIRES_AT", ""),
     gatewayAutostart: parseFlag(env("ACCIO_GATEWAY_AUTOSTART", "1"), true),
-    appPath: discoverAccioAppPath(env("ACCIO_APP_PATH", "")),
+    appPath,
+    appVersion: env("ACCIO_APP_VERSION", discoverAccioAppVersion(appPath) || "0.0.0"),
     desktopHelperUrl: env("ACCIO_DESKTOP_HELPER_URL", "http://127.0.0.1:8090"),
     desktopHelperTimeoutMs: Number(env("ACCIO_DESKTOP_HELPER_TIMEOUT_MS", "15000")),
     gatewayWaitMs: Number(env("ACCIO_GATEWAY_WAIT_MS", "20000")),

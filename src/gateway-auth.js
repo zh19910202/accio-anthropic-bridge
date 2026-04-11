@@ -62,6 +62,11 @@ function deriveUpstreamGatewayBaseUrl(config = {}) {
   return "https://phoenix-gw.alibaba.com";
 }
 
+function resolveUpstreamAppVersion(config = {}) {
+  const candidate = config && config.appVersion ? String(config.appVersion).trim() : "";
+  return candidate || "0.0.0";
+}
+
 async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) {
   if (!authPayload || !authPayload.accessToken || !authPayload.refreshToken) {
     throw new Error("Auth payload is missing accessToken or refreshToken");
@@ -74,9 +79,10 @@ async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) 
     ? String(context.utdid)
     : readAccioUtdid(config && config.accioHome);
   const cna = extractCnaFromCookie(authPayload.cookie);
+  const appVersion = resolveUpstreamAppVersion(config);
   const requestBody = {
     utdid,
-    version: "0.0.0",
+    version: appVersion,
     accessToken: String(authPayload.accessToken),
     refreshToken: String(authPayload.refreshToken)
   };
@@ -86,7 +92,7 @@ async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) 
       "content-type": "application/json",
       "x-language": config && config.language ? String(config.language) : "zh",
       "x-utdid": utdid,
-      "x-app-version": "0.0.0",
+      "x-app-version": appVersion,
       "x-os": process.platform,
       "x-cna": cna
     },
@@ -157,6 +163,7 @@ module.exports = {
   buildGatewayAuthCallbackQuery,
   extractAuthCallbackPayloadFromSearchParams,
   deriveUpstreamGatewayBaseUrl,
+  resolveUpstreamAppVersion,
   refreshAuthPayloadViaUpstream,
   waitForGatewayAuthenticatedUser
 };

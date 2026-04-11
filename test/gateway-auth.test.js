@@ -64,7 +64,8 @@ test("refreshAuthPayloadViaUpstream reuses shared fetch logic and preserves auth
   const refreshed = await refreshAuthPayloadViaUpstream(
     {
       directLlmBaseUrl: "https://example.test/api/adk/llm",
-      language: "zh"
+      language: "zh",
+      appVersion: "0.4.6"
     },
     {
       accessToken: "old_access",
@@ -97,6 +98,8 @@ test("refreshAuthPayloadViaUpstream reuses shared fetch logic and preserves auth
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://example.test/api/auth/refresh_token");
+  assert.equal(calls[0].options.headers["x-app-version"], "0.4.6");
+  assert.equal(JSON.parse(calls[0].options.body).version, "0.4.6");
   assert.equal(calls[0].options.headers["x-cna"], "cookie-cna");
   assert.equal(refreshed.accessToken, "new_access");
   assert.equal(refreshed.refreshToken, "new_refresh");
