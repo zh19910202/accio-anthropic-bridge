@@ -4,6 +4,7 @@ const fsp = require("node:fs/promises");
 
 const { writeJson } = require("../http");
 const log = require("../logger");
+const { errMsg } = require("../utils");
 
 async function handleHealth(req, res, client, directClient, sessionStore, modelsRegistry, responseCache, traceStore) {
   let auth = null;
@@ -153,7 +154,7 @@ async function handleAccioAuthProbe(req, res, client, directClient) {
     directLlmAvailable = await directClient.isAvailable();
   } catch (error) {
     log.debug("direct llm availability probe failed", {
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
   }
 

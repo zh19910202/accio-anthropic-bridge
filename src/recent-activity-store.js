@@ -41,6 +41,11 @@ class RecentActivityStore {
       this.listeners.delete(listener);
     };
   }
+
+  clear() {
+    this.listeners.clear();
+    this.lastSuccess = null;
+  }
 }
 
 module.exports = {

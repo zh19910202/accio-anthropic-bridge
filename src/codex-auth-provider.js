@@ -5,6 +5,7 @@ const path = require("node:path");
 const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
 const { BaseAuthProvider, normalizeStrategy, parseJsonFile } = require("./base-auth-provider");
+const { errMsg } = require("./utils");
 
 function pickFirst(...values) {
   for (const v of values) {
@@ -262,7 +263,7 @@ class CodexAuthProvider extends BaseAuthProvider {
     } catch (error) {
       log.warn("codex account token update failed", {
         accountId: normalizedId,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
   }

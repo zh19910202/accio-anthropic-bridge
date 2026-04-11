@@ -18,12 +18,20 @@ const SENSITIVE_KEYS = new Set([
   "x-utdid"
 ]);
 
+/**
+ * Core mask logic shared by maskSecret / maskToken.
+ * Reveals up to 8 leading characters, then appends "***".
+ */
+function applyMask(value) {
+  return value.length > 8 ? `${value.slice(0, 8)}***` : "***";
+}
+
 function maskSecret(value) {
   if (typeof value !== "string" || !value) {
     return "***";
   }
 
-  return value.length > 8 ? `${value.slice(0, 8)}***` : "***";
+  return applyMask(value);
 }
 
 function truncateString(value, maxLength = DEFAULT_MAX_STRING_LENGTH) {
@@ -103,7 +111,7 @@ function maskToken(token) {
     return null;
   }
 
-  return token.length > 8 ? `${token.slice(0, 8)}***` : "***";
+  return applyMask(token);
 }
 
 module.exports = {

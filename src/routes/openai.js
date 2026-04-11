@@ -1,14 +1,10 @@
 "use strict";
 
-const { buildErrorResponse, estimateTokens } = require("../anthropic");
+const { estimateTokens } = require("../anthropic");
 const { buildDirectRequestFromOpenAi } = require("../direct-llm");
-const {
-  classifyErrorType,
-  createBridgeError,
-  resolveResultError
-} = require("../errors");
+const { createBridgeError } = require("../errors");
 const { openAiMessagesToResponsesInput, shouldFallbackToExternalProvider } = require("../external-fallback");
-const { CORS_HEADERS, writeJson, writeSse } = require("../http");
+const { writeJson } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
 const {
   applyOpenAiDefaults,
@@ -28,7 +24,6 @@ const { OpenAiStreamWriter } = require("../stream/openai-sse");
 const { ResponsesStreamWriter } = require("../stream/responses-sse");
 const { validateOpenAiMessages } = require("../tooling");
 const {
-  executeBridgeQuery,
   sessionHeaders,
   shouldUseDirectTransport,
   usageCompletionTokens,
@@ -36,7 +31,17 @@ const {
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
 const { generateId } = require("../id");
-const { applyBridgeRequestIdToDirectRequest, cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
+const {
+  applyBridgeRequestIdToDirectRequest,
+  cacheHeaders,
+  errMsg,
+  fallbackTransportName,
+  logRequest: logRequestShared,
+  requestedAccountId,
+  resolveUsageTokens,
+  startHeartbeat,
+  writeSseError
+} = require("./shared");
 const { resolveSessionBinding } = require("../session-store");
 
 function logRequest(req, message, meta = {}) {
@@ -79,28 +84,13 @@ async function runDirectOpenAi(body, req, res, directClient, sessionStore, store
   });
 
   /* ── Heartbeat: keeps connection alive while upstream is thinking ── */
-  let pingInterval = null;
-
-  if (stream) {
-    pingInterval = setInterval(() => {
-      if (res.writableEnded || res.destroyed) {
-        clearInterval(pingInterval);
-        pingInterval = null;
-        return;
-      }
-
-      if (res.headersSent) {
-        // OpenAI SSE format: comment line as keepalive (ignored by spec-compliant clients)
-        res.write(": ping\n\n");
-      }
-    }, 15_000);
-  }
+  const heartbeat = stream ? startHeartbeat(res, "openai") : null;
 
   let result;
   try {
     result = await directClient.run(request, {
       accountId: requestedAccountId(req.headers) || (storedSession && storedSession.accountId) || null,
-      stickyAccountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
+      stickyAccountId: storedSession?.accountId ?? null,
       onDecision(event) {
         updateTrace(req, {
           bridge: {
@@ -139,30 +129,14 @@ async function runDirectOpenAi(body, req, res, directClient, sessionStore, store
       }
     });
   } catch (error) {
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
-    }
-
-    if (stream && res.headersSent && !res.writableEnded && !res.destroyed) {
-      // Write an SSE error data block so the client gets a clear signal
-      res.write(`data: ${JSON.stringify({
-        error: {
-          type: error.type || "api_error",
-          message: error.message || "stream error",
-          code: error.status || null
-        }
-      })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
+    if (stream && writeSseError(res, error, "openai")) {
       return;
     }
 
     throw error;
   } finally {
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
+    if (heartbeat) {
+      heartbeat.clear();
     }
   }
 
@@ -284,7 +258,7 @@ async function runCodexChatCompletions(body, req, res, codexClient, sessionStore
   try {
     result = await codexClient.run(responsesBody, {
       accountId: requestedAccountId(req.headers) || (storedSession && storedSession.accountId) || null,
-      stickyAccountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
+      stickyAccountId: storedSession?.accountId ?? null,
       onDecision(event) {
         updateTrace(req, {
           bridge: {
@@ -314,16 +288,7 @@ async function runCodexChatCompletions(body, req, res, codexClient, sessionStore
       }
     });
   } catch (error) {
-    if (stream && res.headersSent && !res.writableEnded && !res.destroyed) {
-      res.write(`data: ${JSON.stringify({
-        error: {
-          type: error.type || "api_error",
-          message: error.message || "stream error",
-          code: error.status || null
-        }
-      })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
+    if (stream && writeSseError(res, error, "openai")) {
       return;
     }
 
@@ -402,35 +367,25 @@ async function executeOpenAiNonStreaming(body, req, client, directClient, sessio
   const storedSession = binding.sessionId ? sessionStore.get(binding.sessionId) : null;
   const directRequest = applyBridgeRequestIdToDirectRequest(req, buildDirectRequestFromOpenAi(body));
 
-  logRequest(req, "openai request parsed", {
+  const parsedMeta = {
     requestedModel: body.model || null,
     normalizedModel: directRequest.model,
     resolvedProviderModel: directRequest.model,
     sessionId: binding.sessionId || null,
     conversationId: binding.conversationId || null,
     sessionBindingHit: Boolean(storedSession),
-    accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-    accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
+    accountId: storedSession?.accountId ?? null,
+    accountName: storedSession?.accountName ?? null,
     defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens)
-  });
-  updateTrace(req, {
-    bridge: {
-      requestedModel: body.model || null,
-      normalizedModel: directRequest.model,
-      resolvedProviderModel: directRequest.model,
-      sessionId: binding.sessionId || null,
-      conversationId: binding.conversationId || null,
-      sessionBindingHit: Boolean(storedSession),
-      accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-      accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
-      defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens)
-    }
-  });
+  };
+
+  logRequest(req, "openai request parsed", parsedMeta);
+  updateTrace(req, { bridge: parsedMeta });
 
   if (await shouldUseDirectTransport(client, directClient)) {
     const result = await directClient.run(directRequest, {
       accountId: requestedAccountId(req.headers) || (storedSession && storedSession.accountId) || null,
-      stickyAccountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
+      stickyAccountId: storedSession?.accountId ?? null,
       onDecision(event) {
         updateTrace(req, {
           bridge: {
@@ -512,13 +467,12 @@ async function tryExternalFallbackOpenAi(body, req, res, fallbackPool, binding, 
       const created = Math.floor(Date.now() / 1000);
       const chunkId = generateId("chatcmpl");
       const result = await fallbackClient.completeOpenAi(body);
-      const inputTokens = estimateTokens(flattenOpenAiRequest(body));
-      const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        : estimateTokens(result.text);
-      const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        : inputTokens;
+      const { promptTokens, completionTokens: outputTokens } = resolveUsageTokens(
+        result.usage,
+        estimateTokens(flattenOpenAiRequest(body)),
+        result.text,
+        estimateTokens
+      );
       const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
 
       if (body.stream === true) {
@@ -568,7 +522,7 @@ async function tryExternalFallbackOpenAi(body, req, res, fallbackPool, binding, 
         phase,
         status: candidateError && candidateError.status ? candidateError.status : null,
         type: candidateError && candidateError.type ? candidateError.type : null,
-        error: candidateError && candidateError.message ? candidateError.message : String(candidateError)
+        error: errMsg(candidateError)
       });
       lastError = candidateError;
     }
@@ -594,32 +548,21 @@ async function handleChatCompletionsRequest(req, res, client, codexClient, fallb
   const storedSession = binding.sessionId ? sessionStore.get(binding.sessionId) : null;
   const responsesBody = buildResponsesBodyFromChat(body);
 
-  setTraceRequest(req, "openai", body, {
+  const requestMeta = {
     requestedModel: body.model || null,
     normalizedModel: body.model || null,
     resolvedProviderModel: body.model || null,
     sessionId: binding.sessionId || null,
     conversationId: binding.conversationId || null,
     sessionBindingHit: Boolean(storedSession),
-    accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-    accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
-    defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens),
-    cacheEligible,
-    theme: "codex"
-  });
-
-  logRequest(req, "openai request parsed", {
-    requestedModel: body.model || null,
-    normalizedModel: body.model || null,
-    resolvedProviderModel: body.model || null,
-    sessionId: binding.sessionId || null,
-    conversationId: binding.conversationId || null,
-    sessionBindingHit: Boolean(storedSession),
-    accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-    accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
+    accountId: storedSession?.accountId ?? null,
+    accountName: storedSession?.accountName ?? null,
     defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens),
     cacheEligible
-  });
+  };
+
+  setTraceRequest(req, "openai", body, { ...requestMeta, theme: "codex" });
+  logRequest(req, "openai request parsed", requestMeta);
 
   if (cacheKey && responseCache) {
     const cached = responseCache.get(cacheKey);
@@ -642,7 +585,7 @@ async function handleChatCompletionsRequest(req, res, client, codexClient, fallb
     } catch (error) {
       logRequest(req, "openai direct failed without local-ws fallback", {
         transportSelected: "codex-responses",
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
 
       if (await tryExternalFallbackOpenAi(body, req, res, fallbackPool, binding, responsesBody, {
@@ -694,13 +637,12 @@ async function tryExternalFallbackResponses(body, chatBody, req, res, fallbackPo
       });
 
       const result = await fallbackClient.completeOpenAi(chatBody);
-      const inputTokens = estimateTokens(flattenOpenAiRequest(chatBody));
-      const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        : estimateTokens(result.text);
-      const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        : inputTokens;
+      const { promptTokens, completionTokens: outputTokens } = resolveUsageTokens(
+        result.usage,
+        estimateTokens(flattenOpenAiRequest(chatBody)),
+        result.text,
+        estimateTokens
+      );
       const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
 
       if (body.stream === true) {
@@ -816,13 +758,13 @@ async function handleResponsesRequest(req, res, client, codexClient, fallbackPoo
     }
   }
 
+  const storedSession = binding.sessionId ? sessionStore.get(binding.sessionId) : null;
+
   let result;
   try {
     result = await codexClient.run(body, {
       accountId: requestedAccountId(req.headers) || null,
-      stickyAccountId: binding.sessionId && sessionStore.get(binding.sessionId) && sessionStore.get(binding.sessionId).accountId
-        ? sessionStore.get(binding.sessionId).accountId
-        : null,
+      stickyAccountId: storedSession?.accountId ?? null,
       onDecision(event) {
         updateTrace(req, {
           bridge: {

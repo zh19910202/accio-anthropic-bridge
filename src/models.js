@@ -2,6 +2,7 @@
 
 const modelAliases = require("../config/model-aliases.json");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 
 function buildModelRecord(id, extras = {}) {
   return {
@@ -156,7 +157,7 @@ class ModelsRegistry {
     } catch (error) {
       log.warn("models discovery failed", {
         source,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
       models = [];
     }

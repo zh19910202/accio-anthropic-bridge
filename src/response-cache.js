@@ -29,10 +29,13 @@ function buildCacheKey(parts) {
   return crypto.createHash("sha256").update(stableSerialize(parts)).digest("hex");
 }
 
+const DEFAULT_MAX_ENTRIES = 128;
+const PROBABILISTIC_PURGE_RATE = 0.05;  // ~5% chance on miss to reclaim expired entries
+
 class ResponseCache {
   constructor(options = {}) {
     this.ttlMs = Number(options.ttlMs || 0);
-    this.maxEntries = Number(options.maxEntries || 128);
+    this.maxEntries = Number(options.maxEntries || DEFAULT_MAX_ENTRIES);
     this.store = new Map();
   }
 
@@ -49,7 +52,7 @@ class ResponseCache {
 
     if (!entry) {
       // Probabilistic cleanup (~5% chance) to reclaim memory from expired entries
-      if (this.store.size > 0 && Math.random() < 0.05) {
+      if (this.store.size > 0 && Math.random() < PROBABILISTIC_PURGE_RATE) {
         this._purgeExpired();
       }
       return null;

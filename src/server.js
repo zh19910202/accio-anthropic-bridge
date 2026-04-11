@@ -3,7 +3,7 @@
 const http = require("node:http");
 
 const { AccioClient, HttpError } = require("./accio-client");
-const { setActiveAccountInFile } = require("./accounts-file");
+const { createAccountSyncSubscriber } = require("./account-sync");
 const { AuthProvider } = require("./auth-provider");
 const { buildErrorResponse } = require("./anthropic");
 const { CodexAuthProvider } = require("./codex-auth-provider");
@@ -119,53 +119,80 @@ function recordRecentActivity(activityStore, req, requestMeta, protocol, statusC
   }
 }
 
-function createServer(config, client, directClient, claudeFallbackPool, codexClient, codexFallbackPool, authProvider, codexAuthProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore) {
-  /* ── Declarative route table ── */
-  const deps = { config, client, directClient, claudeFallbackPool, codexClient, codexFallbackPool, authProvider, codexAuthProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore };
+/**
+ * Extract pathname from req.url with minimal overhead (avoids `new URL()` per request).
+ * Falls back to the full url if no query string is present.
+ */
+function extractPathname(rawUrl) {
+  const qIndex = rawUrl.indexOf("?");
+  return qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+}
 
-  const staticRoutes = [
+function createServer(deps) {
+  const {
+    config, client, directClient, claudeFallbackPool,
+    codexClient, codexFallbackPool, authProvider, codexAuthProvider,
+    gatewayManager, sessionStore, modelsRegistry, responseCache,
+    traceStore, recentActivityStore
+  } = deps;
+
+  /* ── Declarative route table ── */
+
+  /**
+   * API routes get trace capture and activity recording automatically.
+   * The 5th element is an optional meta object with:
+   *   - trace: boolean  — whether to call captureTrace after the handler
+   *   - activity: string — protocol name for recordRecentActivity (omit to skip)
+   */
+  const allRoutes = [
     // Admin UI & API
-    ["GET",  "/admin",                               "admin-ui",  (r, s, u) => handleAdminPage(r, s, deps.config)],
-    ["GET",  "/admin/api/state",                     "admin-api", (r, s, u) => handleAdminState(r, s, deps.config, deps.authProvider, deps.codexAuthProvider, deps.directClient, deps.recentActivityStore)],
+    ["GET",  "/admin",                               "admin-ui",  (r, s) => handleAdminPage(r, s, config)],
+    ["GET",  "/admin/api/state",                     "admin-api", (r, s) => handleAdminState(r, s, config, authProvider, codexAuthProvider, directClient, recentActivityStore)],
     ["GET",  "/admin/api/logs",                      "admin-api", (r, s) => handleAdminLogs(r, s)],
-    ["GET",  "/admin/api/events",                    "admin-sse", (r, s, u) => handleAdminEvents(r, s, deps.config, deps.authProvider, deps.codexAuthProvider, deps.directClient, deps.recentActivityStore)],
-    ["GET",  "/admin/api/config",                    "admin-api", (r, s) => handleAdminConfigGet(r, s, deps.config)],
-    ["POST", "/admin/api/config",                    "admin-api", (r, s) => handleAdminConfigSave(r, s, deps.config, deps.claudeFallbackPool, deps.codexFallbackPool)],
+    ["GET",  "/admin/api/events",                    "admin-sse", (r, s) => handleAdminEvents(r, s, config, authProvider, codexAuthProvider, directClient, recentActivityStore)],
+    ["GET",  "/admin/api/config",                    "admin-api", (r, s) => handleAdminConfigGet(r, s, config)],
+    ["POST", "/admin/api/config",                    "admin-api", (r, s) => handleAdminConfigSave(r, s, config, claudeFallbackPool, codexFallbackPool)],
     ["POST", "/admin/api/config/test",               "admin-api", (r, s) => handleAdminConfigTest(r, s)],
-    ["POST", "/admin/api/snapshots",                 "admin-api", (r, s) => handleAdminSnapshotCreate(r, s, deps.config)],
-    ["POST", "/admin/api/snapshots/test",            "admin-api", (r, s) => handleAdminSnapshotTest(r, s, deps.config, deps.authProvider)],
-    ["POST", "/admin/api/snapshots/activate",        "admin-api", (r, s) => handleAdminSnapshotActivate(r, s, deps.config, deps.gatewayManager)],
-    ["POST", "/admin/api/snapshots/delete",          "admin-api", (r, s) => handleAdminSnapshotDelete(r, s, deps.config)],
-    ["POST", "/admin/api/gateway/login",             "admin-api", (r, s) => handleAdminGatewayLogin(r, s, deps.gatewayManager)],
-    ["POST", "/admin/api/gateway/logout",            "admin-api", (r, s) => handleAdminGatewayLogout(r, s, deps.gatewayManager)],
-    ["POST", "/admin/api/accounts/login",            "admin-api", (r, s) => handleAdminAccountLogin(r, s, deps.config, deps.gatewayManager)],
-    ["GET",  "/admin/api/accounts/callback",         "admin-api", (r, s, u) => handleAdminAccountCallback(r, s, deps.config, u, deps.gatewayManager)],
-    ["GET",  "/admin/api/accounts/login-status",     "admin-api", (r, s, u) => handleAdminAccountLoginStatus(r, s, deps.config, u)],
+    ["POST", "/admin/api/snapshots",                 "admin-api", (r, s) => handleAdminSnapshotCreate(r, s, config)],
+    ["POST", "/admin/api/snapshots/test",            "admin-api", (r, s) => handleAdminSnapshotTest(r, s, config, authProvider)],
+    ["POST", "/admin/api/snapshots/activate",        "admin-api", (r, s) => handleAdminSnapshotActivate(r, s, config, gatewayManager)],
+    ["POST", "/admin/api/snapshots/delete",          "admin-api", (r, s) => handleAdminSnapshotDelete(r, s, config)],
+    ["POST", "/admin/api/gateway/login",             "admin-api", (r, s) => handleAdminGatewayLogin(r, s, gatewayManager)],
+    ["POST", "/admin/api/gateway/logout",            "admin-api", (r, s) => handleAdminGatewayLogout(r, s, gatewayManager)],
+    ["POST", "/admin/api/accounts/login",            "admin-api", (r, s) => handleAdminAccountLogin(r, s, config, gatewayManager)],
+    ["GET",  "/admin/api/accounts/callback",         "admin-api", (r, s, u) => handleAdminAccountCallback(r, s, config, u, gatewayManager)],
+    ["GET",  "/admin/api/accounts/login-status",     "admin-api", (r, s, u) => handleAdminAccountLoginStatus(r, s, config, u)],
     ["POST", "/admin/api/accounts/login/cancel",     "admin-api", (r, s) => handleAdminAccountLoginCancel(r, s)],
-    ["POST", "/admin/api/accounts/capture",          "admin-api", (r, s) => handleAdminCaptureAccount(r, s, deps.config, deps.gatewayManager)],
+    ["POST", "/admin/api/accounts/capture",          "admin-api", (r, s) => handleAdminCaptureAccount(r, s, config, gatewayManager)],
     ["POST", "/admin/api/codex/oauth/start",         "admin-api", (r, s) => handleAdminCodexOAuthStart(r, s)],
-    ["POST", "/admin/api/codex/oauth/complete",      "admin-api", (r, s) => handleAdminCodexOAuthComplete(r, s, deps.config)],
+    ["POST", "/admin/api/codex/oauth/complete",      "admin-api", (r, s) => handleAdminCodexOAuthComplete(r, s, config)],
     ["GET",  "/admin/api/codex/oauth/status",        "admin-api", (r, s, u) => handleAdminCodexOAuthStatus(r, s, u)],
-    ["POST", "/admin/api/codex/accounts/import",     "admin-api", (r, s) => handleAdminCodexAccountImport(r, s, deps.config)],
-    ["POST", "/admin/api/codex/accounts/test",       "admin-api", (r, s) => handleAdminCodexAccountTest(r, s, deps.codexClient)],
-    ["POST", "/admin/api/codex/accounts/delete",     "admin-api", (r, s) => handleAdminCodexAccountDelete(r, s, deps.config)],
-    ["POST", "/admin/api/codex/accounts/default",    "admin-api", (r, s) => handleAdminCodexAccountSetDefault(r, s, deps.config)],
-    ["POST", "/admin/api/codex/accounts/toggle",     "admin-api", (r, s) => handleAdminCodexAccountToggle(r, s, deps.config)],
-    ["GET",  "/auth/callback",                       "admin-api", (r, s, u) => handleCodexOAuthCallback(r, s, deps.config, u)],
+    ["POST", "/admin/api/codex/accounts/import",     "admin-api", (r, s) => handleAdminCodexAccountImport(r, s, config)],
+    ["POST", "/admin/api/codex/accounts/test",       "admin-api", (r, s) => handleAdminCodexAccountTest(r, s, codexClient)],
+    ["POST", "/admin/api/codex/accounts/delete",     "admin-api", (r, s) => handleAdminCodexAccountDelete(r, s, config)],
+    ["POST", "/admin/api/codex/accounts/default",    "admin-api", (r, s) => handleAdminCodexAccountSetDefault(r, s, config)],
+    ["POST", "/admin/api/codex/accounts/toggle",     "admin-api", (r, s) => handleAdminCodexAccountToggle(r, s, config)],
+    ["GET",  "/auth/callback",                       "admin-api", (r, s, u) => handleCodexOAuthCallback(r, s, config, u)],
     // Health & debug
-    ["GET",  "/healthz",                             null,        (r, s) => handleHealth(r, s, deps.client, deps.directClient, deps.sessionStore, deps.modelsRegistry, deps.responseCache, deps.traceStore)],
-    ["GET",  "/debug/accio-auth",                    null,        (r, s) => handleAccioAuthProbe(r, s, deps.client, deps.directClient)],
-    ["GET",  "/debug/traces",                        null,        (r, s, u) => handleTracesList(r, s, deps.traceStore, u)]
+    ["GET",  "/healthz",                             null,        (r, s) => handleHealth(r, s, client, directClient, sessionStore, modelsRegistry, responseCache, traceStore)],
+    ["GET",  "/debug/accio-auth",                    null,        (r, s) => handleAccioAuthProbe(r, s, client, directClient)],
+    ["GET",  "/debug/traces",                        null,        (r, s, u) => handleTracesList(r, s, traceStore, u)],
+    // API routes (with trace capture & activity recording)
+    ["GET",  "/v1/models",                           "openai",    (r, s) => handleModelsRequest(r, s, modelsRegistry),                                                                { trace: true }],
+    ["POST", "/v1/messages",                         "anthropic", (r, s) => handleMessagesRequest(r, s, client, directClient, claudeFallbackPool, sessionStore, responseCache),        { trace: true, activity: "anthropic" }],
+    ["POST", "/v1/messages/count_tokens",            "anthropic", (r, s) => handleCountTokens(r, s),                                                                                  { trace: true }],
+    ["POST", "/v1/chat/completions",                 "openai",    (r, s) => handleChatCompletionsRequest(r, s, client, codexClient, codexFallbackPool, sessionStore, responseCache),    { trace: true, activity: "openai" }],
+    ["POST", "/v1/responses",                        "openai-responses", (r, s) => handleResponsesRequest(r, s, client, codexClient, codexFallbackPool, sessionStore, responseCache),  { trace: true, activity: "openai-responses" }]
   ];
 
-  // Build lookup map: "METHOD:/path" -> [protocol, handler]
+  // Build lookup map: "METHOD:/path" -> [protocol, handler, meta]
   const routeMap = new Map();
-  for (const [method, path, protocol, handler] of staticRoutes) {
-    routeMap.set(`${method}:${path}`, [protocol, handler]);
+  for (const [method, routePath, protocol, handler, meta] of allRoutes) {
+    routeMap.set(`${method}:${routePath}`, [protocol, handler, meta || null]);
   }
 
   return http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const pathname = extractPathname(req.url);
     const startTime = Date.now();
     const requestId = String(req.headers["x-request-id"] || generateId("req"));
 
@@ -188,7 +215,7 @@ function createServer(config, client, directClient, claudeFallbackPool, codexCli
     const requestMeta = {
       requestId,
       method: req.method,
-      path: url.pathname
+      path: pathname
     };
 
     const finishLog = (level, message, meta = {}) => {
@@ -209,30 +236,37 @@ function createServer(config, client, directClient, claudeFallbackPool, codexCli
         return;
       }
 
-      if (req.method === "GET" && url.pathname === "/") {
+      if (req.method === "GET" && pathname === "/") {
         writeJson(res, 200, {
           name: "accio-anthropic-bridge",
           ok: true,
-          endpoints: staticRoutes.map(([m, p]) => `${m} ${p}`).concat([
-            "GET /debug/traces/:id",
-            "GET /debug/traces/:id/replay",
-            "GET /v1/models",
-            "POST /v1/messages",
-            "POST /v1/messages/count_tokens",
-            "POST /v1/chat/completions",
-            "POST /v1/responses"
-          ])
+          endpoints: allRoutes.map(([m, p]) => `${m} ${p}`)
         });
         finishLog("info", "request completed", { status: 200 });
         return;
       }
 
-      /* ── Static route lookup (replaces ~20 if-blocks) ── */
-      const routeKey = `${req.method}:${url.pathname}`;
+      /* ── Unified route lookup ── */
+      const routeKey = `${req.method}:${pathname}`;
       const matched = routeMap.get(routeKey);
       if (matched) {
-        const [protocol, handler] = matched;
+        const [protocol, handler, meta] = matched;
+
+        // Only parse full URL when handler actually needs query parameters
+        const url = handler.length >= 3
+          ? new URL(req.url, `http://${req.headers.host || "localhost"}`)
+          : null;
+
         await handler(req, res, url);
+
+        // Post-handler hooks: trace capture and activity recording
+        if (meta && meta.trace) {
+          captureTrace(traceStore, req, res, requestMeta, startTime);
+        }
+        if (meta && meta.activity) {
+          recordRecentActivity(recentActivityStore, req, requestMeta, meta.activity, res.statusCode || 200);
+        }
+
         const logMeta = { status: res.statusCode || 200 };
         if (protocol) {
           logMeta.protocol = protocol;
@@ -242,64 +276,21 @@ function createServer(config, client, directClient, claudeFallbackPool, codexCli
       }
 
       /* ── Dynamic debug trace routes ── */
-      if (req.method === "GET" && /^\/debug\/traces\/[^/]+$/.test(url.pathname)) {
-        handleTraceDetail(req, res, traceStore, url.pathname.split("/").pop());
+      if (req.method === "GET" && /^\/debug\/traces\/[^/]+$/.test(pathname)) {
+        handleTraceDetail(req, res, traceStore, pathname.split("/").pop());
         finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
-      if (req.method === "GET" && /^\/debug\/traces\/[^/]+\/replay$/.test(url.pathname)) {
-        const segments = url.pathname.split("/");
+      if (req.method === "GET" && /^\/debug\/traces\/[^/]+\/replay$/.test(pathname)) {
+        const segments = pathname.split("/");
         const traceId = segments[segments.length - 2];
         handleTraceReplay(req, res, traceStore, traceId, `http://${req.headers.host || `127.0.0.1:${client.config.port}`}`);
         finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
-      /* ── API routes (with trace capture & activity recording) ── */
-      if (req.method === "GET" && url.pathname === "/v1/models") {
-        await handleModelsRequest(req, res, modelsRegistry);
-        captureTrace(traceStore, req, res, requestMeta, startTime);
-        finishLog("info", "request completed", {
-          status: res.statusCode || 200,
-          protocol: "openai",
-          modelsSource: client.config.modelsSource
-        });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/messages") {
-        await handleMessagesRequest(req, res, client, directClient, claudeFallbackPool, sessionStore, responseCache);
-        captureTrace(traceStore, req, res, requestMeta, startTime);
-        recordRecentActivity(recentActivityStore, req, requestMeta, "anthropic", res.statusCode || 200);
-        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
-        await handleCountTokens(req, res);
-        captureTrace(traceStore, req, res, requestMeta, startTime);
-        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        await handleChatCompletionsRequest(req, res, client, codexClient, codexFallbackPool, sessionStore, responseCache);
-        captureTrace(traceStore, req, res, requestMeta, startTime);
-        recordRecentActivity(recentActivityStore, req, requestMeta, "openai", res.statusCode || 200);
-        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai" });
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/responses") {
-        await handleResponsesRequest(req, res, client, codexClient, codexFallbackPool, sessionStore, responseCache);
-        captureTrace(traceStore, req, res, requestMeta, startTime);
-        recordRecentActivity(recentActivityStore, req, requestMeta, "openai-responses", res.statusCode || 200);
-        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai-responses" });
-        return;
-      }
-
-      writeJson(res, 404, buildErrorResponse(`No route for ${url.pathname}`));
+      writeJson(res, 404, buildErrorResponse(`No route for ${pathname}`));
       finishLog("warn", "request completed", { status: 404 });
     } catch (error) {
       const rawStatusCode = error instanceof HttpError ? error.status : Number(error && error.status) || 500;
@@ -409,69 +400,9 @@ async function main() {
   const recentActivityStore = new RecentActivityStore();
 
   /* ── activeAccount 自动跟随最近成功出口账号 ── */
-  const _lastSyncedAccountIdByTheme = new Map();
-  const _syncTimerByTheme = new Map();
-  const SYNC_DEBOUNCE_MS = 2000;
-
-  recentActivityStore.subscribe((activity) => {
-    if (!activity || !activity.accountId || activity.authSource === "gateway") {
-      return;
-    }
-
-    const nextAccountId = String(activity.accountId);
-    const theme = String(activity.theme || "");
-    const targetAccountsPath = theme === "codex"
-      ? config.codexAccountsPath
-      : config.accountsPath;
-    const targetProvider = theme === "codex" ? codexAuthProvider : authProvider;
-
-    if (!targetAccountsPath) {
-      return;
-    }
-
-    if (nextAccountId === _lastSyncedAccountIdByTheme.get(theme || "claude")) {
-      return;
-    }
-
-    const summary = targetProvider.getSummary();
-    const currentActive = summary && summary.activeAccount ? String(summary.activeAccount) : null;
-
-    if (nextAccountId === currentActive) {
-      _lastSyncedAccountIdByTheme.set(theme || "claude", nextAccountId);
-      const currentTimer = _syncTimerByTheme.get(theme || "claude");
-      if (currentTimer) {
-        clearTimeout(currentTimer);
-        _syncTimerByTheme.delete(theme || "claude");
-      }
-      return;
-    }
-
-    _lastSyncedAccountIdByTheme.set(theme || "claude", nextAccountId);
-
-    const existingTimer = _syncTimerByTheme.get(theme || "claude");
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
-
-    const nextTimer = setTimeout(() => {
-      _syncTimerByTheme.delete(theme || "claude");
-
-      try {
-        setActiveAccountInFile(targetAccountsPath, nextAccountId);
-        log.info("active account synced to serving account", {
-          accountId: nextAccountId,
-          theme: theme || "claude",
-          previousActive: currentActive || null
-        });
-      } catch (error) {
-        log.warn("failed to sync active account", {
-          accountId: nextAccountId,
-          error: error && error.message ? error.message : String(error)
-        });
-      }
-    }, SYNC_DEBOUNCE_MS);
-    _syncTimerByTheme.set(theme || "claude", nextTimer);
-  });
+  recentActivityStore.subscribe(
+    createAccountSyncSubscriber(config, authProvider, codexAuthProvider)
+  );
 
   const traceStore = new DebugTraceStore({
     enabled: config.traceEnabled,
@@ -480,7 +411,14 @@ async function main() {
     maxStringLength: config.traceMaxBodyChars,
     sampleRate: config.traceSampleRate
   });
-  const server = createServer(config, client, directClient, claudeFallbackPool, codexClient, codexFallbackPool, authProvider, codexAuthProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore);
+
+  const deps = {
+    config, client, directClient, claudeFallbackPool,
+    codexClient, codexFallbackPool, authProvider, codexAuthProvider,
+    gatewayManager, sessionStore, modelsRegistry, responseCache,
+    traceStore, recentActivityStore
+  };
+  const server = createServer(deps);
 
   let shuttingDown = false;
 

@@ -5,6 +5,7 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { atomicWriteFileSync } = require("./accounts-file");
+const { errMsg } = require("./utils");
 
 const AUTH_CALLBACK_FILE = "auth-callback.json";
 
@@ -308,7 +309,7 @@ async function readGatewayState(baseUrl = env("ACCIO_BASE_URL", "http://127.0.0.
       baseUrl: normalized,
       status: null,
       user: null,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     };
   }
 }

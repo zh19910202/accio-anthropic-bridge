@@ -41,6 +41,7 @@ const {
 const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets, serializeFallbackTarget } = require("../external-fallback");
 const { maskToken } = require("../redaction");
 const log = require("../logger");
+const { errMsg } = require("../utils");
 
 const execFileAsync = promisify(execFile);
 
@@ -504,7 +505,7 @@ async function requestGatewayJsonWithAutostart(gatewayManager, pathname, options
     log.warn("gateway request failed before autostart retry", {
       pathname,
       baseUrl: gatewayManager.baseUrl,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
 
     await gatewayManager.ensureStarted();
@@ -715,7 +716,7 @@ function persistResolvedAuthPayload(config, alias, authPayload) {
   } catch (error) {
     log.warn("persist auth payload after quota refresh failed", {
       alias,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
   }
 }
@@ -1115,7 +1116,7 @@ async function requestGatewayTextWithAutostart(gatewayManager, pathname, options
     log.warn("gateway text request failed before autostart retry", {
       pathname,
       baseUrl: gatewayManager.baseUrl,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
 
     await gatewayManager.ensureStarted();
@@ -1248,9 +1249,9 @@ async function requestDesktopHelperLaunch(config) {
   } catch (error) {
     log.warn('snapshot switch desktop helper failed', {
       helperUrl: normalized,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
-    return { ok: false, helperUrl: normalized, error: error && error.message ? error.message : String(error) };
+    return { ok: false, helperUrl: normalized, error: errMsg(error) };
   }
 }
 
@@ -1535,7 +1536,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
   } catch (error) {
     log.warn('snapshot switch local start failed', {
       processName,
-      error: error && error.message ? error.message : String(error)
+      error: errMsg(error)
     });
   }
 

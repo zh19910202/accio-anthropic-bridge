@@ -41,8 +41,8 @@ function writeSse(res, event, data) {
   if (res.writableEnded || res.destroyed) {
     return;
   }
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  // Single write reduces syscalls on unbuffered streams.
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 module.exports = {

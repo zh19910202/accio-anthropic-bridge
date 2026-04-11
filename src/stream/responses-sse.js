@@ -18,8 +18,7 @@ class ResponsesStreamWriter extends BaseStreamWriter {
 
   writeEvent(event, data) {
     this.start();
-    this.res.write(`event: ${event}\n`);
-    this.res.write(`data: ${JSON.stringify(data)}\n\n`);
+    this.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
   startResponse() {

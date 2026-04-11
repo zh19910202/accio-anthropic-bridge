@@ -56,8 +56,8 @@ async function executeBridgeQuery({ body, client, prompt, req, sessionStore, pro
       protocol,
       requestedModel: body.model || null,
       lastTransport: "local-ws",
-      accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-      accountName: storedSession && storedSession.accountName ? storedSession.accountName : null
+      accountId: storedSession?.accountId ?? null,
+      accountName: storedSession?.accountName ?? null
     });
   }
 

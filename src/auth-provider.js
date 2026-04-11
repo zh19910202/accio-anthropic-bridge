@@ -5,6 +5,7 @@ const path = require("node:path");
 
 const log = require("./logger");
 const { BaseAuthProvider, normalizeStrategy } = require("./base-auth-provider");
+const { errMsg } = require("./utils");
 
 function normalizeMode(mode) {
   const value = String(mode || "auto").trim().toLowerCase();
@@ -40,7 +41,7 @@ class AuthProvider extends BaseAuthProvider {
       } catch (error) {
         log.debug("auth provider token file load failed", {
           tokenFile: account.tokenFile,
-          error: error && error.message ? error.message : String(error)
+          error: errMsg(error)
         });
       }
     }

@@ -6,9 +6,11 @@ const path = require("node:path");
 
 const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 
 const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const SAVE_DEBOUNCE_MS = 500;
+const SAVE_MAX_WAIT_MS = 5000;  // Upper bound to prevent indefinite deferral under high load
 
 class SessionStore {
   constructor(filePath, options = {}) {
@@ -16,6 +18,7 @@ class SessionStore {
     this.maxAgeMs = options.maxAgeMs || DEFAULT_MAX_AGE_MS;
     this.state = { sessions: {} };
     this._saveTimer = null;
+    this._maxWaitTimer = null;
     this._pendingWrite = Promise.resolve();
     this.load();
   }
@@ -73,22 +76,33 @@ class SessionStore {
     }
   }
 
+  _doSave() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+
+    clearTimeout(this._maxWaitTimer);
+    this._maxWaitTimer = null;
+
+    this._pendingWrite = this._pendingWrite
+      .then(() => this._saveAsync())
+      .catch((error) => {
+        log.warn("session store async save failed", {
+          path: this.filePath,
+          error: errMsg(error)
+        });
+      });
+  }
+
   _scheduleSave() {
-    if (this._saveTimer) {
-      return;
+    // Schedule max-wait timer on first trigger — ensures save happens
+    // within SAVE_MAX_WAIT_MS even under sustained high-frequency updates.
+    if (!this._maxWaitTimer) {
+      this._maxWaitTimer = setTimeout(() => this._doSave(), SAVE_MAX_WAIT_MS);
     }
 
-    this._saveTimer = setTimeout(() => {
-      this._saveTimer = null;
-      this._pendingWrite = this._pendingWrite
-        .then(() => this._saveAsync())
-        .catch((error) => {
-          log.warn("session store async save failed", {
-            path: this.filePath,
-            error: error && error.message ? error.message : String(error)
-          });
-        });
-    }, SAVE_DEBOUNCE_MS);
+    // Reset debounce timer on each call
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this._doSave(), SAVE_DEBOUNCE_MS);
   }
 
   async _saveAsync() {
@@ -102,7 +116,7 @@ class SessionStore {
     } catch (error) {
       log.warn("session store sync flush failed", {
         path: this.filePath,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
   }
@@ -112,10 +126,10 @@ class SessionStore {
   }
 
   flushSync() {
-    if (this._saveTimer) {
-      clearTimeout(this._saveTimer);
-      this._saveTimer = null;
-    }
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+    clearTimeout(this._maxWaitTimer);
+    this._maxWaitTimer = null;
 
     this._saveSync();
   }

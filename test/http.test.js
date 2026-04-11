@@ -92,7 +92,8 @@ describe("writeSse", () => {
     };
 
     writeSse(res, "message", { text: "hello" });
-    assert.equal(chunks[0], "event: message\n");
-    assert.equal(chunks[1], 'data: {"text":"hello"}\n\n');
+    // Single write for reduced syscall overhead
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0], 'event: message\ndata: {"text":"hello"}\n\n');
   });
 });

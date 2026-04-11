@@ -9,14 +9,9 @@ const {
 const {
   buildDirectRequestFromAnthropic,
   extractThinkingConfigFromAnthropic,
-  SseIdleTimeoutError,
   supportsThinkingForModel
 } = require("../direct-llm");
-const {
-  classifyErrorType,
-  createBridgeError,
-  resolveResultError
-} = require("../errors");
+const { createBridgeError } = require("../errors");
 const { shouldFallbackToExternalProvider, STREAMING_REQUIRED_RE } = require("../external-fallback");
 const { CORS_HEADERS, writeJson, writeSse } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
@@ -25,7 +20,6 @@ const { buildCacheKey } = require("../response-cache");
 const { AnthropicStreamWriter } = require("../stream/anthropic-sse");
 const { repairAnthropicMessages, validateAnthropicMessages } = require("../tooling");
 const {
-  executeBridgeQuery,
   sessionHeaders,
   shouldUseDirectTransport,
   usageCompletionTokens,
@@ -33,7 +27,17 @@ const {
 } = require("../bridge-core");
 const { setTraceRequest, setTraceResponse, updateTrace } = require("../debug-traces");
 const { generateId } = require("../id");
-const { applyBridgeRequestIdToDirectRequest, cacheHeaders, fallbackTransportName, logRequest: logRequestShared, requestedAccountId } = require("./shared");
+const {
+  applyBridgeRequestIdToDirectRequest,
+  cacheHeaders,
+  errMsg,
+  fallbackTransportName,
+  logRequest: logRequestShared,
+  requestedAccountId,
+  resolveUsageTokens,
+  startHeartbeat,
+  writeSseError
+} = require("./shared");
 const { resolveSessionBinding } = require("../session-store");
 
 function logRequest(req, message, meta = {}) {
@@ -170,13 +174,12 @@ function isAnthropicLongRequestStreamingError(payload) {
 
 function writeAnthropicFallbackCompletionResult({ req, res, body, binding, cacheState, transport, result }) {
   const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
-  const inputTokens = estimateTokens(flattenAnthropicRequest(body));
-  const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-    ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-    : estimateTokens(result.text);
-  const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-    ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-    : inputTokens;
+  const { promptTokens, completionTokens: outputTokens } = resolveUsageTokens(
+    result.usage,
+    estimateTokens(flattenAnthropicRequest(body)),
+    result.text,
+    estimateTokens
+  );
   const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
 
   const responseBody = buildMessageResponse(body, result.text || "", {
@@ -550,27 +553,13 @@ async function runDirectAnthropic(body, req, res, directClient, sessionStore, st
   };
 
   /* ── Heartbeat ping: keeps connection alive while upstream is thinking ── */
-  let pingInterval = null;
-
-  if (stream) {
-    pingInterval = setInterval(() => {
-      if (res.writableEnded || res.destroyed) {
-        clearInterval(pingInterval);
-        pingInterval = null;
-        return;
-      }
-
-      if (res.headersSent) {
-        writeSse(res, "ping", {});
-      }
-    }, 15_000);
-  }
+  const heartbeat = stream ? startHeartbeat(res, "anthropic") : null;
 
   let result;
   try {
     result = await directClient.run(request, {
       accountId: requestedAccountId(req.headers) || (storedSession && storedSession.accountId) || null,
-      stickyAccountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
+      stickyAccountId: storedSession?.accountId ?? null,
       onDecision(event) {
         updateTrace(req, {
           bridge: {
@@ -625,30 +614,16 @@ async function runDirectAnthropic(body, req, res, directClient, sessionStore, st
       }
     });
   } catch (error) {
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
-    }
-
     /* If the SSE stream was already started, write an error event so the
        client gets a clear signal instead of a silent disconnect. */
-    if (stream && res.headersSent && !res.writableEnded && !res.destroyed) {
-      writeSse(res, "error", {
-        type: "error",
-        error: {
-          type: error.type || "api_error",
-          message: error.message || "stream error"
-        }
-      });
-      res.end();
+    if (stream && writeSseError(res, error, "anthropic")) {
       return;
     }
 
     throw error;
   } finally {
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
+    if (heartbeat) {
+      heartbeat.clear();
     }
   }
 
@@ -761,13 +736,12 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         requestHeaders: req.headers || null
       });
       const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
-      const inputTokens = estimateTokens(flattenAnthropicRequest(body));
-      const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-        : estimateTokens(result.text);
-      const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-        : inputTokens;
+      const { promptTokens, completionTokens: outputTokens } = resolveUsageTokens(
+        result.usage,
+        estimateTokens(flattenAnthropicRequest(body)),
+        result.text,
+        estimateTokens
+      );
       const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
 
       if (binding.sessionId) {
@@ -825,7 +799,7 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         phase,
         status: candidateError && candidateError.status ? candidateError.status : null,
         type: candidateError && candidateError.type ? candidateError.type : null,
-        error: candidateError && candidateError.message ? candidateError.message : String(candidateError)
+        error: errMsg(candidateError)
       });
       lastError = candidateError;
     }
@@ -854,35 +828,23 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
   const cacheEligible = canCacheAnthropicRequest(body);
   const cacheKey = cacheEligible ? buildAnthropicCacheKey(req, body, binding) : null;
 
-  setTraceRequest(req, "anthropic", body, {
+  const requestMeta = {
     requestedModel: body.model || null,
     normalizedModel: directRequest.model,
     resolvedProviderModel: directRequest.model,
     sessionId: binding.sessionId || null,
     conversationId: binding.conversationId || null,
     sessionBindingHit: Boolean(storedSession),
-    accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-    accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
+    accountId: storedSession?.accountId ?? null,
+    accountName: storedSession?.accountName ?? null,
     thinkingRequested: Boolean(thinking),
     thinkingBudgetTokens: thinking && thinking.budget_tokens ? thinking.budget_tokens : null,
     defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens),
     cacheEligible
-  });
+  };
 
-  logRequest(req, "anthropic request parsed", {
-    requestedModel: body.model || null,
-    normalizedModel: directRequest.model,
-    resolvedProviderModel: directRequest.model,
-    sessionId: binding.sessionId || null,
-    conversationId: binding.conversationId || null,
-    sessionBindingHit: Boolean(storedSession),
-    accountId: storedSession && storedSession.accountId ? storedSession.accountId : null,
-    accountName: storedSession && storedSession.accountName ? storedSession.accountName : null,
-    thinkingRequested: Boolean(thinking),
-    thinkingBudgetTokens: thinking && thinking.budget_tokens ? thinking.budget_tokens : null,
-    defaultMaxTokensApplied: Boolean(body.metadata && body.metadata.accio_default_max_tokens),
-    cacheEligible
-  });
+  setTraceRequest(req, "anthropic", body, requestMeta);
+  logRequest(req, "anthropic request parsed", requestMeta);
 
   if (cacheKey && responseCache) {
     const cached = responseCache.get(cacheKey);
@@ -942,7 +904,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
     } catch (error) {
       logRequest(req, "anthropic direct failed without local-ws fallback", {
         transportSelected: "direct-llm",
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
       throw error;
     }

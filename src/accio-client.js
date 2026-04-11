@@ -7,7 +7,7 @@ const path = require("node:path");
 
 const log = require("./logger");
 const { normalizeRequestedModel } = require("./model");
-const { delay } = require("./utils");
+const { delay, errMsg } = require("./utils");
 
 class HttpError extends Error {
   constructor(status, message, body) {
@@ -122,7 +122,7 @@ class AccioClient {
     } catch (error) {
       log.debug("conversation log directory scan failed", {
         accountsRoot: path.join(this.config.accioHome, "accounts"),
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
 
@@ -160,7 +160,7 @@ class AccioClient {
               log.debug("conversation message parse failed", {
                 conversationId,
                 filePath,
-                error: error && error.message ? error.message : String(error)
+                error: errMsg(error)
               });
             }
           }
@@ -169,7 +169,7 @@ class AccioClient {
         log.debug("conversation log read failed", {
           conversationId,
           directory,
-          error: error && error.message ? error.message : String(error)
+          error: errMsg(error)
         });
       }
     }
@@ -330,7 +330,7 @@ class AccioClient {
           ws.close();
         } catch (error) {
           log.debug("websocket close failed", {
-            error: error && error.message ? error.message : String(error)
+            error: errMsg(error)
           });
         }
       };

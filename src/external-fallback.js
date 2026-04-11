@@ -2,6 +2,7 @@
 
 const modelAliases = require("../config/model-aliases.json");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 const { flattenAnthropicRequest, normalizeContent, normalizeSystemPrompt } = require("./anthropic");
 const { normalizeRequestedModel } = require("./model");
 const { flattenOpenAiRequest } = require("./openai");
@@ -243,7 +244,7 @@ function normalizeFetchError(error) {
     return error;
   }
 
-  const normalized = new Error(error && error.message ? error.message : String(error));
+  const normalized = new Error(errMsg(error));
   normalized.status = 502;
   normalized.type = classifyErrorType(normalized.status, normalized);
   return normalized;

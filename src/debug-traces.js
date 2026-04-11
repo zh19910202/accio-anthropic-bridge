@@ -6,8 +6,10 @@ const path = require("node:path");
 
 const { sanitizeHeaders, sanitizeValue } = require("./redaction");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 
 const INDEX_FILE = "index.json";
+const DEFAULT_LIST_LIMIT = 20;
 
 function clampInteger(value, fallback) {
   const normalized = Number(value);
@@ -166,8 +168,8 @@ class DebugTraceStore {
     };
   }
 
-  list(limit = 20) {
-    return this.entries.slice(0, clampInteger(limit, 20));
+  list(limit = DEFAULT_LIST_LIMIT) {
+    return this.entries.slice(0, clampInteger(limit, DEFAULT_LIST_LIMIT));
   }
 
   get(traceId) {
@@ -230,7 +232,7 @@ class DebugTraceStore {
     }
 
     fsp.writeFile(filePath, traceJson).catch((error) => {
-      log.warn("async trace write failed", { path: filePath, error: error.message || String(error) });
+      log.warn("async trace write failed", { path: filePath, error: errMsg(error) });
     });
 
     for (const removedPath of toRemove) {
@@ -241,7 +243,7 @@ class DebugTraceStore {
     this._indexWriteChain = this._indexWriteChain
       .then(() => fsp.writeFile(path.join(this.dirPath, INDEX_FILE), indexJson))
       .catch((error) => {
-        log.warn("async trace index write failed", { error: error.message || String(error) });
+        log.warn("async trace index write failed", { error: errMsg(error) });
       });
 
     return summary;
@@ -327,6 +329,9 @@ class DebugTraceStore {
   }
 
   _buildSummary(trace) {
+    const bridge = trace.bridge || {};
+    const response = trace.response || {};
+    const error = trace.error || {};
     return {
       id: trace.id,
       requestId: trace.requestId,
@@ -336,12 +341,12 @@ class DebugTraceStore {
       protocol: trace.protocol,
       statusCode: trace.statusCode,
       sampleReason: trace.sampleReason,
-      requestedModel: trace.bridge && trace.bridge.requestedModel ? trace.bridge.requestedModel : null,
-      normalizedModel: trace.bridge && trace.bridge.normalizedModel ? trace.bridge.normalizedModel : null,
-      transportSelected: trace.bridge && trace.bridge.transportSelected ? trace.bridge.transportSelected : null,
-      accountId: trace.bridge && trace.bridge.accountId ? trace.bridge.accountId : null,
-      cacheState: trace.response && trace.response.cacheState ? trace.response.cacheState : null,
-      error: trace.error && trace.error.message ? trace.error.message : null
+      requestedModel: bridge.requestedModel || null,
+      normalizedModel: bridge.normalizedModel || null,
+      transportSelected: bridge.transportSelected || null,
+      accountId: bridge.accountId || null,
+      cacheState: response.cacheState || null,
+      error: error.message || null
     };
   }
 }

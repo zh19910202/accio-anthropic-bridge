@@ -7,6 +7,7 @@ const {
   shouldRecordAccountFailure
 } = require("./errors");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 
 const OPENAI_AUTH_URL = "https://auth.openai.com/oauth/token";
 const OPENAI_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -886,7 +887,7 @@ class CodexResponsesClient {
     } catch (error) {
       log.warn("codex token refresh failed", {
         accountId,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
   }

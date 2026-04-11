@@ -30,6 +30,7 @@ const {
   serializeGenerateContentRequest
 } = require("./direct-gateway-sdk");
 const { delay } = require("./utils");
+const { errMsg } = require("./utils");
 
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
 const CURRENT_DIRECT_MAX_OUTPUT_TOKENS = 16384;
@@ -1107,7 +1108,7 @@ class DirectLlmClient {
       return;
     }
 
-    const reason = error && error.message ? String(error.message) : String(error);
+    const reason = errMsg(error);
 
     if (typeof this.authProvider.recordFailure === "function") {
       this.authProvider.recordFailure(accountId, error);
@@ -1300,7 +1301,7 @@ class DirectLlmClient {
         state: "rechecking",
         quotaCheckedAt: matched.record && matched.record.quotaCheckedAt ? matched.record.quotaCheckedAt : checkedAt,
         nextCheckAt,
-        reason: error && error.message ? error.message : String(error)
+        reason: errMsg(error)
       }));
       this._emitStandbyState();
       return null;
@@ -1346,7 +1347,7 @@ class DirectLlmClient {
         baseUrl: normalized,
         status: null,
         user: null,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       };
     }
   }
@@ -1465,7 +1466,7 @@ class DirectLlmClient {
       log.warn("gateway text request failed before autostart retry", {
         pathname,
         baseUrl: this._deriveGatewayBaseUrl(),
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
 
       await this.gatewayManager.ensureStarted();
@@ -1563,7 +1564,7 @@ class DirectLlmClient {
     } catch (error) {
       log.warn("persist auth payload after automatic gateway switch failed", {
         accountId: auth.accountId,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
   }
@@ -1623,7 +1624,7 @@ class DirectLlmClient {
       await this._requestGatewayJson("/auth/logout", { method: "POST", body: {} }).catch((error) => {
         log.warn("automatic account switch logout before callback replay failed", {
           accountId: auth.accountId || null,
-          error: error && error.message ? error.message : String(error)
+          error: errMsg(error)
         });
       });
     }
@@ -1791,7 +1792,7 @@ class DirectLlmClient {
         await this.refreshPreparedCredentials();
       } catch (error) {
         log.debug("prepared account refresh failed", {
-          error: error && error.message ? error.message : String(error)
+          error: errMsg(error)
         });
       } finally {
         if (this._standbyRunRefresh !== runRefresh) {
@@ -2173,7 +2174,7 @@ class DirectLlmClient {
           cooling.push(this._mergeCooldownRecord(previousCooldown, credential, {
             state: "rechecking",
             nextCheckAt,
-            reason: error && error.message ? error.message : String(error)
+            reason: errMsg(error)
           }));
           return false;
         }
@@ -2255,7 +2256,7 @@ class DirectLlmClient {
     try {
       return await this._standbyRefreshPromise;
     } catch (error) {
-      this._preparedLastError = error && error.message ? String(error.message) : String(error);
+      this._preparedLastError = errMsg(error);
       this._emitStandbyState();
       throw error;
     } finally {
@@ -2454,7 +2455,7 @@ class DirectLlmClient {
           accountId: auth.accountId,
           accountName: auth.accountName || null,
           authSource: auth.source,
-          reason: error && error.message ? error.message : String(error),
+          reason: errMsg(error),
           status: null
         });
       }
@@ -2534,7 +2535,7 @@ class DirectLlmClient {
           accountId: auth.accountId,
           accountName: auth.accountName || null,
           authSource: auth.source,
-          reason: error && error.message ? error.message : String(error),
+          reason: errMsg(error),
           status: error && error.status ? error.status : null,
           phase: phase || null,
           responseStarted: true
@@ -2551,7 +2552,7 @@ class DirectLlmClient {
         accountId: auth.accountId,
         accountName: auth.accountName || null,
         authSource: auth.source,
-        reason: error && error.message ? error.message : String(error),
+        reason: errMsg(error),
         status: error && error.status ? error.status : null,
         phase: phase || null,
         responseStarted: false
@@ -2824,7 +2825,7 @@ class DirectLlmClient {
         accountId: auth.accountId || null,
         accountName: auth.accountName || null,
         authSource: auth.source || null,
-        reason: error && error.message ? error.message : String(error),
+        reason: errMsg(error),
         status: error && error.status ? error.status : null,
         phase: phase || null,
         responseStarted: false,

@@ -56,11 +56,16 @@ function recordEntry(entry) {
     ringSize += 1;
   }
 
-  for (const listener of listeners) {
-    try {
-      listener(cloneEntry(entry));
-    } catch {
-      // Ignore listener failures to avoid affecting the main log path.
+  // Only deep-clone when subscribers exist — avoids unnecessary GC pressure
+  // on the hot logging path when no admin SSE clients are connected.
+  if (listeners.size > 0) {
+    const cloned = cloneEntry(entry);
+    for (const listener of listeners) {
+      try {
+        listener(cloned);
+      } catch {
+        // Ignore listener failures to avoid affecting the main log path.
+      }
     }
   }
 }

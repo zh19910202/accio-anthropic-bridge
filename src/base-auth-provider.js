@@ -6,9 +6,12 @@ const path = require("node:path");
 
 const { atomicWriteFileSync } = require("./accounts-file");
 const log = require("./logger");
+const { errMsg } = require("./utils");
 
 const INVALIDATION_MS = 5 * 60 * 1000;
 const SAVE_DEBOUNCE_MS = 500;
+const SAVE_MAX_WAIT_MS = 5000;      // Upper bound to prevent indefinite deferral
+const STAT_CACHE_WINDOW_MS = 1000;  // Avoid redundant statSync in rapid failover loops
 
 function normalizeStrategy(strategy) {
   const value = String(strategy || "round_robin").trim().toLowerCase();
@@ -33,6 +36,7 @@ class BaseAuthProvider {
     this._lastFailures = new Map();
     this._fileCache = null;
     this._saveTimer = null;
+    this._maxWaitTimer = null;
     this._pendingWrite = Promise.resolve();
   }
 
@@ -111,22 +115,33 @@ class BaseAuthProvider {
     }
   }
 
+  _doSave() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+
+    clearTimeout(this._maxWaitTimer);
+    this._maxWaitTimer = null;
+
+    this._pendingWrite = this._pendingWrite
+      .then(() => this._saveAsync())
+      .catch((error) => {
+        log.warn(this._logPrefix + " async save failed", {
+          path: this._resolveStatePath(),
+          error: errMsg(error)
+        });
+      });
+  }
+
   _scheduleSave() {
-    if (this._saveTimer) {
-      return;
+    // Schedule max-wait timer on first trigger — ensures save happens
+    // within SAVE_MAX_WAIT_MS even under sustained high-frequency updates.
+    if (!this._maxWaitTimer) {
+      this._maxWaitTimer = setTimeout(() => this._doSave(), SAVE_MAX_WAIT_MS);
     }
 
-    this._saveTimer = setTimeout(() => {
-      this._saveTimer = null;
-      this._pendingWrite = this._pendingWrite
-        .then(() => this._saveAsync())
-        .catch((error) => {
-          log.warn(this._logPrefix + " async save failed", {
-            path: this._resolveStatePath(),
-            error: error && error.message ? error.message : String(error)
-          });
-        });
-    }, SAVE_DEBOUNCE_MS);
+    // Reset debounce timer on each call
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this._doSave(), SAVE_DEBOUNCE_MS);
   }
 
   async _saveAsync() {
@@ -143,7 +158,7 @@ class BaseAuthProvider {
     } catch (error) {
       log.warn(this._logPrefix + " sync flush failed", {
         path: statePath,
-        error: error && error.message ? error.message : String(error)
+        error: errMsg(error)
       });
     }
   }
@@ -160,10 +175,10 @@ class BaseAuthProvider {
   }
 
   flushSync() {
-    if (this._saveTimer) {
-      clearTimeout(this._saveTimer);
-      this._saveTimer = null;
-    }
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+    clearTimeout(this._maxWaitTimer);
+    this._maxWaitTimer = null;
 
     this._saveSync();
   }
@@ -207,7 +222,7 @@ class BaseAuthProvider {
 
     this._lastFailures.set(String(accountId), {
       at: new Date().toISOString(),
-      reason: error && error.message ? error.message : String(error)
+      reason: errMsg(error)
     });
     this.save();
   }
@@ -302,6 +317,15 @@ class BaseAuthProvider {
     const filePath = this._resolveAccountsPath();
 
     try {
+      // Time-window cache: skip statSync entirely if last read was < 1s ago.
+      // This avoids redundant syscalls during rapid failover loops where
+      // getAuthToken → listCredentials → getConfiguredAccounts is called
+      // multiple times per second.
+      const now = Date.now();
+      if (this._fileCache && this._fileCache.filePath === filePath && this._fileCache.readAt && now - this._fileCache.readAt < STAT_CACHE_WINDOW_MS) {
+        return this._fileCache.result;
+      }
+
       let mtimeMs = 0;
 
       try {
@@ -311,6 +335,7 @@ class BaseAuthProvider {
       }
 
       if (this._fileCache && this._fileCache.filePath === filePath && this._fileCache.mtimeMs === mtimeMs && mtimeMs > 0) {
+        this._fileCache.readAt = now;
         return this._fileCache.result;
       }
 
@@ -335,7 +360,7 @@ class BaseAuthProvider {
         ok: true
       };
 
-      this._fileCache = { filePath, mtimeMs, result };
+      this._fileCache = { filePath, mtimeMs, result, readAt: Date.now() };
       return result;
     } catch (error) {
       this._fileCache = null;
@@ -459,5 +484,7 @@ module.exports = {
   normalizeStrategy,
   parseJsonFile,
   INVALIDATION_MS,
-  SAVE_DEBOUNCE_MS
+  SAVE_DEBOUNCE_MS,
+  SAVE_MAX_WAIT_MS,
+  STAT_CACHE_WINDOW_MS
 };
